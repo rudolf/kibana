@@ -87,22 +87,30 @@ export class ToolingLogTextWriter implements Writer {
   }
 
   write(msg: Message) {
+    console.log('0');
     if (!shouldWriteType(this.level, msg.type)) {
+      console.log('1');
       return false;
     }
 
     if (this.ignoreSources && msg.source && this.ignoreSources.includes(msg.source)) {
+      console.log('2');
       if (msg.type === 'write') {
+        console.log('3');
         const txt = format(msg.args[0], ...msg.args.slice(1));
         // Ensure that Elasticsearch deprecation log messages from Kibana aren't ignored
         if (!/\[elasticsearch\.deprecation\]/.test(txt)) {
+          console.log('4');
+          console.log('ignored: ', txt);
           return false;
         }
       } else {
+        console.log('5');
         return false;
       }
     }
 
+    console.log('6');
     const prefix = has(MSG_PREFIXES, msg.type) ? MSG_PREFIXES[msg.type] : '';
     ToolingLogTextWriter.write(this.writeTo, prefix, msg);
     return true;
