@@ -1301,18 +1301,21 @@ export class SavedObjectsRepository {
     };
 
     const { body } = await this.client
-      .update<SavedObjectsRawDocSource>({
-        id: this._serializer.generateRawId(namespace, type, id),
-        index: this.getIndexForType(type),
-        ...getExpectedVersionProperties(version, preflightResult?.rawDocSource),
-        refresh,
-        body: {
-          doc,
-          ...(rawUpsert && { upsert: rawUpsert._source }),
+      .update<SavedObjectsRawDocSource>(
+        {
+          id: this._serializer.generateRawId(namespace, type, id),
+          index: this.getIndexForType(type),
+          ...getExpectedVersionProperties(version, preflightResult?.rawDocSource),
+          refresh,
+          body: {
+            doc,
+            ...(rawUpsert && { upsert: rawUpsert._source }),
+          },
+          _source_includes: ['namespace', 'namespaces', 'originId'],
+          require_alias: true,
         },
-        _source_includes: ['namespace', 'namespaces', 'originId'],
-        require_alias: true,
-      })
+        { headers: { 'x-elastic-product-origin': 'notkibana' } }
+      )
       .catch((err) => {
         if (SavedObjectsErrorHelpers.isEsUnavailableError(err)) {
           throw err;
