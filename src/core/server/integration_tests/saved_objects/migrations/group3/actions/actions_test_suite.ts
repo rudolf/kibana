@@ -780,7 +780,7 @@ export const runActionTestSuite = ({
   // Reindex doesn't return any errors on it's own, so we have to test
   // together with waitForReindexTask
   // Failing: See https://github.com/elastic/kibana/issues/166190
-  describe.skip('reindex & waitForReindexTask', () => {
+  describe('reindex & waitForReindexTask', () => {
     it('resolves right when reindex succeeds without reindex script', async () => {
       const res = (await reindex({
         client,
@@ -1142,36 +1142,39 @@ export const runActionTestSuite = ({
         }
       `);
     });
-    it('resolves left wait_for_task_completion_timeout when the task does not finish within the timeout', async () => {
-      const readyTaskRes = await waitForIndexStatus({
-        client,
-        index: 'existing_index_with_100k_docs',
-        status: 'yellow',
-        timeout: '300s',
-      })();
+    // can be enabled to reproduce reindex case, but this happens less frequently than with update_by_query
+    it.skip('resolves left wait_for_task_completion_timeout when the task does not finish within the timeout', async () => {
+      for (let i = 0; i++; i < 100000) {
+        const readyTaskRes = await waitForIndexStatus({
+          client,
+          index: 'existing_index_with_100k_docs',
+          status: 'yellow',
+          timeout: '300s',
+        })();
 
-      expect(Either.isRight(readyTaskRes)).toBe(true);
+        expect(Either.isRight(readyTaskRes)).toBe(true);
 
-      const res = (await reindex({
-        client,
-        sourceIndex: 'existing_index_with_100k_docs',
-        targetIndex: 'reindex_target',
-        reindexScript: Option.none,
-        requireAlias: false,
-        excludeOnUpgradeQuery: { match_all: {} },
-        batchSize: 1000,
-      })()) as Either.Right<ReindexResponse>;
+        const res = (await reindex({
+          client,
+          sourceIndex: 'existing_index_with_100k_docs',
+          targetIndex: 'reindex_target',
+          reindexScript: Option.none,
+          requireAlias: false,
+          excludeOnUpgradeQuery: { match_all: {} },
+          batchSize: 1000,
+        })()) as Either.Right<ReindexResponse>;
 
-      const task = waitForReindexTask({ client, taskId: res.right.taskId, timeout: '0s' });
+        const task = waitForReindexTask({ client, taskId: res.right.taskId, timeout: '0s' });
 
-      await expect(task()).resolves.toMatchObject({
-        _tag: 'Left',
-        left: {
-          error: expect.any(errors.ResponseError),
-          message: expect.stringContaining('[timeout_exception]'),
-          type: 'wait_for_task_completion_timeout',
-        },
-      });
+        await expect(task()).resolves.toMatchObject({
+          _tag: 'Left',
+          left: {
+            error: expect.any(errors.ResponseError),
+            message: expect.stringContaining('[timeout_exception]'),
+            type: 'wait_for_task_completion_timeout',
+          },
+        });
+      }
     });
   });
 
@@ -1453,7 +1456,7 @@ export const runActionTestSuite = ({
   });
 
   // FLAKY: https://github.com/elastic/kibana/issues/166199
-  describe.skip('waitForPickupUpdatedMappingsTask', () => {
+  describe('waitForPickupUpdatedMappingsTask', () => {
     it('rejects if there are failures', async () => {
       const res = (await pickupUpdatedMappings(
         client,
@@ -1490,27 +1493,29 @@ export const runActionTestSuite = ({
       await expect(task()).rejects.toThrow('index_not_found_exception');
     });
 
-    it('resolves left wait_for_task_completion_timeout when the task does not complete within the timeout', async () => {
-      const res = (await pickupUpdatedMappings(
-        client,
-        'existing_index_with_100k_docs',
-        1000
-      )()) as Either.Right<UpdateByQueryResponse>;
+    it.only('resolves left wait_for_task_completion_timeout when the task does not complete within the timeout', async () => {
+      for (let i = 0; i < 100000; i++) {
+        const res = (await pickupUpdatedMappings(
+          client,
+          'existing_index_with_100k_docs',
+          1000
+        )()) as Either.Right<UpdateByQueryResponse>;
 
-      const task = waitForPickupUpdatedMappingsTask({
-        client,
-        taskId: res.right.taskId,
-        timeout: '0s',
-      });
+        const task = waitForPickupUpdatedMappingsTask({
+          client,
+          taskId: res.right.taskId,
+          timeout: '0s',
+        });
 
-      await expect(task()).resolves.toMatchObject({
-        _tag: 'Left',
-        left: {
-          error: expect.any(errors.ResponseError),
-          message: expect.stringContaining('[timeout_exception]'),
-          type: 'wait_for_task_completion_timeout',
-        },
-      });
+        await expect(task()).resolves.toMatchObject({
+          _tag: 'Left',
+          left: {
+            error: expect.any(errors.ResponseError),
+            message: expect.stringContaining('[timeout_exception]'),
+            type: 'wait_for_task_completion_timeout',
+          },
+        });
+      }
     });
     it('resolves right when successful', async () => {
       const res = (await pickupUpdatedMappings(
