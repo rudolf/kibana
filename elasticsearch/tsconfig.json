@@ -1,9 +1,8 @@
 {
+  "extends": "../tsconfig.base.json",
   "compilerOptions": {
-    "target": "es2019",
     "module": "commonjs",
     "moduleResolution": "node",
-    "declaration": true,
     "pretty": true,
     "noEmitOnError": true,
     "strict": true,
@@ -15,11 +14,10 @@
     "noFallthroughCasesInSwitch": true,
     "useDefineForClassFields": true,
     "forceConsistentCasingInFileNames": true,
-    "skipLibCheck": false,
     "esModuleInterop": true,
     "isolatedModules": true,
     "importHelpers": true,
-    "outDir": "lib",
+    "outDir": "target/types",
     "lib": [
       "esnext"
     ]
@@ -29,7 +27,7 @@
     "tabSize": 2
   },
   "exclude": [
-    "node_modules"
+    "target/**/*"
   ],
   "include": [
     "./src/**/*.ts"
