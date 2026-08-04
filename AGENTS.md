@@ -2,9 +2,10 @@
 
 ## Cursor Cloud specific instructions
 
-This is **Kibana 8.0.0** (a large Bazel/Yarn monorepo). It is a browser-based
-analytics/search UI for Elasticsearch, so running the app end-to-end requires an
-Elasticsearch instance in addition to the Kibana dev server.
+This is **Kibana 8.0.0** (a large Bazel/Yarn monorepo). For typical Cursor Cloud
+agent work, **checking out the code and bootstrapping deps is enough** — do
+**not** start Elasticsearch or the Kibana dev server unless the task explicitly
+asks you to run the application end-to-end.
 
 Standard setup/run/test commands are documented in `README.md`,
 `CONTRIBUTING.md`, `dev_docs/getting_started/setting_up_a_development_env.mdx`,
@@ -31,31 +32,23 @@ are captured below.
   `BUILD_TS_REFS_CACHE_ENABLE=false` to skip the cache lookup (TS refs are still
   built locally). The startup update script already does this.
 
-### Elasticsearch (required to run Kibana)
-- Start it with: `yarn es snapshot --license trial` (downloads/extracts a
-  snapshot into `.es/8.0.0`, then runs it). Dev credentials are
-  `elastic` / `changeme`; it listens on **http://localhost:9200** (plain HTTP,
-  security enabled).
-- **Critical caveat:** the snapshot's bundled JDK crashes on startup in this
-  container with a cgroup v2 NPE
-  (`CgroupV2Subsystem.getInstance ... anyController is null`) while parsing JVM
-  options. Work around it by exporting `JDK_JAVA_OPTIONS="-XX:-UseContainerSupport"`
-  in the shell that launches ES (kbn-es forwards `process.env` to the ES child,
-  so this reaches the JVM option parser). Without it, ES exits with code 1 before
-  it starts.
-
-### Kibana dev server
-- Start it (in a separate shell, after ES is up) with: `yarn start`.
-- The first start compiles ~117 optimizer bundles (a few minutes) before the app
-  is available; wait for `Kibana is now available`.
-- In dev mode Kibana serves under a **random base path** printed in the logs
-  (e.g. `http://localhost:5601/wuh`). Pass `--no-base-path` to `yarn start` to
-  pin it to `http://localhost:5601/`. Log in through the form with
-  `elastic` / `changeme` (browser sessions use the login form, not HTTP basic
-  auth).
-
 ### Lint / test
 - Full-repo lint and test suites are enormous; scope them to a path/package.
   - ESLint: `node scripts/eslint <path>`  (style: `node scripts/stylelint`)
   - Jest unit: `node scripts/jest <path>` (e.g. `node scripts/jest packages/kbn-std`)
-  - Jest integration / FTR: `node scripts/jest_integration`, `node scripts/functional_tests`.
+  - Jest integration / FTR: `node scripts/jest_integration`, `node scripts/functional_tests`
+    (these may need Elasticsearch; only run when the task requires them).
+
+### Running Kibana / Elasticsearch (only when explicitly requested)
+Do not start these for ordinary code/lint/unit-test tasks.
+
+- Elasticsearch: `yarn es snapshot --license trial` → `http://localhost:9200`,
+  credentials `elastic` / `changeme`.
+  - **Caveat:** the snapshot's bundled JDK crashes on startup in this container
+    with a cgroup v2 NPE (`CgroupV2Subsystem.getInstance ... anyController is
+    null`). Export `JDK_JAVA_OPTIONS="-XX:-UseContainerSupport"` in the shell
+    that launches ES (kbn-es forwards `process.env` to the ES child).
+- Kibana: `yarn start` (after ES is up). First start compiles ~117 optimizer
+  bundles. Dev mode serves under a **random base path** (e.g.
+  `http://localhost:5601/wuh`); pass `--no-base-path` to pin to `/`. Log in via
+  the form with `elastic` / `changeme`.
