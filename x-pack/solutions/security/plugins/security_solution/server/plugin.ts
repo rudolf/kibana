@@ -187,6 +187,8 @@ import { setupAlertsCapabilitiesSwitcher } from './lib/capabilities/alerts_capab
 import { securityAlertsProfileInitializer } from './lib/anonymization';
 import { registerWorkflowSteps } from './workflows/step_types';
 import { registerEndpointWorkflowSteps } from './workflows/step_types/endpoint/register_workflow_steps';
+import { AlertGraphEs } from './remote/alert_graph_es';
+import { AlertGraphEsToken } from './remote/tokens';
 import { setFingerprintCreateAllowed } from './workflows/step_types/match_attack_fingerprints/match_attack_fingerprints';
 import {
   registerSecurityManagedWorkflowOwner,
@@ -931,6 +933,13 @@ export class Plugin implements ISecuritySolutionPlugin {
       registerSecurityWorkflowTriggers(plugins.workflowsExtensions);
       registerSecurityManagedWorkflowOwner(plugins.workflowsExtensions);
     }
+
+    core.remote.bind(AlertGraphEsToken, (scopes) => {
+      return new AlertGraphEs(scopes, async (request) => {
+        const [coreStart] = await core.getStartServices();
+        return coreStart.elasticsearch.client.asScoped(request).asCurrentUser;
+      });
+    });
 
     this.threatIntelSupplyEnabled = isThreatIntelSupplyEnabled(plugins.alertzero);
     setupThreatIntel({
