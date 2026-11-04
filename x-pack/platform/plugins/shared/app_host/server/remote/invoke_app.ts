@@ -9,6 +9,7 @@ import { randomUUID } from 'node:crypto';
 import { RpcSession } from 'capnweb';
 import { expose } from '@kbn/core-remote-common';
 import { RPC_LIMITS } from '../../common';
+import { projectWorkerManifest } from '../package/manifest_schema';
 import type { AppPackage } from '../package/read_package';
 import { BoundedWebSocketTransport, type MinimalWebSocket } from './bounded_transport';
 import { isDeadlineReason } from './deadline';
@@ -88,7 +89,12 @@ export const invokeApp = async ({
   createSocket = defaultSocket,
 }: InvokeAppOptions): Promise<{ value: unknown; timings: InvokeTimings }> => {
   const started = performance.now();
-  const request = { manifest: pkg.manifest, bundle: pkg.bundle, invocationId: randomUUID() };
+  // Preserve the Worker wire schema: never forward UI, approval or dashboard grant fields.
+  const request = {
+    manifest: projectWorkerManifest(pkg.manifest),
+    bundle: pkg.bundle,
+    invocationId: randomUUID(),
+  };
   const timings: InvokeTimings = {
     connectMs: 0,
     authMs: 0,

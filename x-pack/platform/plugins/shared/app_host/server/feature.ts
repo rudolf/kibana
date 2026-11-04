@@ -9,6 +9,7 @@ import { DEFAULT_APP_CATEGORIES } from '@kbn/core/server';
 import type { KibanaFeatureConfig } from '@kbn/features-plugin/common';
 import { i18n } from '@kbn/i18n';
 import { API_PRIVILEGE_READ, FEATURE_ID, PLUGIN_ID } from '../common';
+import { API_PRIVILEGE_APP_ALERT_DIGEST, APP_FEATURE_ID } from '../common/ui_protocol';
 
 const privilege = {
   app: [PLUGIN_ID],
@@ -26,5 +27,29 @@ export const appHostFeature: KibanaFeatureConfig = {
   privileges: {
     all: privilege,
     read: privilege,
+  },
+};
+
+const appPrivilege = {
+  app: [],
+  api: [API_PRIVILEGE_APP_ALERT_DIGEST],
+  savedObject: { all: [], read: [] },
+  ui: [],
+};
+
+/**
+ * Fixed per-app privilege `read_app_alert_digest`, registered at setup. Required in addition to
+ * `read_app_host` for the app's metadata, UI documents, leases, execution and native summary.
+ */
+export const appHostAlertDigestFeature: KibanaFeatureConfig = {
+  id: APP_FEATURE_ID,
+  name: i18n.translate('xpack.appHost.alertDigestFeatureName', {
+    defaultMessage: 'App Host app: Alert digest (prototype)',
+  }),
+  category: DEFAULT_APP_CATEGORIES.management,
+  app: [],
+  privileges: {
+    all: appPrivilege,
+    read: appPrivilege,
   },
 };

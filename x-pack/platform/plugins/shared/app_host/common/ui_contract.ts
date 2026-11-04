@@ -1,0 +1,142 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+// The immutable bridgeApi 1 contract: capability descriptors plus the UI security profile.
+// Its canonical SHA-256 is the manifest's `ui.scopeMapDigest`. Any semantic expansion or policy
+// relaxation changes the digest, so existing approvals stop matching (fail closed). The digest is
+// pinned by a snapshot test; changing it requires a new contract identity and security review.
+// Pure data, no imports beyond constants: the prototype release tool hashes the same object.
+
+import { UI_BRIDGE_API, UI_LIMITS } from './ui_protocol';
+
+export interface CapabilityDescriptor {
+  readonly id: string;
+  readonly bridgeMethod: string;
+  readonly kind: 'server' | 'parent';
+  readonly description: string;
+  readonly input: string;
+  readonly output: string;
+  readonly mintsCredential: boolean;
+  readonly executesLater: boolean;
+  readonly egressSideEffect: boolean;
+  readonly acceptsReferences: boolean;
+}
+
+/** Closed registry of bridgeApi 1 capabilities. Additions require security review. */
+export const BRIDGE_V1_CAPABILITIES: readonly CapabilityDescriptor[] = [
+  {
+    id: 'app.summary',
+    bridgeMethod: 'callAppRoute',
+    kind: 'server',
+    description: 'Run the approved app release GET /summary route as the current viewer',
+    input: "{method:'GET',path:'/summary'}",
+    output: '{appId,version,label,counts:{high,low}}',
+    mintsCredential: false,
+    executesLater: false,
+    egressSideEffect: false,
+    acceptsReferences: false,
+  },
+  {
+    id: 'es.search',
+    bridgeMethod: 'search',
+    kind: 'server',
+    description: 'Host-built match_all over the single granted synthetic index, current viewer',
+    input: '{index:<granted literal>,size:1..100}',
+    output: '{total,records:[{severity,rule}]}<=100,<=16KiB',
+    mintsCredential: false,
+    executesLater: false,
+    egressSideEffect: false,
+    acceptsReferences: false,
+  },
+  {
+    id: 'kibana.dashboard.read',
+    bridgeMethod: 'getDashboardPreview',
+    kind: 'server',
+    description:
+      'Current-viewer GET /api/dashboards/{grantedId} (2023-10-31), id/title projection only',
+    input: '{id:<granted UUID>}',
+    output: '{id,title<=256}<=4KiB',
+    mintsCredential: false,
+    executesLater: false,
+    egressSideEffect: false,
+    acceptsReferences: false,
+  },
+  {
+    id: 'host.theme',
+    bridgeMethod: 'getTheme',
+    kind: 'parent',
+    description: 'Fixed EUI color tokens and mode; no HTTP authority',
+    input: '()',
+    output: '{mode,colors:{background,text,border,primary,danger}}<=1KiB',
+    mintsCredential: false,
+    executesLater: false,
+    egressSideEffect: false,
+    acceptsReferences: false,
+  },
+];
+
+/** Normalized security profile; placeholders avoid digest cycles with origin and artifact URLs. */
+export const UI_SECURITY_PROFILE = {
+  guardianIframe: {
+    attributes: { referrerpolicy: 'no-referrer' },
+    forbiddenAttributes: ['sandbox', 'allow', 'allowfullscreen', 'srcdoc'],
+  },
+  childIframe: {
+    attributes: { sandbox: 'allow-scripts', referrerpolicy: 'no-referrer' },
+    forbiddenAttributes: ['allow', 'allowfullscreen', 'srcdoc'],
+  },
+  guardianCsp:
+    "default-src 'none'; script-src {guardianScript}; style-src 'unsafe-inline'; frame-src {childDocument}; base-uri 'none'; form-action 'none'; frame-ancestors {origin}",
+  childCsp:
+    "sandbox allow-scripts; default-src 'none'; script-src {bootstrapScript} {uiScript}; script-src-attr 'none'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; frame-src 'none'; worker-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors {origin}",
+  jsonCsp: "sandbox; default-src 'none'; frame-ancestors 'none'",
+  assetCsp: "sandbox; default-src 'none'; frame-ancestors 'none'",
+  corePolicy: 'core enforcing policy retained; report-uri, report-to and report-sample removed',
+  reportOnly: 'empty',
+  referrerPolicy: 'no-referrer',
+  permissionsPolicy:
+    'accelerometer=(), autoplay=(), bluetooth=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(), geolocation=(), gyroscope=(), hid=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), serial=(), usb=(), web-share=(), xr-spatial-tracking=()',
+  dnsPrefetch: 'off',
+  cacheControl: 'no-store',
+  documentFetchDest: 'iframe',
+  assetDisposition: 'attachment',
+  protocol: {
+    transport: 'string-only MessagePort',
+    frameBytes: UI_LIMITS.frameBytes,
+    receiveQueueBytes: UI_LIMITS.receiveQueueBytes,
+    maxDepth: UI_LIMITS.rpcMaxDepth,
+    maxBigIntDigits: UI_LIMITS.rpcMaxBigIntDigits,
+    liveStubs: UI_LIMITS.liveRpcStubs,
+    ingress: [UI_LIMITS.ingressPerSecond, UI_LIMITS.ingressBurst],
+    operations: [UI_LIMITS.operationsPerSecond, UI_LIMITS.operationsBurst],
+    operationsPerLease: UI_LIMITS.operationsPerLease,
+    inFlightPerLease: UI_LIMITS.inFlightPerLease,
+    deadlineMs: UI_LIMITS.operationDeadlineMs,
+    guestCallbacks: false,
+  },
+} as const;
+
+export const UI_CONTRACT_V1 = {
+  bridgeApi: UI_BRIDGE_API,
+  capabilities: BRIDGE_V1_CAPABILITIES,
+  securityProfile: UI_SECURITY_PROFILE,
+} as const;
+
+/** Deterministic JSON: object keys sorted recursively, no whitespace. Data-only input. */
+export const canonicalJson = (value: unknown): string => {
+  if (value === null || typeof value !== 'object') {
+    const encoded = JSON.stringify(value);
+    if (encoded === undefined) throw new Error('canonicalJson: unsupported value');
+    return encoded;
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+    .join(',')}}`;
+};

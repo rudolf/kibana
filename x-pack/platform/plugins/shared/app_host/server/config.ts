@@ -38,6 +38,9 @@ const configSchema = schema.object({
   ),
   // Dedicated random deployment secret shared with the dispatcher. Never sent to app code.
   callerToken: whenEnabled(schema.string({ minLength: 32, maxLength: 256 })),
+  // Operator-only approval record for the app UI (consent.json, mode 0600). Unset: UI disabled and
+  // the native summary keeps its legacy backend-only behaviour.
+  consentPath: schema.maybe(schema.string({ minLength: 1, maxLength: 4096 })),
 });
 
 export type AppHostConfig = TypeOf<typeof configSchema>;

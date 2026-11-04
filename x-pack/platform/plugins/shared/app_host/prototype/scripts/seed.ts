@@ -73,7 +73,16 @@ const kibanaRole = async (name: string, elasticsearch: unknown, feature: boolean
     headers: { 'kbn-xsrf': 'app-host-seed' },
     body: {
       elasticsearch,
-      kibana: feature ? [{ base: [], feature: { appHost: ['read'] }, spaces: ['default'] }] : [],
+      // The native summary needs the host privilege and the fixed per-app privilege.
+      kibana: feature
+        ? [
+            {
+              base: [],
+              feature: { appHost: ['read'], appHostAlertDigest: ['read'] },
+              spaces: ['default'],
+            },
+          ]
+        : [],
     },
   });
   check(`role ${name}`, result.status, [204]);

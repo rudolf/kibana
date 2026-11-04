@@ -82,6 +82,10 @@ export const toSummaryResponse = (
         body: { message: 'App invocation failed', attributes: { code: outcome.code } },
         headers: reached,
       });
+    case 'release_mismatch':
+      return response.forbidden({
+        body: { message: 'App release is not approved', attributes: { code: 'app_stale' } },
+      });
     case 'invalid_output':
       return response.customError({
         statusCode: 502,

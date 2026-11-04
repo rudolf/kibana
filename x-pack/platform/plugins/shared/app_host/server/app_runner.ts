@@ -16,7 +16,7 @@ import type { MinimalWebSocket } from './remote/bounded_transport';
 import { createDeadline } from './remote/deadline';
 import { describeDispatcher } from './remote/dispatcher_endpoint';
 import { InvokeError, invokeApp, type InvokeErrorCode } from './remote/invoke_app';
-import { SearchCapability } from './remote/search_capability';
+import { SearchCapability, type SearchObserver } from './remote/search_capability';
 
 export interface AppRunnerConfig {
   readonly packagePath: string;
@@ -50,7 +50,17 @@ export type SummaryOutcome =
   | { readonly status: 'deadline' }
   | { readonly status: 'aborted' }
   | { readonly status: 'remote_error'; readonly code: string }
-  | { readonly status: 'invalid_output' };
+  | { readonly status: 'invalid_output' }
+  | { readonly status: 'release_mismatch' };
+
+export interface RunSummaryOptions {
+  /** Hold this verified full release across the invocation; any other installed release fails. */
+  readonly expectedReleaseDigest?: string;
+  /** Legacy mode (no operator approval configured): UI releases are never run unapproved. */
+  readonly legacyOnly?: boolean;
+  /** Observes each Worker-path HostEs search (audit attribution, S9). */
+  readonly searchObserver?: SearchObserver;
+}
 
 /** Orchestrates one summary invocation: limit, verify package, invoke remotely, validate output. */
 export class AppRunner {
@@ -70,7 +80,8 @@ export class AppRunner {
   async runSummary(
     appId: string,
     esClient: ElasticsearchClient,
-    requestAborted: AbortSignal
+    requestAborted: AbortSignal,
+    options: RunSummaryOptions = {}
   ): Promise<SummaryOutcome> {
     if (appId !== INSTALLED_APP_ID) return { status: 'not_found' };
     const release = this.#limiter.tryAcquire();
@@ -78,10 +89,24 @@ export class AppRunner {
     const started = performance.now();
     const deadline = createDeadline(requestAborted, this.#config.deadlineMs ?? LIMITS.deadlineMs);
     const { signal } = deadline;
-    const capability = new SearchCapability(esClient);
+    let capability: SearchCapability | undefined;
     try {
       const pkg = await readPackage(this.#config.packagePath);
       if (pkg.manifest.id !== appId) return { status: 'not_found' };
+      const { expectedReleaseDigest, legacyOnly, searchObserver } = options;
+      if (
+        expectedReleaseDigest !== undefined &&
+        pkg.manifest.releaseDigest !== expectedReleaseDigest
+      ) {
+        return { status: 'release_mismatch' };
+      }
+      if (legacyOnly && pkg.manifest.ui !== undefined) return { status: 'release_mismatch' };
+      // The grant comes from the verified release held for this whole invocation.
+      capability = new SearchCapability(
+        esClient,
+        { appId: pkg.manifest.id, indices: pkg.manifest.permissions.indices },
+        searchObserver
+      );
       const packageMs = performance.now() - started;
       const { value, timings } = await invokeApp({
         dispatcherUrl: this.#config.dispatcherUrl,
@@ -116,18 +141,18 @@ export class AppRunner {
     } catch (error) {
       return this.#failure(error, capability);
     } finally {
-      capability.revoke();
+      capability?.revoke();
       deadline.dispose();
       release();
     }
   }
 
-  #failure(error: unknown, capability: SearchCapability): SummaryOutcome {
+  #failure(error: unknown, capability: SearchCapability | undefined): SummaryOutcome {
     if (error instanceof PackageError) {
       this.#logger.warn(`App package rejected before invocation: ${error.code}`);
       return { status: 'invalid_package', code: error.code };
     }
-    if (capability.stats.esDenied) return { status: 'es_forbidden' };
+    if (capability?.stats.esDenied) return { status: 'es_forbidden' };
     if (error instanceof InvokeError) {
       const mapped: Record<InvokeErrorCode, SummaryOutcome> = {
         deadline: { status: 'deadline' },

@@ -1,0 +1,195 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+// Local superuser-operated approval tool. Before writing consent.json it verifies, with the same
+// authenticated installer principal in ES and Kibana: the reserved `superuser` role, ES
+// `_has_privileges` read on the exact index, and a successful native GET of the exact dashboard.
+// Every negative or unavailable check fails closed without writing. No credentials are persisted.
+
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { dirname, join } from 'node:path';
+import { canonicalJson } from '../../../common/ui_contract';
+import { http as defaultHttp, type HttpResult } from './http';
+import { LOCAL_DIR } from './secrets';
+import { sha256, type UiManifest } from './ui_release';
+
+export const CONSENT_FILE = join(LOCAL_DIR, 'operator', 'consent.json');
+
+export interface ConsentRecord {
+  readonly appId: string;
+  readonly enabled: boolean;
+  readonly approvedReleaseDigest: string;
+  readonly approvedVersion: string;
+  readonly approvedBy: string;
+  readonly installerGrantDigest: string;
+}
+
+export const installerGrantDigest = (manifest: UiManifest, approvedBy: string): string =>
+  sha256(
+    canonicalJson({
+      appId: manifest.id,
+      releaseDigest: manifest.releaseDigest,
+      indices: manifest.permissions.indices,
+      dashboardIds: manifest.permissions.dashboardIds,
+      scopes: manifest.ui.scopes,
+      approvedBy,
+    })
+  );
+
+const VERSION = /^(0|[1-9][0-9]{0,4})\.(0|[1-9][0-9]{0,4})\.(0|[1-9][0-9]{0,4})$/;
+export const parseVersion = (value: string): [number, number, number] => {
+  const match = VERSION.exec(value);
+  const parts = match ? [Number(match[1]), Number(match[2]), Number(match[3])] : [];
+  if (parts.length !== 3 || parts.some((part) => part > 65535)) {
+    throw new Error(`Invalid UI release version ${value}`);
+  }
+  return [parts[0], parts[1], parts[2]];
+};
+export const compareVersions = (a: string, b: string): number => {
+  const [x, y] = [parseVersion(a), parseVersion(b)];
+  return x[0] - y[0] || x[1] - y[1] || x[2] - y[2];
+};
+
+export const readConsent = (path = CONSENT_FILE): ConsentRecord | undefined =>
+  existsSync(path) ? (JSON.parse(readFileSync(path, 'utf8')) as ConsentRecord) : undefined;
+
+export const writeConsent = (record: ConsentRecord, path = CONSENT_FILE): void => {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  const tmp = `${path}.${randomBytes(6).toString('hex')}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+  chmodSync(tmp, 0o600);
+  renameSync(tmp, path);
+};
+
+export type ApprovalFailure =
+  | 'es_unavailable'
+  | 'kibana_unavailable'
+  | 'not_superuser'
+  | 'mixed_identities'
+  | 'index_privilege_missing'
+  | 'dashboard_unreadable'
+  | 'downgrade_rejected';
+
+export class ApprovalError extends Error {
+  readonly code: ApprovalFailure;
+  constructor(code: ApprovalFailure) {
+    super(`approval refused: ${code}`);
+    this.code = code;
+  }
+}
+
+export interface ApprovalOptions {
+  readonly manifest: UiManifest;
+  readonly esUrl: string;
+  readonly kbUrl: string;
+  /** Installer credentials for ES and Kibana; normally the same `user:pass`. */
+  readonly esAuth: string;
+  readonly kbAuth: string;
+  readonly consentPath?: string;
+  readonly http?: typeof defaultHttp;
+}
+
+export interface ApprovalResult {
+  readonly written: boolean;
+  readonly idempotent: boolean;
+  readonly approvedBy: string;
+  readonly installerGrantDigest: string;
+}
+
+const safe = async (call: () => Promise<HttpResult>, failure: ApprovalFailure) => {
+  try {
+    return await call();
+  } catch {
+    throw new ApprovalError(failure);
+  }
+};
+
+export const approveRelease = async ({
+  manifest,
+  esUrl,
+  kbUrl,
+  esAuth,
+  kbAuth,
+  consentPath = CONSENT_FILE,
+  http = defaultHttp,
+}: ApprovalOptions): Promise<ApprovalResult> => {
+  parseVersion(manifest.version);
+  const authenticate = await safe(
+    () => http(`${esUrl}/_security/_authenticate`, { auth: esAuth }),
+    'es_unavailable'
+  );
+  if (authenticate.status !== 200) throw new ApprovalError('es_unavailable');
+  const esUser = authenticate.body as { username?: string; roles?: string[] };
+  if (!esUser.username || !(esUser.roles ?? []).includes('superuser')) {
+    throw new ApprovalError('not_superuser');
+  }
+  const me = await safe(
+    () =>
+      http(`${kbUrl}/internal/security/me`, {
+        auth: kbAuth,
+        headers: { 'x-elastic-internal-origin': 'app-host-approval' },
+      }),
+    'kibana_unavailable'
+  );
+  if (me.status !== 200) throw new ApprovalError('kibana_unavailable');
+  const kbUser = me.body as { username?: string };
+  // The same authenticated principal must pass both checks; never combine two people's privileges.
+  if (kbUser.username !== esUser.username) throw new ApprovalError('mixed_identities');
+  const [index] = manifest.permissions.indices;
+  const privileges = await safe(
+    () =>
+      http(`${esUrl}/_security/user/_has_privileges`, {
+        method: 'POST',
+        auth: esAuth,
+        body: { index: [{ names: [index], privileges: ['read'] }] },
+      }),
+    'es_unavailable'
+  );
+  const has = privileges.body as { has_all_requested?: boolean; username?: string };
+  if (privileges.status !== 200 || has.username !== esUser.username || !has.has_all_requested) {
+    throw new ApprovalError('index_privilege_missing');
+  }
+  const [dashboardId] = manifest.permissions.dashboardIds;
+  const dashboard = await safe(
+    () =>
+      http(`${kbUrl}/api/dashboards/${encodeURIComponent(dashboardId)}`, {
+        auth: kbAuth,
+        headers: { 'elastic-api-version': '2023-10-31' },
+      }),
+    'kibana_unavailable'
+  );
+  if (dashboard.status !== 200 || (dashboard.body as { id?: string }).id !== dashboardId) {
+    throw new ApprovalError('dashboard_unreadable');
+  }
+  const approvedBy = esUser.username;
+  const grant = installerGrantDigest(manifest, approvedBy);
+  const existing = readConsent(consentPath);
+  if (existing) {
+    if (
+      existing.approvedReleaseDigest === manifest.releaseDigest &&
+      existing.approvedVersion === manifest.version
+    ) {
+      return { written: false, idempotent: true, approvedBy, installerGrantDigest: grant };
+    }
+    if (compareVersions(manifest.version, existing.approvedVersion) <= 0) {
+      throw new ApprovalError('downgrade_rejected');
+    }
+  }
+  writeConsent(
+    {
+      appId: manifest.id,
+      enabled: true,
+      approvedReleaseDigest: manifest.releaseDigest,
+      approvedVersion: manifest.version,
+      approvedBy,
+      installerGrantDigest: grant,
+    },
+    consentPath
+  );
+  return { written: true, idempotent: false, approvedBy, installerGrantDigest: grant };
+};

@@ -35,6 +35,46 @@ code, and does not offer an SDK, install API, saved objects, tasks or app-author
 - `/app/appHost`: a static, host-rendered page with title, version, refresh button and severity
   table. App-provided text is rendered as text.
 
+## Third-party app UI (synthetic, local-only cut)
+
+Spec: `kibana-apps-ui-cut-spec.md` (design docs) and its security sign-off (conditions S1–S11). This is
+a synthetic-data prototype, **not** approval to expose customer data to third-party browser code, and
+not production-ready (production gates G1–G6 are not implemented).
+
+U1 — browser shell (no data capability):
+
+- Static deep link `alert-digest` → `/app/appHost/alert-digest`: trusted host chrome (title, fixed
+  publisher, approved version, release fingerprint, scopes, resources, declared egress, the required
+  consent copy, **Allow this version** and **Disable**) outside the frame. Package-supplied text renders
+  as text. Nothing is framed before the viewer clicks Allow.
+- Topology: trusted parent → trusted same-origin **guardian** iframe (`referrerpolicy=no-referrer`, no
+  `sandbox`/`allow`/`allowfullscreen`) → opaque app iframe with exactly `sandbox="allow-scripts"` and
+  `referrerpolicy="no-referrer"`.
+- Documents `GET /api/app_host/ui/{appId}/{releaseDigest}/{guardian|frame}`: both privileges, approved and
+  enabled release only, default space only, `Sec-Fetch-Dest: iframe` only (else 403 JSON), no query
+  string, fixed generated HTML with server-derived values in a JSON data block.
+- Assets `GET /api/app_host/ui_assets/{file}`: the two fixed host scripts (`host-guardian.js`,
+  `host-child.js`) and the approved UI bundle `<uiDigest>.js` (≤512 KiB, SHA-256 recomputed on every
+  read). Public, `application/javascript`, `Content-Disposition: attachment`, `nosniff`, response
+  sandbox. Anything else (unknown, unapproved, disabled, tampered) is **404**, never 401/403 (S6).
+- A post-Core `onPreResponse` hook composes the final-wire headers on every App Host path (`/api/app_host/`,
+  `/internal/app_host/`, `/api/apps/`), including 4xx/5xx: Core's enforcing policy rebuilt from
+  `http.csp.header` minus `report-uri`/`report-to`/`'report-sample'` (S1), then the strict surface policy
+  (guardian, child, asset or JSON), an empty `Content-Security-Policy-Report-Only`, and post-Core
+  `Referrer-Policy: no-referrer`, a deny-all `Permissions-Policy`, `X-DNS-Prefetch-Control: off`,
+  `Cache-Control: no-store` and `nosniff` (S2). Other Kibana routes are untouched.
+- Handshake: the parent creates one RPC `MessageChannel` and one control channel, posts them to the
+  guardian (exact Kibana origin). The guardian accepts exactly two handshake messages, checking
+  `event.source`/origin before reading data (S4): the parent's init and the child's echo of a one-time
+  challenge it sends on the child's first load. It then transfers the RPC port once and removes its
+  listeners. Any later child or guardian load revokes; nothing is rebound. The host child bootstrap
+  clears `window.name`, answers the challenge, then loads only the verified UI bundle. Lifecycle notices
+  use the control port; the parent has no window `message` listener.
+- Parent RPC: capnweb `RpcSession` over a bounded string-only port transport (32 KiB UTF-8 per frame,
+  256 KiB / 1,024-frame queue, ingress paced at 60/s burst 16, `messageerror` terminates; depth 12,
+  BigInt 64, ≤128 live stubs). In U1 no lease or server executor is wired: the three data methods
+  deny with `app_denied`; only `getTheme()` returns (fixed EUI tokens).
+
 capnweb sessions use `maxMessageSize: 256 KiB`, `maxDepth: 32` and `maxBigIntDigits: 64`, plus a
 transport that rejects binary frames, frames over 256 KiB and a receive queue over 1 MiB before
 parsing. Both caps count **UTF-8 bytes** (capnweb's own `maxMessageSize` counts UTF-16 code units).

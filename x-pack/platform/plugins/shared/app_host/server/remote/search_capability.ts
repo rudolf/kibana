@@ -8,7 +8,17 @@
 import type { ElasticsearchClient } from '@kbn/core/server';
 import { isRequestAbortedError, isResponseError } from '@kbn/es-errors';
 import { LIMITS, SYNTHETIC_INDEX } from '../../common';
+import { evaluateSearch, isGrantedHitIndex, type VerifiedGrant } from '../grant_evaluator';
 import { HostError } from './host_error';
+
+/** Observes every search attempt (audit attribution); never receives payloads. */
+export type SearchObserver = (outcome: 'success' | 'failure', reason: string) => void;
+
+/** Grant used when no verified release grant is supplied (legacy backend-only manifests). */
+export const LEGACY_SYNTHETIC_GRANT: VerifiedGrant = {
+  appId: 'legacy',
+  indices: [SYNTHETIC_INDEX],
+};
 
 export interface HostEsRecord {
   readonly severity: string;
@@ -35,34 +45,14 @@ interface AlertSource {
 
 const SEVERITY_PATTERN = /^[a-z]{1,16}$/;
 
-const isPlainObject = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' &&
-  value !== null &&
-  !Array.isArray(value) &&
-  [Object.prototype, null].includes(Object.getPrototypeOf(value));
-
-const parseParams = (params: unknown): { size: number } => {
-  if (!isPlainObject(params)) throw new HostError('invalid_search');
-  const keys = Object.keys(params);
-  if (keys.length !== 2 || !keys.includes('index') || !keys.includes('size')) {
-    throw new HostError('invalid_search');
-  }
-  const { index, size } = params;
-  // Exact match only: no wildcards, comma lists, arrays, cross-cluster names or other indices.
-  if (index !== SYNTHETIC_INDEX) throw new HostError('index_not_granted');
-  if (typeof size !== 'number' || !Number.isInteger(size) || size < 1) {
-    throw new HostError('invalid_search');
-  }
-  if (size > LIMITS.callbackRecords) throw new HostError('invalid_search');
-  return { size };
-};
-
 /**
  * Request-scoped Elasticsearch capability behind the exposed `HostEs` facade.
  * Holds the route's `asCurrentUser` client, a one-call budget and an abort signal; never exposed.
  */
 export class SearchCapability {
   readonly #client: ElasticsearchClient;
+  readonly #grant: VerifiedGrant;
+  readonly #observer: SearchObserver | undefined;
   readonly #abort = new AbortController();
   #active = true;
   #calls = 0;
@@ -71,8 +61,14 @@ export class SearchCapability {
   #requestBytes = 0;
   #responseBytes = 0;
 
-  constructor(client: ElasticsearchClient) {
+  constructor(
+    client: ElasticsearchClient,
+    grant: VerifiedGrant = LEGACY_SYNTHETIC_GRANT,
+    observer?: SearchObserver
+  ) {
     this.#client = client;
+    this.#grant = grant;
+    this.#observer = observer;
   }
 
   public get active(): boolean {
@@ -96,16 +92,29 @@ export class SearchCapability {
   }
 
   async search(params: unknown): Promise<HostEsSearchResult> {
+    try {
+      const result = await this.#search(params);
+      this.#observer?.('success', 'ok');
+      return result;
+    } catch (error) {
+      this.#observer?.('failure', error instanceof HostError ? error.code : 'host_error');
+      throw error;
+    }
+  }
+
+  async #search(params: unknown): Promise<HostEsSearchResult> {
     if (!this.#active) throw new HostError('host_revoked');
     this.#calls += 1;
     if (this.#calls > LIMITS.callbacksPerInvocation) throw new HostError('callback_budget');
     this.#requestBytes += Buffer.byteLength(JSON.stringify(params) ?? '');
-    const { size } = parseParams(params);
+    const decision = evaluateSearch(this.#grant, params);
+    if (!decision.allowed) throw new HostError(decision.reason);
+    const { index, size } = decision;
     const started = performance.now();
     try {
       const response = await this.#client.search<AlertSource>(
         {
-          index: SYNTHETIC_INDEX,
+          index,
           size,
           expand_wildcards: 'none',
           allow_no_indices: false,
@@ -135,7 +144,7 @@ export class SearchCapability {
     let bytes = 0;
     for (const hit of hits.hits.slice(0, LIMITS.callbackRecords)) {
       // An alias with the granted name could resolve elsewhere; refuse rather than leak.
-      if (hit._index !== SYNTHETIC_INDEX) throw new HostError('index_not_granted');
+      if (!isGrantedHitIndex(this.#grant, hit._index)) throw new HostError('index_not_granted');
       const { severity, rule } = hit._source ?? {};
       if (typeof severity !== 'string' || !SEVERITY_PATTERN.test(severity)) continue;
       if (typeof rule !== 'string' || rule.length === 0 || rule.length > LIMITS.ruleLength) {

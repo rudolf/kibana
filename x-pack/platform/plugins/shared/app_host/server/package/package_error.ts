@@ -11,7 +11,13 @@ export type PackageErrorCode =
   | 'manifest_invalid'
   | 'bundle_unavailable'
   | 'bundle_too_large'
-  | 'digest_mismatch';
+  | 'digest_mismatch'
+  | 'ui_invalid'
+  | 'release_digest_mismatch'
+  | 'scope_map_mismatch'
+  | 'ui_bundle_unavailable'
+  | 'ui_bundle_too_large'
+  | 'ui_digest_mismatch';
 
 /** Raised when the installed package cannot be trusted; the host fails closed before any remote call. */
 export class PackageError extends Error {

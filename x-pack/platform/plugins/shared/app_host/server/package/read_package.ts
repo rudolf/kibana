@@ -9,7 +9,14 @@ import { createHash } from 'node:crypto';
 import { constants, promises as fs } from 'node:fs';
 import { join } from 'node:path';
 import { LIMITS } from '../../common';
-import { manifestSchema, type AppManifest } from './manifest_schema';
+import { UI_LIMITS } from '../../common/ui_protocol';
+import { SCOPE_MAP_DIGEST_V1, computeReleaseDigest } from '../ui/contract';
+import {
+  manifestSchema,
+  parseUiVersion,
+  type AppManifest,
+  type UiAppManifest,
+} from './manifest_schema';
 import { PackageError, type PackageErrorCode } from './package_error';
 
 export interface AppPackage {
@@ -57,11 +64,65 @@ export const readManifest = async (packagePath: string): Promise<AppManifest> =>
     'package_unavailable',
     'manifest_too_large'
   );
+  let parsed: unknown;
+  let manifest: AppManifest;
   try {
-    return manifestSchema.validate(JSON.parse(raw.toString('utf8')));
+    parsed = JSON.parse(raw.toString('utf8'));
+    manifest = manifestSchema.validate(parsed);
   } catch {
     throw new PackageError('manifest_invalid');
   }
+  verifyReleaseEnvelope(manifest, parsed as Record<string, unknown>);
+  return manifest;
+};
+
+/**
+ * Cross-field checks. Legacy backend-only manifests carry no UI fields. A UI release needs a
+ * numeric version, the digest-named entry, exactly one dashboard grant, the host's own bridgeApi 1
+ * contract digest and a release digest that covers every other manifest field.
+ */
+const verifyReleaseEnvelope = (manifest: AppManifest, raw: Record<string, unknown>): void => {
+  const { ui, releaseDigest, permissions } = manifest;
+  if (!ui) {
+    if (releaseDigest !== undefined || permissions.dashboardIds !== undefined) {
+      throw new PackageError('ui_invalid');
+    }
+    return;
+  }
+  if (releaseDigest === undefined || permissions.dashboardIds === undefined) {
+    throw new PackageError('ui_invalid');
+  }
+  if (ui.entry !== `${ui.digest}.js` || !parseUiVersion(manifest.version)) {
+    throw new PackageError('ui_invalid');
+  }
+  if (ui.scopeMapDigest !== SCOPE_MAP_DIGEST_V1) throw new PackageError('scope_map_mismatch');
+  // Hash the parsed JSON (the validated value has the same content; unknown keys were rejected).
+  if (computeReleaseDigest(raw) !== releaseDigest) {
+    throw new PackageError('release_digest_mismatch');
+  }
+};
+
+export const isUiManifest = (manifest: AppManifest): manifest is UiAppManifest =>
+  manifest.ui !== undefined &&
+  manifest.releaseDigest !== undefined &&
+  manifest.permissions.dashboardIds !== undefined;
+
+/**
+ * Reads the approved immutable UI bundle with the 512 KiB bound and recomputes its SHA-256.
+ * A digest-looking filename alone is never treated as integrity verification.
+ */
+export const readUiBundle = async (packagePath: string, uiDigest: string): Promise<Buffer> => {
+  if (!/^[0-9a-f]{64}$/.test(uiDigest)) throw new PackageError('ui_bundle_unavailable');
+  const raw = await readBounded(
+    join(packagePath, `${uiDigest}.js`),
+    UI_LIMITS.uiBundleBytes,
+    'ui_bundle_unavailable',
+    'ui_bundle_too_large'
+  );
+  if (createHash('sha256').update(raw).digest('hex') !== uiDigest) {
+    throw new PackageError('ui_digest_mismatch');
+  }
+  return raw;
 };
 
 /**
