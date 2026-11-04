@@ -18,7 +18,8 @@
     "benchmark": "tsx scripts/benchmark.ts",
     "typecheck": "tsc -p tsconfig.json && tsc -p cloudflare/tsconfig.json",
     "test": "npm run -s typecheck && tsx --test 'test/*_test.ts'",
-    "kibana:config": "tsx scripts/local_kibana_config.ts"
+    "kibana:config": "tsx scripts/local_kibana_config.ts",
+    "ui-check": "tsx scripts/ui_check.ts"
   },
   "dependencies": {
     "capnweb": "0.12.0"

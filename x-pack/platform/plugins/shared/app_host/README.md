@@ -85,10 +85,12 @@ curl -s -u "$READER" "$KB_URL/api/apps/alert-digest/summary"
 # {"appId":"alert-digest","version":"1.0.1","label":"Digest v2","counts":{"high":2,"low":1}}
 npm --prefix "$P/prototype" run acceptance -- --kibana "$KB_URL" --rpc ws://127.0.0.1:8787/rpc \
   --wrangler-log "$P/prototype/.local/logs/wrangler.log" --local-workerd
-npm --prefix "$P/prototype" run benchmark -- --kibana "$KB_URL" --samples 20
+npm --prefix "$P/prototype" run ui-check -- --kibana "$KB_URL"   # page v1 -> v2 via Refresh, screenshots in .local/
+npm --prefix "$P/prototype" run benchmark -- --kibana "$KB_URL" --samples 20 --rpc ws://127.0.0.1:8787/rpc
 ```
 
 Open `$KB_URL/app/appHost` as `app_host_reader`, release another label, and press **Refresh**.
+`acceptance` and `ui-check` mutate the package directory and restore its original manifest at the end.
 
 `--local-workerd` reports the CPU-loop checks as `NOT_ENFORCED_LOCALLY`: OSS workerd does not enforce
 Dynamic Worker `limits.cpuMs`. Remote acceptance must run without that flag, against a `wss://`
