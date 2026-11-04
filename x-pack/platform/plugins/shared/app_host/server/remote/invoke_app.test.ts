@@ -109,6 +109,51 @@ describe('invokeApp', () => {
     expect(Object.keys(request as object).sort()).toEqual(['bundle', 'invocationId', 'manifest']);
   });
 
+  it('projects a UI release manifest onto the unchanged Worker wire schema', async () => {
+    let request: { manifest?: Record<string, unknown> } | undefined;
+    const dispatcher = createFakeDispatcher({
+      token: TOKEN,
+      behaviour: async (req, host) => {
+        request = req as typeof request;
+        return summarise(host);
+      },
+    });
+    const client = createScopedClient();
+    client.search.mockResponse(searchResponse());
+    const base = pkg();
+    await invokeApp({
+      dispatcherUrl: 'ws://127.0.0.1:8787/rpc',
+      callerToken: TOKEN,
+      pkg: {
+        ...base,
+        manifest: {
+          ...base.manifest,
+          version: '2.0.0',
+          permissions: {
+            indices: ['kbn-apps-prototype-alerts'],
+            dashboardIds: ['78a07dab-f7e4-4bdf-b155-da929711312c'],
+          },
+          ui: {
+            entry: `${'b'.repeat(64)}.js`,
+            digest: 'b'.repeat(64),
+            bridgeApi: 1,
+            scopeMapDigest: 'c'.repeat(64),
+            scopes: ['app.summary'],
+            egress: { client: [], server: [] },
+          },
+          releaseDigest: 'd'.repeat(64),
+        },
+      },
+      capability: new SearchCapability(client),
+      signal: new AbortController().signal,
+      createSocket: dispatcher.createSocket,
+    });
+    expect(Object.keys(request?.manifest ?? {}).sort()).toEqual(
+      ['digest', 'hostApi', 'id', 'permissions', 'routes', 'title', 'version'].sort()
+    );
+    expect(request?.manifest?.permissions).toEqual({ indices: ['kbn-apps-prototype-alerts'] });
+  });
+
   it('exposes nothing on the Node side before authentication', async () => {
     const { dispatcher, run } = setup((_req, host) => summarise(host), 'w'.repeat(43));
     const pending = run();

@@ -46,6 +46,13 @@ writeFileSync(
     `csp.frame_ancestors: ["'self'"]`,
     // Synthetic local collector: proves app surfaces send no reports while normal routes keep Core's.
     `csp.report_uri: [${q(cspCollector)}]`,
+    // Kibana's own security audit log, to correlate native Dashboard reads with bridge records.
+    'xpack.security.audit.enabled: true',
+    'xpack.security.audit.appender:',
+    '  type: file',
+    `  fileName: ${q(resolve(logs, 'kibana_audit.ndjson'))}`,
+    '  layout:',
+    '    type: json',
     'logging:',
     '  appenders:',
     '    app_host_audit:',

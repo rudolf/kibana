@@ -11,6 +11,9 @@ import type { AppHostConfig } from './config';
 import { appHostAlertDigestFeature, appHostFeature } from './feature';
 import { registerRoutes } from './routes/register_routes';
 import type { AppHostPluginSetup, AppHostPluginStart, AppHostSetupDependencies } from './types';
+import { BridgeAuditLogger } from './ui/audit';
+import { BridgeService } from './ui/bridge_service';
+import { registerLeaseRoutes } from './ui/register_lease_routes';
 import { registerUiRoutes } from './ui/register_ui_routes';
 import { registerSecurityHeadersHook, SurfaceDecisions } from './ui/security_headers';
 import { UiUrls } from './ui/ui_context';
@@ -44,14 +47,27 @@ export class AppHostPlugin
 
     const { publicBaseUrl } = core.http.basePath;
     if (consentPath && publicBaseUrl) {
+      const urls = new UiUrls(publicBaseUrl);
       registerUiRoutes({
         router,
         basePath: core.http.basePath,
         packagePath,
         consentPath,
-        urls: new UiUrls(publicBaseUrl),
+        urls,
         decisions,
         logger: this.#logger.get('ui'),
+      });
+      registerLeaseRoutes({
+        router,
+        basePath: core.http.basePath,
+        urls,
+        service: new BridgeService({
+          packagePath,
+          consentPath,
+          runner,
+          audit: new BridgeAuditLogger(this.#logger.get('bridge_audit')),
+        }),
+        getStart: async () => (await core.getStartServices())[0],
       });
       this.#logger.info('App Host prototype enabled (third-party UI: synthetic local cut)');
     } else {

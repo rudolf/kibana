@@ -15,7 +15,10 @@ the remote steps.
 | `seam` | M1 assertions: Node → dispatcher → fresh Dynamic Worker → Node callback |
 | `kibana:config` | Write the git-ignored Kibana config `.local/kibana.app_host.yml` (0600) |
 | `seed` | Synthetic index (high/high/low, no aliases) and reader/no-index/no-feature roles and users |
-| `release` | Build the sample app; write `<sha256>.js` first, then atomically replace `manifest.json` |
+| `release` | Build the sample app; write `<sha256>.js` first, then atomically replace `manifest.json`. `--with-ui` also builds the UI IIFE and the UI envelope; `--approve-local-synthetic` runs the checked superuser approval and writes `.local/operator/consent.json` (0600) |
+| `ui:seed` | UI cut seed on top of `seed`: hostile `medium` record, granted + ungranted synthetic dashboards, empty space `app-host-empty`, viewer matrix (`.local/ui_users.json`, never printed) |
+| `ui:operator` | Operator `disable` / `enable` / `status` / `reset` of the approval file (never reachable through the bridge) |
+| `ui:security` | T1–T14 Playwright/API harness in Chromium/Firefox/WebKit; JSON report in `.local/ui_security-*.json` |
 | `acceptance` | Kibana-level M2/M3 assertions (authz, ES denial, package failures, limits, deadline, ...) |
 | `ui-check` | Page check of `/app/appHost` v1 → v2 via Refresh (uses the Kibana workspace's Playwright) |
 | `benchmark` | Fresh-invocation latency sample through Kibana (and optionally the raw seam) |
@@ -106,14 +109,19 @@ The total stays under 200 fresh invocations (~87). Cleanup (also needs approval)
   separate diagnostic probe (`probe*.ts`).
 - `shared/` wire protocol validation and the bounded WebSocket transport, used by the dispatcher and Node tools.
 - `app/src/` sample app: plain `Summary` class plus a native `WorkerEntrypoint` adapter (`App`).
+- `ui/src/` sample app UI (one classic IIFE: `main.ts` plus the small guest SDK `sdk.ts`); `ui/fixtures/hostile.ts`
+  is the deliberately hostile UI used by T1/T3–T6.
+- `scripts/lib/ui_suites/` the `ui:security` suites; `scripts/lib/approval.ts` the local approval tool.
 - `fixtures/` adversarial seam apps (egress, loop, misuse, budget, sentinel, echo, env probe).
 - `scripts/` Node tools run with the pinned `tsx`; `test/` node:test unit tests.
 
 ## Lint and type check
 
-`npm run lint` is the Workers-aware check for this directory. It runs both `tsc` projects (Node tools,
-and `cloudflare/tsconfig.json` against `@cloudflare/workers-types`, covering `cloudflare/`, `app/`,
-`fixtures/` and `shared/`), then Kibana's own `node scripts/eslint` on the prototype directory. Two
+`npm run lint` is the Workers-aware check for this directory. It runs the three `tsc` projects (Node
+tools; `cloudflare/tsconfig.json` against `@cloudflare/workers-types`, covering `cloudflare/`, `app/`,
+`fixtures/` and `shared/`; `ui/tsconfig.json` for the browser UI), then Kibana's own `node scripts/eslint`
+on the prototype directory. The release tool imports the plugin's own `common/ui_contract.ts`, so the
+scope-map digest it writes is the one Kibana pins. Two
 narrowly scoped overrides in the repository lint config make the Kibana lint accept constructs the
 Workers runtime requires, without inline `eslint-disable` comments:
 

@@ -225,6 +225,29 @@ describe('AppBridge over capnweb + bounded MessageChannel (T9)', () => {
     close();
   });
 
+  it('pipelined calls do not bypass per-lease in-flight and rate budgets', async () => {
+    const holds: Array<() => void> = [];
+    const operations: unknown[] = [];
+    const { remote, close } = connect(
+      (op) =>
+        new Promise((resolve) => {
+          operations.push(op);
+          holds.push(() => resolve({ ok: true, result: { ...SUMMARY } }));
+        })
+    );
+    // Twelve calls issued without awaiting (capnweb pushes them back to back).
+    const calls = Array.from({ length: 12 }, () =>
+      codeOf(remote.callAppRoute({ method: 'GET', path: '/summary' }))
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(operations).toHaveLength(2);
+    holds.forEach((release) => release());
+    const codes = await Promise.all(calls);
+    expect(codes.filter((code) => code === 'ok')).toHaveLength(2);
+    expect(codes.filter((code) => code === 'app_rate_limited')).toHaveLength(10);
+    close();
+  });
+
   it('a message deeper than 12 levels aborts the session', async () => {
     const { remote, ended, close } = connect();
     let deep: unknown = 'x';

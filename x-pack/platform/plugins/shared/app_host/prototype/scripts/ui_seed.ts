@@ -74,6 +74,26 @@ if (!dashboardId) {
   dashboardId = (created.body as { id: string }).id;
 }
 
+// 2b. A second synthetic dashboard that no release ever grants.
+const previousUngranted = (previous as { ungrantedDashboardId?: string }).ungrantedDashboardId;
+let ungrantedDashboardId = previousUngranted;
+if (ungrantedDashboardId) {
+  const existing = await kb(`/api/dashboards/${ungrantedDashboardId}`, 'GET', undefined, {
+    'elastic-api-version': '2023-10-31',
+  });
+  if (existing.status !== 200) ungrantedDashboardId = undefined;
+}
+if (!ungrantedDashboardId) {
+  const created = await kb(
+    '/api/dashboards',
+    'POST',
+    { title: 'Synthetic ungranted dashboard' },
+    { 'elastic-api-version': '2023-10-31' }
+  );
+  check('create ungranted dashboard', created.status, [200, 201]);
+  ungrantedDashboardId = (created.body as { id: string }).id;
+}
+
 // 3. Second, empty synthetic space for the superuser non-default-space denial controls.
 const space = await kb(`/api/spaces/space/${EMPTY_SPACE}`);
 if (space.status === 404) {
@@ -137,12 +157,13 @@ for (const key of Object.keys(roles) as UserKey[]) {
   check(`user ${username}`, result.status, [200]);
 }
 writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), { mode: 0o600 });
-writeUiSeed({ dashboardId, emptySpaceId: EMPTY_SPACE });
+writeUiSeed({ dashboardId, ungrantedDashboardId, emptySpaceId: EMPTY_SPACE });
 
 process.stdout.write(
   `${JSON.stringify({
     hostileRecord: 'synthetic-hostile (severity medium)',
     dashboardId,
+    ungrantedDashboardId,
     emptySpace: EMPTY_SPACE,
     users: Object.values(users).map(({ username }) => username),
     passwords: '.local/ui_users.json (git-ignored, not printed)',

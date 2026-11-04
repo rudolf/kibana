@@ -17,6 +17,8 @@ export const UI_SEED_FILE = join(LOCAL_DIR, 'ui_seed.json');
 
 export interface UiSeedState {
   readonly dashboardId: string;
+  /** A second, existing synthetic dashboard that is never granted (T13 existence-oracle control). */
+  readonly ungrantedDashboardId: string;
   readonly emptySpaceId: string;
 }
 

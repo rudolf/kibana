@@ -388,6 +388,7 @@ const runT6Engine = async (ctx: SuiteContext, engine: string) => {
       });
       await popup.close();
       await sleep(500);
+      const executesDuringSpoof = executes.length;
       releaseFrame();
       await waitForStatus(page, /^bound$/);
       const child = await waitForChild(page);
@@ -407,8 +408,8 @@ const runT6Engine = async (ctx: SuiteContext, engine: string) => {
         T6,
         'sibling opaque frame and unrelated window receive no capability',
         engine,
-        siblingGot.every((data) => data?.t !== 'port') && executes.length === 0,
-        { siblingMessages: siblingGot.length, executesDuringSpoof: executes.length }
+        siblingGot.every((data) => data?.t !== 'port') && executesDuringSpoof === 0,
+        { siblingMessages: siblingGot.length, executesDuringSpoof }
       );
 
       // S4: post-handshake flood, 1,000 x 1 MiB to the guardian and to top.

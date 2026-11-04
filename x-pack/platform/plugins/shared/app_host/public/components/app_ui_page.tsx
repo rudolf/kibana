@@ -127,9 +127,13 @@ export const AppUiPage = ({ http, createLease }: PageProps) => {
     refreshMetadata();
     const interval = setInterval(refreshMetadata, UI_LIMITS.pollIntervalMs);
     window.addEventListener('focus', refreshMetadata);
+    // Closing the tab revokes the lease too (keepalive request), not only an in-app unmount.
+    const onPageHide = () => unmountFrame('unmounted');
+    window.addEventListener('pagehide', onPageHide);
     return () => {
       clearInterval(interval);
       window.removeEventListener('focus', refreshMetadata);
+      window.removeEventListener('pagehide', onPageHide);
       unmountFrame('unmounted');
     };
   }, [refreshMetadata, unmountFrame]);
@@ -147,13 +151,27 @@ export const AppUiPage = ({ http, createLease }: PageProps) => {
         return;
       }
       leaseRef.current = lease;
-      const host = new FrameHost({
+      // Server rejection on the next call is authoritative: lifecycle codes tear the frame down.
+      const terminal: Partial<Record<string, FrameHostEndReason>> = {
+        app_disabled: 'disabled',
+        app_stale: 'stale',
+        app_expired: 'expired',
+      };
+      const executor: BridgeExecutor | undefined = lease
+        ? async (operation, signal) => {
+            const outcome = await lease.executor(operation, signal);
+            const reason = outcome.ok ? undefined : terminal[outcome.code];
+            if (reason) setTimeout(() => host.end(reason), 0);
+            return outcome;
+          }
+        : undefined;
+      const host: FrameHost = new FrameHost({
         container,
         guardianUrl: http.basePath.prepend(current.guardianPath),
         kibanaOrigin: window.location.origin,
         grant: { scopes: current.scopes, dashboardIds: current.dashboardIds },
         theme: () => themeRef.current as UiTheme,
-        executor: lease?.executor,
+        executor,
         onBound: () => setFrame({ status: 'bound' }),
         onEnded: (reason, detail) => {
           if (hostRef.current === host) {
