@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "lib": ["es2022"],
+    "types": ["@cloudflare/workers-types"],
+    "strict": true,
+    "noEmit": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "customConditions": ["workerd"]
+  },
+  "include": ["src/**/*.ts", "../shared/**/*.ts", "../app/src/**/*.ts", "../fixtures/**/*.ts"]
+}

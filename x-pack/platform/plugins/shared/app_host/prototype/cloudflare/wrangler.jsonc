@@ -1,0 +1,13 @@
+// App Host prototype dispatcher. Local: `npm run dev`. Remote deploy requires explicit user approval.
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "kbn-app-host-proto-dispatcher",
+  "main": "src/dispatcher.ts",
+  "compatibility_date": "2026-11-04",
+  "worker_loaders": [{ "binding": "LOADER" }],
+  "vars": { "DEPLOYMENT_ID": "kbn-app-host-proto" },
+  "workers_dev": true,
+  "preview_urls": false,
+  "observability": { "enabled": false },
+  "upload_source_maps": false
+}
