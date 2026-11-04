@@ -2,8 +2,10 @@
 
 Prototype plugin that runs one operator-installed backend app bundle in a fresh Cloudflare Dynamic
 Worker. It gives the app a request-scoped, read-only Elasticsearch capability for the current user,
-and renders the app's result on a static host page. It is **disabled by default**, is not production
-code, and does not offer an SDK, install API, saved objects, tasks or app-authored browser code.
+and renders the app's result on a static host page. With an operator approval file it also hosts the
+app's own UI in a guardian-wrapped, opaque-origin iframe with a typed, lease-bound bridge (the synthetic,
+local-only UI cut below). It is **disabled by default**, is not production code, and does not offer an SDK,
+install API, saved objects or tasks. App-authored browser code never runs in Kibana's origin.
 
 ## What it does
 

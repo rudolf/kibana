@@ -11,7 +11,15 @@
 // T11 never-delegable corpus (S8), T12 installer/approval/scope map, T13 uniform errors,
 // T14 ephemeral state / space / buckets.
 
-import { readFileSync, existsSync } from 'node:fs';
+import {
+  closeSync,
+  existsSync,
+  fstatSync,
+  openSync,
+  readFileSync,
+  readSync,
+  statSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { ApprovalError, approveRelease, readConsent, CONSENT_FILE } from '../approval';
 import { LOCAL_DIR } from '../secrets';
@@ -230,7 +238,7 @@ export const runT2 = async (ctx: SuiteContext) => {
     const keysBefore = await fetch(`${ctx.es}/_security/api_key?owner=false`, {
       headers: { authorization: `Basic ${Buffer.from(ctx.adminAuth).toString('base64')}` },
     }).then((r) => r.json() as Promise<{ api_keys: unknown[] }>);
-    const httpLogBefore = httpDebugLines();
+    const httpLogMark = httpDebugMark();
     const forbidden = await execute(ctx, su, {
       op: 'security.apiKey.create',
       params: { name: 'x' },
@@ -243,9 +251,9 @@ export const runT2 = async (ctx: SuiteContext) => {
     const keysAfter = await fetch(`${ctx.es}/_security/api_key?owner=false`, {
       headers: { authorization: `Basic ${Buffer.from(ctx.adminAuth).toString('base64')}` },
     }).then((r) => r.json() as Promise<{ api_keys: unknown[] }>);
-    const securityCalls = httpDebugLines()
-      .slice(httpLogBefore.length)
-      .filter((line) => /\/(api|internal)\/security\//.test(line));
+    const securityCalls = httpDebugSince(httpLogMark).filter((line) =>
+      /\/(api|internal)\/security\//.test(line)
+    );
     report.expect(
       T,
       'superuser: non-delegable op rejected, zero native security-route calls, no key minted',
@@ -331,8 +339,23 @@ const runT2Browser = async (ctx: SuiteContext, engine: string) => {
 };
 
 export const HTTP_DEBUG_LOG = join(LOCAL_DIR, 'logs', 'http_debug.ndjson');
-export const httpDebugLines = (): string[] =>
-  existsSync(HTTP_DEBUG_LOG) ? readFileSync(HTTP_DEBUG_LOG, 'utf8').split('\n') : [];
+/** Byte offset marker: the http.server.response debug log grows by hundreds of MB per run. */
+export const httpDebugMark = (): number =>
+  existsSync(HTTP_DEBUG_LOG) ? statSync(HTTP_DEBUG_LOG).size : 0;
+
+/** Lines appended to the debug log since `mark` (read by byte offset, never the whole file). */
+export const httpDebugSince = (mark: number): string[] => {
+  if (!existsSync(HTTP_DEBUG_LOG)) return [];
+  const fd = openSync(HTTP_DEBUG_LOG, 'r');
+  try {
+    const length = Math.max(0, fstatSync(fd).size - mark);
+    const buffer = Buffer.alloc(length);
+    readSync(fd, buffer, 0, length, mark);
+    return buffer.toString('utf8').split('\n');
+  } finally {
+    closeSync(fd);
+  }
+};
 
 export const runT7 = async (ctx: SuiteContext) => {
   const { report, users } = ctx;

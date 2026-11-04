@@ -30,7 +30,8 @@ import {
   createLease,
   dispatcherConnections,
   execute,
-  httpDebugLines,
+  httpDebugMark,
+  httpDebugSince,
   readPanels,
   revokeAll,
   type TestLease,
@@ -65,6 +66,30 @@ export const POST_RECORDER = `(() => {
   const portPost = MessagePort.prototype.postMessage;
   MessagePort.prototype.postMessage = function (message, ...rest) { record(message); return portPost.call(this, message, ...rest); };
 })();`;
+
+/** Disable via the trusted chrome (parent revokes its lease) before reloading a page. */
+const disableFrame = async (page: Page) => {
+  const disable = page.locator('[data-test-subj="appHostDisable"]');
+  if (await disable.isEnabled({ timeout: 500 }).catch(() => false)) {
+    await Promise.all([
+      page
+        .waitForResponse((r) => /\/revoke$/.test(r.url()), { timeout: 3000 })
+        .catch(() => undefined),
+      disable.click({ timeout: 1000 }).catch(() => undefined),
+    ]);
+  }
+};
+
+const legacyReader = (): { username: string; password: string } | undefined => {
+  const file = join(LOCAL_DIR, 'users.json');
+  return existsSync(file)
+    ? (
+        JSON.parse(readFileSync(file, 'utf8')) as {
+          reader?: { username: string; password: string };
+        }
+      ).reader
+    : undefined;
+};
 
 const openBound = async (page: Page, ctx: SuiteContext) => {
   await openAndAllow(page, ctx.kibana);
@@ -267,7 +292,7 @@ export const runT4 = async (ctx: SuiteContext) => {
         );
         const hitsBefore = ctx.receiver.hits.length;
         const connectionsBefore = ctx.receiver.connections;
-        const kibanaLogBefore = httpDebugLines().length;
+        const kibanaLogMark = httpDebugMark();
         const child = await openBound(page, ctx);
         const probe = await waitProbe(child);
         await sleep(2500);
@@ -301,9 +326,9 @@ export const runT4 = async (ctx: SuiteContext) => {
             ]),
           }
         );
-        const kibanaHits = httpDebugLines()
-          .slice(kibanaLogBefore)
-          .filter((line) => line.includes('m=fetchkibana'));
+        const kibanaHits = httpDebugSince(kibanaLogMark).filter((line) =>
+          line.includes('m=fetchkibana')
+        );
         report.expect(
           T,
           "credentialed fetch to Kibana (credentials:'include') never sent",
@@ -364,14 +389,12 @@ export const runT4 = async (ctx: SuiteContext) => {
         const marker = `${fn.toLowerCase()}-${engine}-${Date.now()}`;
         const n = await session(ctx, engine, users.viewer);
         try {
-          const before = httpDebugLines().length;
+          const before = httpDebugMark();
           const child = await openBound(n.page, ctx);
           await waitProbe(child);
           const result = await runIn(child, fn, marker);
           await sleep(2500);
-          const kibana = httpDebugLines()
-            .slice(before)
-            .filter((line) => line.includes(marker));
+          const kibana = httpDebugSince(before).filter((line) => line.includes(marker));
           report.expect(
             T,
             `${label}: blocked (zero receiver/Kibana hits)`,
@@ -394,14 +417,12 @@ export const runT4 = async (ctx: SuiteContext) => {
         const marker = `selfquery-${engine}-${Date.now()}`;
         const n = await session(ctx, engine, users.viewer);
         try {
-          const before = httpDebugLines().length;
+          const before = httpDebugMark();
           const child = await openBound(n.page, ctx);
           await waitProbe(child);
           await runIn(child, 'selfFrameQuery', marker);
           await sleep(2500);
-          const kibana = httpDebugLines()
-            .slice(before)
-            .filter((line) => line.includes(marker));
+          const kibana = httpDebugSince(before).filter((line) => line.includes(marker));
           report.add(
             T,
             'exact frame path + query (accepted residual: reaches Kibana logs, no document, revoked)',
@@ -514,6 +535,7 @@ export const runT8 = async (ctx: SuiteContext) => {
         writeFileSync(assetPath, `${original}\n;document.title='tampered';`);
         try {
           const asset = await kfetch(ctx, `/api/app_host/ui_assets/${ctx.current?.ui.digest}.js`);
+          await disableFrame(page);
           await page.reload();
           await openAndAllow(page, ctx.kibana);
           await waitForStatus(page, /^bound$/);
@@ -533,6 +555,7 @@ export const runT8 = async (ctx: SuiteContext) => {
           writeFileSync(assetPath, original);
         }
         // 3. Unapproved new code (same scopes): old lease stale, no auto-mount.
+        await disableFrame(page);
         await page.reload();
         const v1Child = await openBound(page, ctx);
         await readPanels(v1Child);
@@ -566,6 +589,13 @@ export const runT8 = async (ctx: SuiteContext) => {
           kbAuth: ctx.adminAuth,
         });
         await page.locator('[data-test-subj="appHostAllowVersion"]').waitFor();
+        await page.waitForFunction(
+          () =>
+            !(document.querySelector('[data-test-subj="appHostAllowVersion"]') as HTMLButtonElement)
+              .disabled,
+          undefined,
+          { timeout: 15_000 }
+        );
         await page.waitForFunction(
           (version) =>
             document.querySelector('[data-test-subj="appHostUiVersion"]')?.textContent === version,
@@ -604,25 +634,37 @@ export const runT8 = async (ctx: SuiteContext) => {
             wranglerReloads: wranglerReloads() - reloadsBefore,
           }
         );
-        // 5. Logout: the parent-held lease is unusable without the session.
-        const last = leases[leases.length - 1];
-        await s.context.request
-          .get(`${ctx.kibana}/api/security/logout`, { maxRedirects: 0 })
-          .catch(() => undefined);
-        const afterLogout = await s.context.request.post(
-          `${ctx.kibana}/internal/app_host/ui/leases/${last.leaseId}/execute`,
-          {
-            headers: { ...apiHeaders(ctx), 'content-type': 'application/json' },
-            data: { secret: last.secret, operation: { op: 'app.summary' } },
+        // 5. Logout (a principal the other suites never lease for: a logged-out lease cannot be
+        // revoked by the parent and stays until its 5-minute TTL).
+        const logoutUser = legacyReader();
+        if (logoutUser) {
+          const l = await session(ctx, engine, logoutUser);
+          try {
+            const logoutLeases = leaseFromResponses(l.page);
+            await openBound(l.page, ctx);
+            await sleep(300);
+            const last = logoutLeases[logoutLeases.length - 1];
+            await l.context.request
+              .get(`${ctx.kibana}/api/security/logout`, { maxRedirects: 0 })
+              .catch(() => undefined);
+            const afterLogout = await l.context.request.post(
+              `${ctx.kibana}/internal/app_host/ui/leases/${last.leaseId}/execute`,
+              {
+                headers: { ...apiHeaders(ctx), 'content-type': 'application/json' },
+                data: { secret: last.secret, operation: { op: 'app.summary' } },
+              }
+            );
+            report.expect(
+              T,
+              'logout: lease unusable without the Kibana session',
+              engine,
+              afterLogout.status() === 401,
+              afterLogout.status()
+            );
+          } finally {
+            await l.close();
           }
-        );
-        report.expect(
-          T,
-          'logout: lease unusable without the Kibana session',
-          engine,
-          afterLogout.status() === 401,
-          afterLogout.status()
-        );
+        }
       } finally {
         await s.close();
         await release(ctx, { label: 'Digest v1', serverLabel: 'Server v1' });
@@ -641,11 +683,12 @@ export const runT10 = async (ctx: SuiteContext) => {
   const T = 'T10';
   if (ctx.currentEntry !== 'ui/src/main.ts') await release(ctx);
   const before = auditLines().length;
+  const httpMark = httpDebugMark();
   const kibanaAuditBefore = auditLines(KIBANA_AUDIT_LOG).length;
   const secrets: string[] = [];
   const leaseIds: string[] = [];
   try {
-    const lease = (await createLease(ctx, users.viewer)).lease as TestLease;
+    const lease = (await createLease(ctx, users.viewer2)).lease as TestLease;
     secrets.push(lease.secret);
     leaseIds.push(lease.leaseId);
     await execute(
@@ -669,7 +712,7 @@ export const runT10 = async (ctx: SuiteContext) => {
     );
     // Browser session: window/port payloads must never carry the lease secret.
     for (const engine of ctx.engines) {
-      const s = await session(ctx, engine, users.viewer, POST_RECORDER);
+      const s = await session(ctx, engine, users.viewer2, POST_RECORDER);
       try {
         const leases = leaseFromResponses(s.page);
         const child = await openBound(s.page, ctx);
@@ -705,7 +748,7 @@ export const runT10 = async (ctx: SuiteContext) => {
       .slice(before)
       .map((line) => JSON.parse(line) as Record<string, any>);
     const raw = auditLines().slice(before).join('\n');
-    const viewerRecords = records.filter((r) => r.user?.name === users.viewer.username);
+    const viewerRecords = records.filter((r) => r.user?.name === users.viewer2.username);
     const summary = viewerRecords.find(
       (r) => r.app?.capability === 'app.summary' && r.event?.outcome === 'success'
     );
@@ -761,7 +804,7 @@ export const runT10 = async (ctx: SuiteContext) => {
     );
     const logs = [
       auditLines().slice(before).join('\n'),
-      httpDebugLines().join('\n'),
+      httpDebugSince(httpMark).join('\n'),
       readFileSync(join(LOCAL_DIR, 'logs', process.env.KIBANA_LOG ?? 'kibana4.log'), 'utf8'),
       auditLines(KIBANA_AUDIT_LOG).join('\n'),
     ];
@@ -770,11 +813,11 @@ export const runT10 = async (ctx: SuiteContext) => {
       T,
       'S11: lease secrets absent from audit, Kibana, security-audit and http.server.response debug logs',
       'http',
-      secrets.length > 0 && secretLeaks.length === 0 && httpDebugLines().length > 100,
+      secrets.length > 0 && secretLeaks.length === 0 && httpDebugSince(httpMark).length > 100,
       {
         secretsChecked: secrets.length,
         leaks: secretLeaks.length,
-        httpDebugLines: httpDebugLines().length,
+        httpDebugLines: httpDebugSince(httpMark).length,
       }
     );
     report.expect(
@@ -794,7 +837,7 @@ export const runT10 = async (ctx: SuiteContext) => {
     );
     const native = kibanaAudit.find(
       (r) =>
-        r.user?.name === users.viewer.username && JSON.stringify(r).includes(ctx.seed.dashboardId)
+        r.user?.name === users.viewer2.username && JSON.stringify(r).includes(ctx.seed.dashboardId)
     );
     report.expect(
       T,
