@@ -1,0 +1,28 @@
+{
+  "extends": "@kbn/tsconfig-base/tsconfig.json",
+  "compilerOptions": {
+    "outDir": "target/types"
+  },
+  "include": [
+    "common/**/*",
+    "public/**/*",
+    "server/**/*"
+  ],
+  "exclude": [
+    "target/**/*",
+    "prototype/**/*"
+  ],
+  "kbn_references": [
+    "@kbn/config-schema",
+    "@kbn/core",
+    "@kbn/core-remote-common",
+    "@kbn/es-errors",
+    "@kbn/features-plugin",
+    "@kbn/i18n",
+    "@kbn/i18n-react",
+    "@kbn/logging",
+    "@kbn/logging-mocks",
+    "@kbn/react-kibana-context-render",
+    "@kbn/ui-callout"
+  ]
+}

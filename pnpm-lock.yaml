@@ -801,6 +801,9 @@ importers:
       '@kbn/app-header':
         specifier: workspace:*
         version: link:src/core/packages/chrome/app-header
+      '@kbn/app-host-plugin':
+        specifier: workspace:*
+        version: link:x-pack/platform/plugins/shared/app_host
       '@kbn/app-link-test-plugin':
         specifier: workspace:*
         version: link:src/platform/test/plugin_functional/plugins/app_link_test
@@ -9462,6 +9465,8 @@ importers:
   x-pack/platform/plugins/shared/anonymization: {}
 
   x-pack/platform/plugins/shared/apm_sources_access: {}
+
+  x-pack/platform/plugins/shared/app_host: {}
 
   x-pack/platform/plugins/shared/automatic_import: {}
 

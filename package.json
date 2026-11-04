@@ -291,6 +291,7 @@
     "@kbn/apm-ui-shared": "workspace:*",
     "@kbn/apm-utils": "workspace:*",
     "@kbn/app-header": "workspace:*",
+    "@kbn/app-host-plugin": "workspace:*",
     "@kbn/app-link-test-plugin": "workspace:*",
     "@kbn/app-menu": "workspace:*",
     "@kbn/application-usage-test-plugin": "workspace:*",
