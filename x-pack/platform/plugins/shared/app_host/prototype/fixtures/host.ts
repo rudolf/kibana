@@ -15,11 +15,12 @@ export interface FixtureHost {
 
 export const INDEX = 'kbn-apps-prototype-alerts';
 
-export const denied = async (fn: () => Promise<unknown>): Promise<boolean> => {
+/** The rejection message of `fn` (truncated), or null when it did not reject. */
+export const rejection = async (fn: () => Promise<unknown>): Promise<string | null> => {
   try {
     await fn();
-    return false;
-  } catch {
-    return true;
+    return null;
+  } catch (error) {
+    return String(error instanceof Error ? error.message : error).slice(0, 300);
   }
 };

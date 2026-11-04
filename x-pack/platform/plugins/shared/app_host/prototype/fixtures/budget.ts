@@ -5,15 +5,16 @@
  * 2.0.
  */
 
-// The first callback succeeds; the second exceeds the one-callback budget.
+// The first callback succeeds; the second exceeds the one-callback budget. Reports the exact
+// rejection message of the second call.
 
 import { WorkerEntrypoint } from 'cloudflare:workers';
-import { INDEX, denied, type FixtureHost } from './host';
+import { INDEX, rejection, type FixtureHost } from './host';
 
 export class App extends WorkerEntrypoint {
   async run(host: FixtureHost) {
     const first = await host.search({ index: INDEX, size: 1 });
-    const secondDenied = await denied(() => host.search({ index: INDEX, size: 1 }));
-    return { first: first.total, secondDenied };
+    const secondError = await rejection(() => host.search({ index: INDEX, size: 1 }));
+    return { first: first.total, secondError };
   }
 }

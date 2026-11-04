@@ -35,6 +35,16 @@ export const MAX_QUEUED_TRANSPORT_BYTES = 4 * RPC_LIMITS.maxMessageSize;
 
 const encoder = new TextEncoder();
 
+/**
+ * An `Error` with no stack. capnweb serializes a replacement error's `stack` when `onSendError`
+ * returns one that has it, which would disclose source paths to the peer.
+ */
+export const stacklessError = (message: string): Error => {
+  const error = new Error(message);
+  delete error.stack;
+  return error;
+};
+
 export class ProtocolError extends Error {
   readonly code: string;
   constructor(code: string, message: string) {

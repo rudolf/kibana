@@ -12,12 +12,16 @@ export const TIMING_HEADER = 'x-app-host-timing';
 
 const round = (value: number): string => value.toFixed(1);
 
+/** Timing-header entry naming the dispatcher endpoint actually used (scheme, class, fingerprint). */
+export const dispatcherEntry = (dispatcher: string): string => `dispatcher;desc="${dispatcher}"`;
+
 /**
  * Host-owned timing header (the timing header syntax; Kibana owns `server-timing` itself): phase
- * durations and logical (JSON) byte counts. Never payloads.
+ * durations, logical (JSON) byte counts and the dispatcher endpoint description. Never payloads.
  */
-export const appHostTiming = (timings: SummaryTimings): string =>
+export const appHostTiming = (timings: SummaryTimings, dispatcher: string): string =>
   [
+    dispatcherEntry(dispatcher),
     `total;dur=${round(timings.totalMs)}`,
     `package;dur=${round(timings.packageMs)}`,
     `connect;dur=${round(timings.connectMs)}`,
@@ -30,16 +34,21 @@ export const appHostTiming = (timings: SummaryTimings): string =>
 
 const NO_STORE = { 'cache-control': 'no-store' };
 
-/** Maps a summary outcome to a host-owned JSON response; app output never sets headers or status. */
+/**
+ * Maps a summary outcome to a host-owned JSON response; app output never sets headers or status.
+ * Outcomes that reached the dispatcher carry the dispatcher entry, so tooling can verify the target.
+ */
 export const toSummaryResponse = (
   response: KibanaResponseFactory,
-  outcome: SummaryOutcome
+  outcome: SummaryOutcome,
+  dispatcher: string
 ): IKibanaResponse => {
+  const reached = { ...NO_STORE, [TIMING_HEADER]: dispatcherEntry(dispatcher) };
   switch (outcome.status) {
     case 'ok':
       return response.ok({
         body: outcome.body,
-        headers: { ...NO_STORE, [TIMING_HEADER]: appHostTiming(outcome.timings) },
+        headers: { ...NO_STORE, [TIMING_HEADER]: appHostTiming(outcome.timings, dispatcher) },
       });
     case 'not_found':
       return response.notFound({ body: { message: 'App not found' } });
@@ -57,11 +66,13 @@ export const toSummaryResponse = (
     case 'es_forbidden':
       return response.forbidden({
         body: { message: 'Current user is not authorized to read the app data' },
+        headers: reached,
       });
     case 'deadline':
       return response.customError({
         statusCode: 504,
         body: { message: 'App invocation exceeded its deadline' },
+        headers: reached,
       });
     case 'aborted':
       return response.customError({ statusCode: 499, body: { message: 'Request aborted' } });
@@ -69,6 +80,7 @@ export const toSummaryResponse = (
       return response.customError({
         statusCode: 502,
         body: { message: 'App invocation failed', attributes: { code: outcome.code } },
+        headers: reached,
       });
     case 'invalid_output':
       return response.customError({
@@ -77,6 +89,7 @@ export const toSummaryResponse = (
           message: 'App returned invalid output',
           attributes: { code: 'invalid_app_output' },
         },
+        headers: reached,
       });
   }
 };

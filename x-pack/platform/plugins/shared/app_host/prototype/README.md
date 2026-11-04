@@ -20,6 +20,7 @@ the remote steps.
 | `ui-check` | Page check of `/app/appHost` v1 → v2 via Refresh (uses the Kibana workspace's Playwright) |
 | `benchmark` | Fresh-invocation latency sample through Kibana (and optionally the raw seam) |
 | `test` | `tsc` for Node and Workers code, then `node:test` unit tests |
+| `lint` | Workers-aware check: both `tsc` projects, then Kibana's `node scripts/eslint` (oxlint + ESLint) on this directory |
 
 ## M1: transport and isolation seam (local workerd)
 
@@ -35,14 +36,24 @@ npm --prefix "$P/prototype" run dev:probe
 npm --prefix "$P/prototype" run seam -- --url ws://127.0.0.1:8787/rpc --probe-url ws://127.0.0.1:8788/rpc --local-workerd
 ```
 
-`seam` prints one JSON object and exits 0 only when every required assertion holds:
-`result:42`, `callbackCount:1`, `unauthenticatedInvokeDenied`, `wrongTokenDenied`,
-`idleUnauthClosed`, `fetchBlocked`, `connectBlocked`, `loopBounded`, `reconnectSucceeded`, plus
-replay, digest, size/depth, misuse, budget, fresh-module, concurrency and disconnect checks.
+`seam` prints one JSON object and exits 0 only when every required assertion holds. Remote mode
+(no flag) needs a non-loopback `wss://` URL and runs the CPU gate **first, isolated**: the loop
+fixture must fail with `app_host:app_cpu_limit` (`loopCpuLimited`). The 5 s client deadline is a
+separate wall-clock assertion (`loopWallBounded`) and never satisfies the CPU gate; a deadline or a
+generic error is a failure, and the run stops before any other invocation. Then: `result:42`,
+`callbackCount:1`, `unauthenticatedInvokeDenied`, `wrongTokenDenied`, `idleUnauthClosed`,
+`fetchBlocked`/`connectBlocked` (workerd's `globalOutbound: null` policy message, not a DNS or
+network failure), replay and digest checks, seven misuse cases **each in a fresh invocation** with
+its specific contract error and no Node handler call, the one-call budget (`app_host:callback_budget`),
+receiver-side transport limits (socket closed `1009` for a 257 KiB ASCII frame and for a
+270,000-UTF-8-byte / 90,000-code-unit frame; `app_host:rpc_limit` and close `1011` for a depth-40
+message or callback result, each with a control that hits the ordinary validator instead), fresh
+module state, concurrency, disconnect and reconnect.
 
-`--local-workerd` exists because OSS workerd (used by `wrangler dev`) does not enforce Dynamic
-Worker `limits.cpuMs`: an infinite loop pins the local runtime until it is restarted. With the
-flag, the loop test is reported as `NOT_ENFORCED_LOCALLY`. **Remote acceptance must not use it.**
+`--local-workerd` is accepted only for a loopback URL. OSS workerd (used by `wrangler dev`) does not
+enforce Dynamic Worker `limits.cpuMs`: an infinite loop pins the local runtime until it is restarted.
+With the flag, the three loop checks are reported as `NOT_ENFORCED_LOCALLY` and the loop fixture is
+not run. **Remote acceptance must not use it.**
 
 ## Remote acceptance (requires explicit user approval first)
 
@@ -57,14 +68,37 @@ npx wrangler secret put KIBANA_CALLER_TOKEN --config cloudflare/wrangler.jsonc <
 npx wrangler deploy --config cloudflare/wrangler.jsonc
 export CF_RPC_URL="wss://kbn-app-host-proto-dispatcher.<subdomain>.workers.dev/rpc"
 curl -s -o /dev/null -w '%{http_code}\n' "${CF_RPC_URL/wss:/https:}"   # 426, not an upload endpoint
-npm run seam -- --url "$CF_RPC_URL"                                # ~25 invocations, no --local-workerd
+npm run seam -- --url "$CF_RPC_URL"                                # CPU gate first; ~21 fresh Workers
 npm run kibana:config -- --dispatcher "$CF_RPC_URL"                # then restart local Kibana once
-npm run acceptance -- --kibana "$KB_URL" --rpc "$CF_RPC_URL"       # ~30 invocations, includes CPU loop
-npm run benchmark -- --kibana "$KB_URL" --samples 20 --rpc "$CF_RPC_URL" --label 'remote workers.dev'  # 40
+npm run acceptance -- --kibana "$KB_URL" --rpc "$CF_RPC_URL"       # verify target, CPU gate, ~26 Workers
+npm run benchmark -- --kibana "$KB_URL" --samples 20 --rpc "$CF_RPC_URL" --note 'remote workers.dev'  # 40
 ```
 
-The total stays under 200 fresh invocations. Cleanup (also needs approval):
+Each command refuses a non-`wss://` or loopback URL in remote mode. `acceptance` and `benchmark`
+first check that Kibana reports the same dispatcher fingerprint as `--rpc` (host-owned
+`x-app-host-timing` evidence, so a stale config without a restart is caught) and stop after one
+invocation otherwise; `remote`/`local` in their output is derived from that evidence, and `--note`
+never affects it. A latency GO needs a verified remote dispatcher and every requested Kibana and seam
+sample to succeed with valid evidence. There is no remote dispatcher connection observer, so the
+acceptance "no invocation" checks are `NOT_VERIFIED` remotely (verdict `PASS_WITH_NOT_VERIFIED`,
+exit 3); their HTTP-denial halves are still asserted, and the local run keeps the observer with a
+positive control.
+
+The total stays under 200 fresh invocations (~87). Cleanup (also needs approval):
 `npx wrangler delete --config cloudflare/wrangler.jsonc`.
+
+## Known prototype limitations
+
+- **An authenticated dispatcher socket has no idle or operation timeout.** Unauthenticated sockets
+  are closed after 2 s, but once `authenticate` succeeds the dispatcher keeps the socket open until
+  the client closes it. Kibana's caller has a 5 s deadline and closes its single-use socket in
+  `finally`, and no capability or fresh Worker exists until `invoke`, but any client holding the
+  caller token could keep an unused (or used) authenticated socket open. A dispatcher-side
+  post-auth/operation timeout is later hardening, not production-ready behaviour.
+- Closing a socket does not prove an isolate was terminated; only the managed runtime's CPU-limit
+  error (`app_host:app_cpu_limit`) is accepted as CPU-enforcement evidence. The dispatcher maps the
+  runtime's CPU-limit message by pattern (`errors.ts`); that mapping is unverified until the remote run.
+- Node's built-in WebSocket buffers one complete frame before the transport rejects it.
 
 ## Layout
 
@@ -75,6 +109,21 @@ The total stays under 200 fresh invocations. Cleanup (also needs approval):
 - `fixtures/` adversarial seam apps (egress, loop, misuse, budget, sentinel, echo, env probe).
 - `scripts/` Node tools run with the pinned `tsx`; `test/` node:test unit tests.
 
-Kibana's ESLint reports `@kbn/imports/no_unresolvable_imports` for `cloudflare:*` imports and
-`import/no-default-export` for the two Worker main modules. Both are required by the Workers runtime;
-this package is type-checked with its own `tsc` against `@cloudflare/workers-types`.
+## Lint and type check
+
+`npm run lint` is the Workers-aware check for this directory. It runs both `tsc` projects (Node tools,
+and `cloudflare/tsconfig.json` against `@cloudflare/workers-types`, covering `cloudflare/`, `app/`,
+`fixtures/` and `shared/`), then Kibana's own `node scripts/eslint` on the prototype directory. Two
+narrowly scoped overrides in the repository lint config make the Kibana lint accept constructs the
+Workers runtime requires, without inline `eslint-disable` comments:
+
+- `.oxlint/imports.mts`: `@kbn/imports/no_unresolvable_imports` is off for
+  `prototype/{cloudflare,app,fixtures}/**/*.ts`, which import the runtime's built-in
+  `cloudflare:workers` / `cloudflare:sockets`. Kibana's Node import resolver cannot resolve those;
+  the Workers `tsc` resolves them and fails on any other unresolvable import (TS2307).
+- `.oxlint/import_plugin.mts`: `import/no-default-export` is off for exactly
+  `cloudflare/src/dispatcher.ts` and `cloudflare/src/probe.ts`, the Worker main modules whose
+  default export is the runtime's fetch handler.
+
+The isolated `package-lock.json` is kept by the `!package-lock.json` entry in `.gitignore`; no lint
+or pre-commit check rejects it.

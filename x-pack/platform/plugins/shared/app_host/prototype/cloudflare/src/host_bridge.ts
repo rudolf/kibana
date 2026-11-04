@@ -10,6 +10,7 @@ import {
   MAX_CALLBACKS_PER_INVOCATION,
   parseSearchParams,
   parseSearchResult,
+  stacklessError,
   type SearchResult,
 } from '../../shared/protocol';
 import { sanitize } from './errors';
@@ -36,9 +37,11 @@ export class HostBridge extends RpcTarget {
 
   async search(params: unknown): Promise<SearchResult> {
     const host = this.#host;
-    if (!host) throw new Error('app_host:host_revoked');
+    if (!host) throw stacklessError('app_host:host_revoked');
     this.#calls += 1;
-    if (this.#calls > MAX_CALLBACKS_PER_INVOCATION) throw new Error('app_host:callback_budget');
+    if (this.#calls > MAX_CALLBACKS_PER_INVOCATION) {
+      throw stacklessError('app_host:callback_budget');
+    }
     try {
       const request = parseSearchParams(params);
       const result = await host.search(request);

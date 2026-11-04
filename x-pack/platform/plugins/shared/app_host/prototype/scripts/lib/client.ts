@@ -10,7 +10,12 @@
 import { randomUUID } from 'node:crypto';
 import { RpcSession, RpcTarget } from 'capnweb';
 import { BoundedWebSocketTransport } from '../../shared/bounded_transport';
-import { RPC_LIMITS, parseSearchParams, type SearchResult } from '../../shared/protocol';
+import {
+  RPC_LIMITS,
+  parseSearchParams,
+  stacklessError,
+  type SearchResult,
+} from '../../shared/protocol';
 import type { BuiltPackage } from './build';
 
 /** Structural view of the dispatcher's authenticated capability as seen through a capnweb stub. */
@@ -35,6 +40,9 @@ export interface Session {
   close(): void;
 }
 
+/** `onSendError` for the tool client: one fixed, stackless code; never local paths or messages. */
+export const sanitizeClientError = (): Error => stacklessError('app_host:host_error');
+
 export const openSession = (url: string): Session => {
   const openedAt = performance.now();
   const socket = new WebSocket(url);
@@ -46,7 +54,7 @@ export const openSession = (url: string): Session => {
   const session = new RpcSession(new BoundedWebSocketTransport(socket), undefined, {
     limits: RPC_LIMITS,
     // Never send stacks or host-internal messages to the remote peer.
-    onSendError: () => new Error('app_host:host_error'),
+    onSendError: sanitizeClientError,
   });
   return {
     root: session.getRemoteMain() as unknown as RemoteRoot,

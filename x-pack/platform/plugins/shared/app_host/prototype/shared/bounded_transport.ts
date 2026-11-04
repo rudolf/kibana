@@ -21,13 +21,46 @@ export interface MinimalWebSocket {
 const CONNECTING = 0;
 
 /**
+ * UTF-8 byte length without allocating (Workers has no `Buffer`). Matches `TextEncoder`, which
+ * encodes a lone surrogate as U+FFFD (3 bytes). Never smaller than the UTF-16 code-unit count.
+ */
+export const utf8ByteLength = (value: string): number => {
+  let bytes = 0;
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code < 0x80) {
+      bytes += 1;
+    } else if (code < 0x800) {
+      bytes += 2;
+    } else if (code >= 0xd800 && code <= 0xdbff && i + 1 < value.length) {
+      const next = value.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4;
+        i++;
+      } else {
+        bytes += 3;
+      }
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
+};
+
+interface QueuedFrame {
+  readonly data: string;
+  readonly bytes: number;
+}
+
+/**
  * capnweb string transport that rejects binary frames, oversized frames and unbounded receive
- * queues before any JSON parsing. capnweb's own `limits` still apply after this check.
+ * queues before any JSON parsing. Frame and queue limits count UTF-8 bytes; capnweb's own
+ * `limits` (whose `maxMessageSize` counts UTF-16 code units) still apply after this check.
  */
 export class BoundedWebSocketTransport {
   readonly #socket: MinimalWebSocket;
   #sendQueue: string[] | undefined;
-  #receiveQueue: string[] = [];
+  #receiveQueue: QueuedFrame[] = [];
   #queuedBytes = 0;
   #resolver: ((value: string) => void) | undefined;
   #rejecter: ((reason: unknown) => void) | undefined;
@@ -56,7 +89,9 @@ export class BoundedWebSocketTransport {
         this.#abortWith(new Error('Binary frames are not accepted.'));
         return;
       }
-      if (data.length > RPC_LIMITS.maxMessageSize) {
+      // Cheap pre-check first: more code units than the byte cap is always over it.
+      const bytes = data.length > RPC_LIMITS.maxMessageSize ? data.length : utf8ByteLength(data);
+      if (bytes > RPC_LIMITS.maxMessageSize) {
         this.#abortWith(new Error('Incoming frame exceeds the message size limit.'));
         return;
       }
@@ -67,12 +102,12 @@ export class BoundedWebSocketTransport {
         resolve(data);
         return;
       }
-      this.#queuedBytes += data.length;
+      this.#queuedBytes += bytes;
       if (this.#queuedBytes > MAX_QUEUED_TRANSPORT_BYTES) {
         this.#abortWith(new Error('Receive queue exceeded its bound.'));
         return;
       }
-      this.#receiveQueue.push(data);
+      this.#receiveQueue.push({ data, bytes });
     });
     socket.addEventListener('close', (event: { code?: number }) => {
       this.#fail(new Error(`Peer closed WebSocket (${event.code ?? 'unknown'}).`));
@@ -94,8 +129,8 @@ export class BoundedWebSocketTransport {
   receive(): Promise<string> {
     const next = this.#receiveQueue.shift();
     if (next !== undefined) {
-      this.#queuedBytes -= next.length;
-      return Promise.resolve(next);
+      this.#queuedBytes -= next.bytes;
+      return Promise.resolve(next.data);
     }
     if (this.#error) return Promise.reject(this.#error);
     return new Promise((resolve, reject) => {

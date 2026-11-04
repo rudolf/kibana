@@ -310,4 +310,17 @@ export const importsOverrides: OxlintOverride[] = [
       '@kbn/imports/no_unused_imports': 'off',
     },
   },
+  {
+    // App Host prototype Workers code (dispatcher, sample app, fixtures) imports the Workers
+    // runtime's built-in `cloudflare:workers` / `cloudflare:sockets` modules, which Kibana's Node
+    // import resolver cannot resolve. Module resolution for these files is enforced instead by the
+    // prototype's Workers type check (`npm --prefix .../prototype run lint`, `tsc` against
+    // `@cloudflare/workers-types`), which fails on any unresolvable import.
+    files: [
+      'x-pack/platform/plugins/shared/app_host/prototype/{cloudflare,app,fixtures}/**/*.ts',
+    ],
+    rules: {
+      '@kbn/imports/no_unresolvable_imports': 'off',
+    },
+  },
 ];

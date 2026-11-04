@@ -8,17 +8,36 @@
 // Fresh-invocation latency sample. Every sample is a new HTTP request, WebSocket, authentication and
 // Dynamic Worker `load()`; nothing is warmed or cached on purpose. These are not cold-isolate,
 // warm-cache or scale-to-zero measurements.
-// Usage: npm run benchmark -- --kibana http://localhost:5601 [--samples 20] [--rpc URL] [--label TEXT]
+// Usage: npm run benchmark -- --kibana http://localhost:5601 --rpc URL [--samples 20]
+//          [--local-workerd] [--note TEXT]
+//
+// --rpc is the dispatcher Kibana is expected to use. Every Kibana sample must carry the matching
+// host-owned dispatcher fingerprint in `x-app-host-timing`; local versus remote is derived from
+// that evidence. Remote mode needs a non-loopback wss:// URL; --local-workerd needs a loopback URL.
+// --note is free text for the report only; it never affects classification or the decision.
 
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { parseArgs } from './lib/args';
 import { buildFixture } from './lib/build';
 import { invokeOnce } from './lib/client';
+import {
+  TIMING_HEADER,
+  parseTimingHeader,
+  requestedTarget,
+  verifyDispatcher,
+  type DispatcherVerification,
+  type RequestedTarget,
+} from './lib/dispatcher_target';
 import { http, userAuth } from './lib/http';
+import { latencyDecision } from './lib/latency_decision';
 import { LOCAL_DIR, readCallerToken, readUsers } from './lib/secrets';
 
-const args = parseArgs(process.argv.slice(2), ['kibana', 'samples', 'rpc', 'label']);
+const args = parseArgs(
+  process.argv.slice(2),
+  ['kibana', 'samples', 'rpc', 'note', 'local-workerd'],
+  ['local-workerd']
+);
 const kibana = (args.kibana ?? process.env.KB_URL ?? '').replace(/\/$/, '');
 if (!kibana) throw new Error('--kibana is required');
 const samples = Number(args.samples ?? 20);
@@ -27,12 +46,13 @@ if (!Number.isInteger(samples) || samples < 1 || samples > 200) {
     '--samples must be an integer 1-200 (approved remote budget is <=200 invocations)'
   );
 }
-const rpc = args.rpc;
-const environment =
-  args.label ??
-  (rpc && !rpc.startsWith('wss://')
-    ? 'local workerd, not remote acceptance'
-    : 'unspecified (pass --label)');
+let target: RequestedTarget;
+try {
+  target = requestedTarget(args.rpc ?? process.env.CF_RPC_URL, args['local-workerd'] === 'true');
+} catch (error) {
+  process.stdout.write(`${JSON.stringify({ error: (error as Error).message }, null, 2)}\n`);
+  process.exit(2);
+}
 const reader = userAuth(readUsers().reader);
 
 const percentile = (values: number[], p: number): number | null => {
@@ -48,23 +68,6 @@ const stats = (values: number[]) => ({
   max: percentile(values, 100),
 });
 
-/** Parses `name;dur=1.0` and `name;desc="a=1,b=2"` entries of the host-owned timing header. */
-const parseTiming = (header: string | null) => {
-  const durations: Record<string, number> = {};
-  const descriptions: Record<string, string> = {};
-  for (const entry of (header ?? '').split(/,\s*(?=[a-z_]+;)/)) {
-    const [name, ...params] = entry.split(';');
-    for (const param of params) {
-      const separator = param.indexOf('=');
-      const key = param.slice(0, separator);
-      const raw = param.slice(separator + 1);
-      if (key === 'dur') durations[name] = Number(raw);
-      if (key === 'desc') descriptions[name] = raw.replace(/^"|"$/g, '');
-    }
-  }
-  return { durations, descriptions };
-};
-
 const endToEnd: number[] = [];
 const phases: Record<string, number[]> = {};
 const statuses: Record<string, number> = {};
@@ -77,15 +80,50 @@ const bytes = {
 const callbacks: number[] = [];
 let exceptions = 0;
 
+const invalid: Record<string, number> = {};
+const markInvalid = (reason: string) => {
+  invalid[reason] = (invalid[reason] ?? 0) + 1;
+};
+let firstVerification: DispatcherVerification | undefined;
+let mismatches = 0;
+let verifiedResponses = 0;
+let validSamples = 0;
+let attempted = 0;
+
 for (let i = 0; i < samples; i++) {
+  attempted += 1;
   try {
     const result = await http(`${kibana}/api/apps/alert-digest/summary`, { auth: reader });
     statuses[result.status] = (statuses[result.status] ?? 0) + 1;
-    if (result.status !== 200) continue;
+    const header = result.headers.get(TIMING_HEADER);
+    const verification = verifyDispatcher(target, header);
+    if (verification.observed === null && result.status !== 200) {
+      // Failed before reaching the dispatcher (e.g. 429/500): no target evidence either way.
+      markInvalid(`status ${result.status} (no dispatcher evidence)`);
+      continue;
+    }
+    firstVerification ??= verification;
+    if (!verification.verified) {
+      mismatches += 1;
+      markInvalid(`dispatcher not verified: ${verification.reason}`);
+      // Do not spend further (possibly remote) invocations against an unverified target.
+      break;
+    }
+    verifiedResponses += 1;
+    if (result.status !== 200) {
+      markInvalid(`status ${result.status}`);
+      continue;
+    }
+    const { durations, descriptions } = parseTimingHeader(header);
+    const callbackCount = Number(descriptions.callbacks ?? NaN);
+    if (!Number.isFinite(durations.total) || callbackCount !== 1) {
+      markInvalid('invalid timing evidence');
+      continue;
+    }
+    validSamples += 1;
     endToEnd.push(result.ms);
-    const { durations, descriptions } = parseTiming(result.headers.get('x-app-host-timing'));
     for (const [name, value] of Object.entries(durations)) (phases[name] ??= []).push(value);
-    callbacks.push(Number(descriptions.callbacks ?? NaN));
+    callbacks.push(callbackCount);
     const logical = Object.fromEntries(
       (descriptions.logical_bytes ?? '')
         .split(',')
@@ -99,10 +137,16 @@ for (let i = 0; i < samples; i++) {
     exceptions += 1;
   }
 }
+const verified = mismatches === 0 && verifiedResponses > 0;
+const verifiedMode = verified ? firstVerification?.observedMode ?? null : null;
+const failedSamples = samples - validSamples;
 
-// Optional direct seam sample (Node -> dispatcher -> Dynamic Worker -> Node callback), no Kibana/ES.
+// Direct seam sample against the same verified endpoint (Node -> dispatcher -> Dynamic Worker ->
+// Node callback), no Kibana/ES. Skipped when the Kibana target was not verified.
 let seam: Record<string, unknown> | undefined;
-if (rpc) {
+let seamValid = 0;
+const seamRequested = verified ? samples : 0;
+if (verified) {
   const token = readCallerToken();
   const pkg = await buildFixture('adder');
   const connectAuth: number[] = [];
@@ -111,7 +155,7 @@ if (rpc) {
   let failed = 0;
   for (let i = 0; i < samples; i++) {
     const outcome = await invokeOnce({
-      url: rpc,
+      url: target.url,
       token,
       pkg,
       handler: async () => ({ total: 41, records: [] }),
@@ -120,6 +164,7 @@ if (rpc) {
       failed += 1;
       continue;
     }
+    seamValid += 1;
     connectAuth.push(outcome.timing.connectAuthMs);
     invoke.push(outcome.timing.invokeMs);
     total.push(outcome.timing.totalMs);
@@ -128,25 +173,39 @@ if (rpc) {
     connectAndAuthMs: stats(connectAuth),
     invokeIncludingLoadAndCallbackMs: stats(invoke),
     totalMs: stats(total),
+    requested: samples,
+    valid: seamValid,
     failed,
   };
 }
 
-const isLocal = environment.startsWith('local');
-const latencyDecision = (value: number | null): string => {
-  if (value === null) return 'NO DATA';
-  if (isLocal)
-    return `NO DECISION: local workerd p95 ${value} ms says nothing about the remote topology`;
-  if (value <= 2000) return 'GO (latency)';
-  return 'NO-GO for the chosen topology pending investigation';
-};
-
-const freshInvocations = samples + (rpc ? samples : 0);
+const freshInvocations = attempted + seamRequested;
 const p95 = percentile(endToEnd, 95);
+const environment =
+  verifiedMode === 'remote'
+    ? 'remote dispatcher (verified wss:// fingerprint)'
+    : verifiedMode === 'local'
+    ? 'local workerd (verified loopback fingerprint), not remote acceptance'
+    : 'UNVERIFIED dispatcher target';
 const report = {
   environment,
+  note: args.note,
+  dispatcher: {
+    requested: target.url,
+    requestedMode: target.mode,
+    expected: target.expected,
+    observed: firstVerification?.observed ?? null,
+    verified,
+    verifiedResponses,
+    mismatches,
+    reason: firstVerification?.verified ? undefined : firstVerification?.reason,
+  },
   measurement: 'fresh-invocation (new HTTP request, WebSocket, auth and LOADER.load per sample)',
   samples,
+  attempted,
+  validSamples,
+  failedSamples,
+  invalid,
   statuses,
   exceptions,
   kibanaEndToEndMs: stats(endToEnd),
@@ -177,10 +236,19 @@ const report = {
   decision: {
     threshold:
       'p95 end-to-end <= 2000 ms for the tiny synthetic summary (prototype threshold, not an SLO)',
-    latency: latencyDecision(p95),
-    remoteAcceptance: isLocal
-      ? 'BLOCKED: local workerd only; remote Cloudflare acceptance not run'
-      : 'see acceptance output',
+    latency: latencyDecision({
+      verifiedMode,
+      requestedSamples: samples,
+      validSamples,
+      failedSamples,
+      seamRequestedSamples: samples,
+      seamValidSamples: seamValid,
+      p95,
+    }),
+    remoteAcceptance:
+      verifiedMode === 'remote'
+        ? 'see acceptance output'
+        : 'BLOCKED: no verified remote dispatcher; remote Cloudflare acceptance not run',
     production: 'NOT EVALUATED',
   },
 };
@@ -189,3 +257,4 @@ mkdirSync(LOCAL_DIR, { recursive: true });
 const file = resolve(LOCAL_DIR, `benchmark-${new Date().toISOString().replace(/[:.]/g, '-')}.json`);
 writeFileSync(file, `${JSON.stringify(report, null, 2)}\n`);
 process.stdout.write(`${JSON.stringify({ ...report, savedTo: file }, null, 2)}\n`);
+process.exit(verified && failedSamples === 0 && seamValid === samples ? 0 : 1);

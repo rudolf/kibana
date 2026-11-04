@@ -25,6 +25,16 @@ export class HostError extends Error {
   }
 }
 
+/**
+ * An `Error` with no stack. capnweb serializes a replacement error's `stack` when `onSendError`
+ * returns one that has it, which would disclose host source paths to the peer.
+ */
+export const stacklessError = (message: string): Error => {
+  const error = new Error(message);
+  delete error.stack;
+  return error;
+};
+
 /** capnweb `onSendError`: replace every outbound error with a stackless, sanitized one. */
 export const sanitizeOutboundError = (error: Error): Error =>
-  error instanceof HostError ? new Error(error.message) : new Error('app_host:host_error');
+  stacklessError(error instanceof HostError ? error.message : 'app_host:host_error');

@@ -14,6 +14,7 @@ import { PackageError, type PackageErrorCode } from './package/package_error';
 import { readPackage } from './package/read_package';
 import type { MinimalWebSocket } from './remote/bounded_transport';
 import { createDeadline } from './remote/deadline';
+import { describeDispatcher } from './remote/dispatcher_endpoint';
 import { InvokeError, invokeApp, type InvokeErrorCode } from './remote/invoke_app';
 import { SearchCapability } from './remote/search_capability';
 
@@ -56,11 +57,14 @@ export class AppRunner {
   readonly #config: AppRunnerConfig;
   readonly #logger: Logger;
   readonly #limiter: InvocationLimiter;
+  /** Host-owned description of the dispatcher endpoint every invocation uses (see `describeDispatcher`). */
+  readonly dispatcher: string;
 
   constructor(config: AppRunnerConfig, logger: Logger) {
     this.#config = config;
     this.#logger = logger;
     this.#limiter = new InvocationLimiter(config.maxConcurrent ?? LIMITS.concurrentInvocations);
+    this.dispatcher = describeDispatcher(config.dispatcherUrl);
   }
 
   async runSummary(

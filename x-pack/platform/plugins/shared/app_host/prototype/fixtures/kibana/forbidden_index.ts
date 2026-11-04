@@ -6,13 +6,14 @@
  */
 
 import { WorkerEntrypoint } from 'cloudflare:workers';
-import { rejects, type VariantHost } from './summary_host';
+import { rejectionLabel, type VariantHost } from './summary_host';
 
 export class App extends WorkerEntrypoint {
   async run(host: VariantHost) {
-    const denied = await rejects(() => host.search({ index: '.kibana', size: 1 }));
     return {
-      label: denied ? 'forbidden-index-denied' : 'FORBIDDEN-INDEX-ALLOWED',
+      label: await rejectionLabel('forbidden-index-denied', () =>
+        host.search({ index: '.kibana', size: 1 })
+      ),
       counts: { high: 0, low: 0 },
     };
   }

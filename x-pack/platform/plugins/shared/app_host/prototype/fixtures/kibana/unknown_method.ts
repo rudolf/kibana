@@ -6,14 +6,13 @@
  */
 
 import { WorkerEntrypoint } from 'cloudflare:workers';
-import { INDEX, rejects, type VariantHost } from './summary_host';
+import { INDEX, rejectionLabel, type VariantHost } from './summary_host';
 
 export class App extends WorkerEntrypoint {
   async run(host: VariantHost) {
     const loose = host as unknown as Record<string, (arg: unknown) => Promise<unknown>>;
-    const denied = await rejects(() => loose.deleteIndex({ index: INDEX }));
     return {
-      label: denied ? 'unknown-method-denied' : 'UNKNOWN-METHOD-ALLOWED',
+      label: await rejectionLabel('unknown-method', () => loose.deleteIndex({ index: INDEX })),
       counts: { high: 0, low: 0 },
     };
   }

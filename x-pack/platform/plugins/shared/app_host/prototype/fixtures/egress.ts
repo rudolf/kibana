@@ -6,23 +6,25 @@
  */
 
 // Attempts global fetch and TCP connect, then proves the granted callback still works.
+// Returns each denial reason, so the seam can tell a sandbox-policy denial from an unrelated
+// DNS/network failure.
 
 import { WorkerEntrypoint } from 'cloudflare:workers';
 import { connect } from 'cloudflare:sockets';
-import { INDEX, denied, type FixtureHost } from './host';
+import { INDEX, rejection, type FixtureHost } from './host';
 
 export class App extends WorkerEntrypoint {
   async run(host: FixtureHost) {
-    const fetchBlocked = await denied(async () => {
+    const fetchError = await rejection(async () => {
       const response = await fetch('https://example.com/');
       await response.arrayBuffer();
     });
-    const connectBlocked = await denied(async () => {
+    const connectError = await rejection(async () => {
       const socket = connect({ hostname: 'example.com', port: 80 });
       await socket.opened;
       await socket.close();
     });
     const { total } = await host.search({ index: INDEX, size: 1 });
-    return { fetchBlocked, connectBlocked, callback: total + 1 };
+    return { fetchError, connectError, callback: total + 1 };
   }
 }

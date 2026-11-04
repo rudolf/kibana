@@ -18,6 +18,7 @@
     "benchmark": "tsx scripts/benchmark.ts",
     "typecheck": "tsc -p tsconfig.json && tsc -p cloudflare/tsconfig.json",
     "test": "npm run -s typecheck && tsx --test 'test/*_test.ts'",
+    "lint": "npm run -s typecheck && cd ../../../../../.. && node scripts/eslint x-pack/platform/plugins/shared/app_host/prototype",
     "kibana:config": "tsx scripts/local_kibana_config.ts",
     "ui-check": "tsx scripts/ui_check.ts"
   },

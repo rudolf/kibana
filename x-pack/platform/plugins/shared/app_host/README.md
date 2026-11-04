@@ -25,13 +25,22 @@ code, and does not offer an SDK, install API, saved objects, tasks or app-author
   6. validates the app output as exactly `{label, counts: {high, low}}`, and returns host-owned JSON
      `{appId, version, label, counts}`. An Elasticsearch authorization failure is a `403`, whatever
      the app returned. Other remote failures are a sanitized `502`.
+- Responses that reached the dispatcher carry a host-owned `x-app-host-timing` header. It starts
+  with `dispatcher;desc="scheme=<ws|wss>,class=<loopback|remote>,fp=<16 hex>"`: a SHA-256
+  fingerprint of the normalized dispatcher URL this Kibana process actually uses (never the URL or
+  token). Successful responses add phase durations, the callback count and logical JSON byte counts.
+  The prototype tooling recomputes the fingerprint from `--rpc` and refuses to run against a
+  different dispatcher.
 - `GET /internal/app_host/apps` (same privilege): `{apps: [{id, title, version}]}`.
 - `/app/appHost`: a static, host-rendered page with title, version, refresh button and severity
   table. App-provided text is rendered as text.
 
 capnweb sessions use `maxMessageSize: 256 KiB`, `maxDepth: 32` and `maxBigIntDigits: 64`, plus a
-transport that rejects binary and oversized frames before parsing. Node's built-in WebSocket cannot
-cap `maxPayload`, so one oversized frame is still buffered before it is rejected.
+transport that rejects binary frames, frames over 256 KiB and a receive queue over 1 MiB before
+parsing. Both caps count **UTF-8 bytes** (capnweb's own `maxMessageSize` counts UTF-16 code units).
+Node's built-in WebSocket cannot cap `maxPayload`, so one oversized frame is still buffered before it
+is rejected. Errors sent to the dispatcher are replaced with a stackless `app_host:<code>` error, so
+no host stack or source path crosses the wire.
 
 The Cloudflare dispatcher, sample app, fixtures and all demo tooling live in the isolated
 [`prototype/`](./prototype/README.md) tool package.
@@ -83,24 +92,32 @@ curl -s -u "$READER" -H 'x-elastic-internal-origin: kibana' "$KB_URL/internal/ap
 npm --prefix "$P/prototype" run release -- --version 1.0.1 --label 'Digest v2' --out "$APP_PACKAGE_DIR"
 curl -s -u "$READER" "$KB_URL/api/apps/alert-digest/summary"
 # {"appId":"alert-digest","version":"1.0.1","label":"Digest v2","counts":{"high":2,"low":1}}
+# --wrangler-log needs an absolute path (npm runs the script in the prototype directory)
 npm --prefix "$P/prototype" run acceptance -- --kibana "$KB_URL" --rpc ws://127.0.0.1:8787/rpc \
-  --wrangler-log "$P/prototype/.local/logs/wrangler.log" --local-workerd
+  --wrangler-log "$PWD/$P/prototype/.local/logs/wrangler.log" --local-workerd
 npm --prefix "$P/prototype" run ui-check -- --kibana "$KB_URL"   # page v1 -> v2 via Refresh, screenshots in .local/
-npm --prefix "$P/prototype" run benchmark -- --kibana "$KB_URL" --samples 20 --rpc ws://127.0.0.1:8787/rpc
+npm --prefix "$P/prototype" run benchmark -- --kibana "$KB_URL" --samples 20 \
+  --rpc ws://127.0.0.1:8787/rpc --local-workerd
 ```
 
 Open `$KB_URL/app/appHost` as `app_host_reader`, release another label, and press **Refresh**.
 `acceptance` and `ui-check` mutate the package directory and restore its original manifest at the end.
 
-`--local-workerd` reports the CPU-loop checks as `NOT_ENFORCED_LOCALLY`: OSS workerd does not enforce
-Dynamic Worker `limits.cpuMs`. Remote acceptance must run without that flag, against a `wss://`
-dispatcher deployed with explicit approval (see `prototype/README.md`).
+`acceptance` and `benchmark` first verify, from the `dispatcher` fingerprint in `x-app-host-timing`,
+that Kibana uses the `--rpc` dispatcher, and stop otherwise. Local versus remote is derived from
+that evidence. `--local-workerd` is accepted only for a loopback `--rpc` and a verified loopback
+dispatcher; it reports the CPU-loop checks as `NOT_ENFORCED_LOCALLY`, because OSS workerd does not
+enforce Dynamic Worker `limits.cpuMs`. Remote acceptance must run without that flag, against a
+`wss://` dispatcher deployed with explicit approval (see `prototype/README.md`). Without
+`--wrangler-log`, the "no dispatcher connection" checks are reported `NOT_VERIFIED` (exit code 3),
+never as passing.
 
 ## Checks
 
 ```bash
 node scripts/jest x-pack/platform/plugins/shared/app_host
 node scripts/type_check --project x-pack/platform/plugins/shared/app_host/tsconfig.json
-node scripts/eslint x-pack/platform/plugins/shared/app_host/{common,public,server}
+node scripts/eslint x-pack/platform/plugins/shared/app_host
+npm --prefix x-pack/platform/plugins/shared/app_host/prototype run lint   # Workers tsc + scoped Kibana lint
 npm --prefix x-pack/platform/plugins/shared/app_host/prototype run test
 ```

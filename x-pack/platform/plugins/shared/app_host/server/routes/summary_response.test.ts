@@ -22,6 +22,8 @@ const timings = {
   callbackRequestBytes: 10,
   callbackResponseBytes: 20,
 };
+const DISPATCHER = 'scheme=ws,class=loopback,fp=731a85aec9305232';
+const DISPATCHER_ONLY = `dispatcher;desc="${DISPATCHER}"`;
 
 describe('toSummaryResponse', () => {
   it('returns host-owned JSON with no-store and the timing header', () => {
@@ -32,36 +34,46 @@ describe('toSummaryResponse', () => {
       label: 'Digest v1',
       counts: { high: 2, low: 1 },
     };
-    toSummaryResponse(factory, { status: 'ok', body, timings });
+    toSummaryResponse(factory, { status: 'ok', body, timings }, DISPATCHER);
     expect(factory.ok).toHaveBeenCalledWith({
       body,
-      headers: { 'cache-control': 'no-store', [TIMING_HEADER]: appHostTiming(timings) },
+      headers: { 'cache-control': 'no-store', [TIMING_HEADER]: appHostTiming(timings, DISPATCHER) },
     });
   });
 
-  it.each<[SummaryOutcome, number]>([
-    [{ status: 'busy' }, 429],
-    [{ status: 'invalid_package', code: 'digest_mismatch' }, 500],
-    [{ status: 'deadline' }, 504],
-    [{ status: 'remote_error', code: 'app_failed' }, 502],
-    [{ status: 'invalid_output' }, 502],
-  ])('maps %p to %s', (outcome, statusCode) => {
+  it.each<[SummaryOutcome, number, boolean]>([
+    [{ status: 'busy' }, 429, false],
+    [{ status: 'invalid_package', code: 'digest_mismatch' }, 500, false],
+    [{ status: 'deadline' }, 504, true],
+    [{ status: 'remote_error', code: 'app_cpu_limit' }, 502, true],
+    [{ status: 'invalid_output' }, 502, true],
+  ])('maps %p to %s (dispatcher entry: %s)', (outcome, statusCode, reached) => {
     const factory = httpServerMock.createResponseFactory();
-    toSummaryResponse(factory, outcome);
+    toSummaryResponse(factory, outcome, DISPATCHER);
     expect(factory.customError).toHaveBeenCalledWith(expect.objectContaining({ statusCode }));
+    const [[{ headers }]] = factory.customError.mock.calls;
+    expect((headers as Record<string, string> | undefined)?.[TIMING_HEADER]).toBe(
+      reached ? DISPATCHER_ONLY : undefined
+    );
   });
 
   it('maps not found and Elasticsearch denial', () => {
     const factory = httpServerMock.createResponseFactory();
-    toSummaryResponse(factory, { status: 'not_found' });
-    toSummaryResponse(factory, { status: 'es_forbidden' });
+    toSummaryResponse(factory, { status: 'not_found' }, DISPATCHER);
+    toSummaryResponse(factory, { status: 'es_forbidden' }, DISPATCHER);
     expect(factory.notFound).toHaveBeenCalled();
-    expect(factory.forbidden).toHaveBeenCalled();
+    expect(factory.forbidden).toHaveBeenCalledWith(
+      expect.objectContaining({
+        headers: expect.objectContaining({ [TIMING_HEADER]: DISPATCHER_ONLY }),
+      })
+    );
   });
 
-  it('never includes payloads in the timing header', () => {
-    expect(appHostTiming(timings)).toMatch(/^total;dur=10\.0, package;dur=1\.0/);
-    expect(appHostTiming(timings)).toContain(
+  it('leads with the dispatcher entry and never includes payloads', () => {
+    expect(appHostTiming(timings, DISPATCHER)).toMatch(
+      /^dispatcher;desc="scheme=ws,class=loopback,fp=731a85aec9305232", total;dur=10\.0, package;dur=1\.0/
+    );
+    expect(appHostTiming(timings, DISPATCHER)).toContain(
       'logical_bytes;desc="req=100,res=50,cb_req=10,cb_res=20"'
     );
   });

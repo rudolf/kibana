@@ -27,15 +27,24 @@ export interface MinimalWebSocket {
 const CONNECTING = 0;
 const MAX_QUEUED_BYTES = 4 * RPC_LIMITS.maxMessageSize;
 
+/** UTF-8 byte length of a frame. A UTF-16 code unit never encodes to fewer than one UTF-8 byte. */
+export const frameBytes = (data: string): number => Buffer.byteLength(data, 'utf8');
+
+interface QueuedFrame {
+  readonly data: string;
+  readonly bytes: number;
+}
+
 /**
  * capnweb string transport that rejects binary frames, oversized frames and unbounded receive
- * queues before JSON parsing. Node's built-in WebSocket cannot cap the frame size it buffers
+ * queues before JSON parsing. Frame and queue limits count UTF-8 bytes, not UTF-16 code units
+ * (capnweb's own `maxMessageSize` counts code units, so it would let a multibyte frame through). Node's built-in WebSocket cannot cap the frame size it buffers
  * (`maxPayload`), so a single oversized frame is still received before it is rejected here.
  */
 export class BoundedWebSocketTransport implements RpcTransport {
   readonly #socket: MinimalWebSocket;
   #sendQueue: string[] | undefined;
-  #receiveQueue: string[] = [];
+  #receiveQueue: QueuedFrame[] = [];
   #queuedBytes = 0;
   #resolve: ((value: string) => void) | undefined;
   #reject: ((reason: unknown) => void) | undefined;
@@ -66,8 +75,8 @@ export class BoundedWebSocketTransport implements RpcTransport {
   receive(): Promise<string> {
     const next = this.#receiveQueue.shift();
     if (next !== undefined) {
-      this.#queuedBytes -= next.length;
-      return Promise.resolve(next);
+      this.#queuedBytes -= next.bytes;
+      return Promise.resolve(next.data);
     }
     if (this.#error) return Promise.reject(this.#error);
     return new Promise((resolve, reject) => {
@@ -97,7 +106,9 @@ export class BoundedWebSocketTransport implements RpcTransport {
       this.#rejectFrame('Binary frames are not accepted.');
       return;
     }
-    if (data.length > RPC_LIMITS.maxMessageSize) {
+    // Cheap pre-check first: more code units than the byte cap is always over it.
+    const bytes = data.length > RPC_LIMITS.maxMessageSize ? data.length : frameBytes(data);
+    if (bytes > RPC_LIMITS.maxMessageSize) {
       this.#rejectFrame('Incoming frame exceeds the message size limit.');
       return;
     }
@@ -108,12 +119,12 @@ export class BoundedWebSocketTransport implements RpcTransport {
       resolve(data);
       return;
     }
-    this.#queuedBytes += data.length;
+    this.#queuedBytes += bytes;
     if (this.#queuedBytes > MAX_QUEUED_BYTES) {
       this.#rejectFrame('Receive queue exceeded its bound.');
       return;
     }
-    this.#receiveQueue.push(data);
+    this.#receiveQueue.push({ data, bytes });
   }
 
   #rejectFrame(message: string): void {

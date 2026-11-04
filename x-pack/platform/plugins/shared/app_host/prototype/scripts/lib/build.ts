@@ -77,8 +77,15 @@ export const buildApp = async (version: string, label: string): Promise<BuiltPac
     version
   );
 
-export const buildFixture = async (name: string): Promise<BuiltPackage> =>
-  packageBundle(await bundleModule(`fixtures/${name}.ts`), '0.0.0-fixture', `Fixture ${name}`);
+export const buildFixture = async (
+  name: string,
+  define: Record<string, string> = {}
+): Promise<BuiltPackage> =>
+  packageBundle(
+    await bundleModule(`fixtures/${name}.ts`, define),
+    '0.0.0-fixture',
+    `Fixture ${name}`
+  );
 
 /** Builds a Kibana acceptance variant packaged as the installed app id. */
 export const buildVariant = async (

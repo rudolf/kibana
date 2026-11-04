@@ -7,11 +7,13 @@
 
 import {
   createFakeDispatcher,
+  type FakeSocket,
   type HostStub,
   type InvokeBehaviour,
 } from '../mocks/fake_dispatcher';
 import { createScopedClient, responseError, searchResponse } from '../mocks/es';
 import type { AppPackage } from '../package/read_package';
+import { HostError, sanitizeOutboundError } from './host_error';
 import { InvokeError, invokeApp } from './invoke_app';
 import { SearchCapability } from './search_capability';
 import { createDeadline } from './deadline';
@@ -65,6 +67,13 @@ const failure = async (promise: Promise<unknown>) => {
 };
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+/** Finds every capnweb `["error", name, message, stack?, props?]` tuple in a decoded frame. */
+const errorTuples = (node: unknown): unknown[][] => {
+  if (!Array.isArray(node)) return [];
+  if (node[0] === 'error' && typeof node[1] === 'string') return [node];
+  return node.flatMap(errorTuples);
+};
 
 describe('invokeApp', () => {
   it('authenticates, invokes once with a fresh host and closes everything', async () => {
@@ -194,17 +203,53 @@ describe('invokeApp', () => {
     expect(error.code).toBe('remote_error');
   });
 
-  it('sends only sanitized, stackless host errors', async () => {
+  it('encodes host errors on the wire as a sanitized code with no stack or host path', async () => {
     let seen: unknown;
-    const { client, run } = setup(async (_req, host) => {
-      seen = await host.search(SEARCH).catch((e) => e);
-      return { label: 'x', counts: { high: 0, low: 0 } };
+    const dispatcher = createFakeDispatcher({
+      token: TOKEN,
+      behaviour: async (_req, host) => {
+        seen = await host.search(SEARCH).catch((e) => e);
+        return { label: 'x', counts: { high: 0, low: 0 } };
+      },
     });
+    const frames: string[] = [];
+    const createSocket = () => {
+      const socket = dispatcher.createSocket() as FakeSocket;
+      const send = socket.send.bind(socket);
+      socket.send = (data: string) => {
+        frames.push(data);
+        send(data);
+      };
+      return socket;
+    };
+    const client = createScopedClient();
     client.search.mockRejectedValue(responseError(500));
-    await run();
-    expect(seen).toBeInstanceOf(Error);
+    await invokeApp({
+      dispatcherUrl: 'ws://127.0.0.1:8787/rpc',
+      callerToken: TOKEN,
+      pkg: pkg(),
+      capability: new SearchCapability(client),
+      signal: new AbortController().signal,
+      createSocket,
+    });
     expect((seen as Error).message).toBe('app_host:es_failed');
-    expect(String((seen as Error).stack ?? '')).not.toContain('search_capability');
+    const encoded = frames.filter((frame) => frame.includes('"error"'));
+    expect(encoded).toHaveLength(1);
+    // Exactly ["error", name, message]: no stack element, no extra properties.
+    expect(errorTuples(JSON.parse(encoded[0]))).toEqual([['error', 'Error', 'app_host:es_failed']]);
+    for (const frame of frames) {
+      expect(frame).not.toMatch(/\.ts\b|\.js\b|node_modules|\bat \S+ \(|\\n\s*at /);
+      expect(frame).not.toContain(__dirname);
+    }
+  });
+
+  it('replaces every outbound error with a stackless code', () => {
+    const generic = sanitizeOutboundError(new TypeError(`boom at ${__filename}`));
+    expect(generic.message).toBe('app_host:host_error');
+    expect(generic.stack).toBeUndefined();
+    const host = sanitizeOutboundError(new HostError('index_not_granted'));
+    expect(host.message).toBe('app_host:index_not_granted');
+    expect(host.stack).toBeUndefined();
   });
 
   it('keeps two concurrent invocations (different app identities) apart', async () => {

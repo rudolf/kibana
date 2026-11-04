@@ -70,7 +70,7 @@ export const registerRoutes = ({ router, runner, packagePath, logger }: RouteDep
       const aborted = requestAbortSignal(request);
       try {
         const outcome = await runner.runSummary(request.params.appId, esClient, aborted.signal);
-        return toSummaryResponse(response, outcome);
+        return toSummaryResponse(response, outcome, runner.dispatcher);
       } finally {
         aborted.dispose();
       }

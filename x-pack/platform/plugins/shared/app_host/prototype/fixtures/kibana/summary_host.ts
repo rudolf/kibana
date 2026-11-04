@@ -19,11 +19,19 @@ export const count = (records: Array<{ severity: string }>) => ({
   low: records.filter(({ severity }) => severity === 'low').length,
 });
 
-export const rejects = async (fn: () => Promise<unknown>): Promise<boolean> => {
+/**
+ * Label reporting a rejection: `<prefix>:<rejection message>` (truncated to the 80-char label
+ * limit), or `<PREFIX>-ALLOWED` when the call was not rejected.
+ */
+export const rejectionLabel = async (
+  prefix: string,
+  fn: () => Promise<unknown>
+): Promise<string> => {
   try {
     await fn();
-    return false;
-  } catch {
-    return true;
+    return `${prefix.toUpperCase()}-ALLOWED`;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return `${prefix}:${message}`.slice(0, 80);
   }
 };

@@ -8,8 +8,7 @@
 import type { Type, TypeOf } from '@kbn/config-schema';
 import { schema } from '@kbn/config-schema';
 import type { PluginConfigDescriptor } from '@kbn/core/server';
-
-const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]']);
+import { LOOPBACK_HOSTS } from './remote/dispatcher_endpoint';
 
 const whenEnabled = (type: Type<string>) =>
   schema.conditional(schema.siblingRef('enabled'), true, type, schema.maybe(type));
