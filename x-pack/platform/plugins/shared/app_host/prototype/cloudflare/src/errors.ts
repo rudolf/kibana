@@ -7,7 +7,10 @@
 
 import { ProtocolError, stacklessError } from '../../shared/protocol';
 
-const CPU_LIMIT = /exceeded CPU|CPU time limit|cpu limit|exceededCpu/i;
+// Positive termination signatures only (workerd: "Worker exceeded CPU time limit.", outcome
+// `exceededCpu`). Mentions of a CPU limit without "exceeded" (configuration or availability
+// errors) must not count as enforcement evidence and fall through to `app_failed`.
+const CPU_LIMIT = /\bexceeded CPU time limit\b|\bexceededCpu\b/i;
 const SUBREQUEST_LIMIT = /exceeded.*subrequest/i;
 // capnweb deserialization limits and the bounded transport's frame/queue limits.
 const RPC_LIMIT =

@@ -100,6 +100,18 @@ for (const [name, thrown, expected] of [
   ['protocol error', () => new ProtocolError('digest_mismatch', 'x'), 'app_host:digest_mismatch'],
   ['coded error', () => new Error('app_host:callback_budget'), 'app_host:callback_budget'],
   ['CPU limit', () => new Error('Worker exceeded CPU time limit.'), 'app_host:app_cpu_limit'],
+  ['CPU outcome', () => new Error('exceededCpu'), 'app_host:app_cpu_limit'],
+  [
+    'invalid CPU limit config',
+    () => new Error('Invalid cpu limit configuration'),
+    'app_host:app_failed',
+  ],
+  [
+    'unsupported CPU limit',
+    () => new Error('CPU time limit is not supported'),
+    'app_host:app_failed',
+  ],
+  ['CPU limit mention', () => new Error('cpu limit set to 50ms'), 'app_host:app_failed'],
   [
     'depth limit',
     () => new TypeError('Deserialization exceeded maximum allowed message depth of 32.'),
