@@ -12,6 +12,8 @@ export type AuditReason =
   | 'ok'
   | 'session_created'
   | 'mint_failed'
+  | 'revoked_during_mint'
+  | 'stale_generation'
   | 'bad_handle'
   | 'expired'
   | 'principal_mismatch'

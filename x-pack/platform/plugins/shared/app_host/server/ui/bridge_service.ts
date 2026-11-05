@@ -43,6 +43,8 @@ export interface CallerContext {
   readonly requestAborted: AbortSignal;
   /** Grants a key from the viewer's own credentials; null when API keys are unavailable. */
   readonly grantKey: (request: AppKeyRequest) => Promise<AppKey | null>;
+  /** Invalidates one key by id as Kibana's internal user (cleanup of a key that is never issued). */
+  readonly invalidateKey: (id: string) => Promise<void>;
   readonly asKey: (key: AppKey) => KeyScopedClients;
   /** Absolute pathname the dashboard self call must hit (server base path, default space). */
   readonly dashboardPathname: (id: string) => string;
@@ -327,6 +329,22 @@ export class BridgeService {
       key = null;
     }
     if (!key) return deny('app_unavailable', 'mint_failed', appOf(manifest));
+    // A disable, uninstall or new approval (and a re-enable after it) may have completed while the
+    // grant was in flight, and its name-based invalidation can miss this key. Re-read the state: a
+    // key minted across a generation change is invalidated and never issued.
+    const after = await this.#readState();
+    if (
+      after.status !== 'approved' ||
+      after.manifest.releaseDigest !== manifest.releaseDigest ||
+      after.consent.generation !== state.consent.generation
+    ) {
+      await caller.invalidateKey(key.id).catch(() => undefined);
+      return deny(
+        after.status === 'disabled' ? 'app_disabled' : 'app_stale',
+        'revoked_during_mint',
+        appOf(manifest, key.id)
+      );
+    }
     const handle = this.#handles.seal({
       id: key.id,
       apiKey: key.apiKey,
@@ -334,6 +352,7 @@ export class BridgeService {
       release: manifest.releaseDigest,
       space: caller.spaceId,
       principal: caller.principal as string,
+      generation: state.consent.generation,
       // The key's own expiration starts when Elasticsearch creates it, after this instant.
       exp: this.#now() + UI_LIMITS.sessionTtlMs,
     });
@@ -384,8 +403,15 @@ export class BridgeService {
       return failure(expired ? 'app_expired' : 'app_denied');
     }
     const { payload: session } = opened;
-    // 2. Enablement and approval (cached ≤ 2 s); key invalidation covers the remaining window.
-    const state = await this.#cachedState();
+    // 2. Enablement, approval and generation. A cached read (≤ 2 s) may only accept; any refusal is
+    // decided on a fresh read, so a handle minted right after a state change is not refused as stale.
+    const accepts = (current: UiReleaseState) =>
+      current.status === 'approved' &&
+      current.manifest.id === session.app &&
+      current.manifest.releaseDigest === session.release &&
+      current.consent.generation === session.generation;
+    const cached = await this.#cachedState();
+    const state = accepts(cached) ? cached : await this.#readState();
     const sessionApp: BridgeAuditEvent['app'] =
       state.status === 'approved' || state.status === 'disabled'
         ? appOf(state.manifest, session.id)
@@ -399,6 +425,11 @@ export class BridgeService {
     const { manifest } = state;
     if (manifest.releaseDigest !== session.release || manifest.id !== session.app) {
       return deny('app_stale', 'stale_release');
+    }
+    // Disabled, uninstalled or re-approved since mint: refused forever, whether or not the key's
+    // invalidation in Elasticsearch succeeded (that is cleanup).
+    if (state.consent.generation !== session.generation) {
+      return deny('app_stale', 'stale_generation');
     }
     // 3. Input schema only (closed union, scope, exact index and dashboard id). Not authorization:
     // the key's role descriptor and the viewer's own privileges are enforced natively.

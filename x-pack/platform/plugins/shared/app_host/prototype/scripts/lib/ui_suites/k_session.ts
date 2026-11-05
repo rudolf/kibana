@@ -10,21 +10,32 @@
 // `xpack.app_host.testOnlySkipInputSchema: true`); without it K1 proves the bypass is off by
 // default and reports the ES-side checks as NOT_VERIFIED. Everything else runs on the default config.
 
+import { spawnSync } from 'node:child_process';
 import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Page } from '@playwright/test';
-import { approveRelease, setAppEnabled } from '../approval';
-import { appKeyName } from '../app_keys';
+import { approveRelease, readConsent, setAppEnabled } from '../approval';
+import { AppKeyInvalidationError, appKeyName, invalidateAppKeys } from '../app_keys';
 import { http } from '../http';
+import { credentialNeedles, encodedPrefixNeedle, scanSurfaces, type Surface } from '../leak_scan';
+import { SessionHandles } from '../../../../server/ui/session_handle';
 import { LOCAL_DIR, kibanaSystemAuth } from '../secrets';
 import type { UiUser } from '../ui_harness';
 import { sleep } from '../ui_harness';
 import { jestEvidence, kfetch, release, session, type SuiteContext } from './context';
 import { POST_RECORDER, openBound } from './u3_adversarial';
-import { apiHeaders, codeOf, createSession, execute, type TestSession } from './u2_authority';
+import {
+  apiHeaders,
+  codeOf,
+  createSession,
+  execute,
+  readPanels,
+  type TestSession,
+} from './u2_authority';
 
 const HTTP = 'http';
 const LOGS = join(LOCAL_DIR, 'logs');
+const PROTOTYPE_DIR = join(LOCAL_DIR, '..');
 const AUDIT_LOG = join(LOGS, 'app_host_audit.ndjson');
 const VIEWER_ONLY_INDEX = 'kbn-apps-prototype-viewer-only';
 const SYNTHETIC_INDEX = 'kbn-apps-prototype-alerts';
@@ -42,8 +53,8 @@ const readLines = (file: string): string[] =>
   existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean) : [];
 /** Byte size now; logs (http_debug) grow by hundreds of MB, so they are read by offset. */
 const sizeOf = (file: string): number => (existsSync(file) ? statSync(file).size : 0);
-const readSince = (file: string, offset: number): string => {
-  if (!existsSync(file)) return '';
+const readSince = (file: string, offset: number): string | undefined => {
+  if (!existsSync(file)) return undefined;
   const fd = openSync(file, 'r');
   try {
     const length = Math.max(0, statSync(file).size - offset);
@@ -85,11 +96,20 @@ const keysByName = async (ctx: SuiteContext, name: string): Promise<KeyInfo[]> =
     }
   ).api_keys ?? [];
 
-const keyById = async (ctx: SuiteContext, id: string): Promise<KeyInfo | undefined> =>
-  (
-    (await esAdmin(ctx, `/_security/api_key?id=${encodeURIComponent(id)}&with_limited_by=true`))
-      .body as { api_keys?: KeyInfo[] }
-  ).api_keys?.[0];
+/** Keys are minted with refresh=false, so a fresh key may need up to one refresh to be listed. */
+const keyById = async (ctx: SuiteContext, id: string): Promise<KeyInfo | undefined> => {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const found = (
+      (await esAdmin(ctx, `/_security/api_key?id=${encodeURIComponent(id)}&with_limited_by=true`))
+        .body as { api_keys?: KeyInfo[] }
+    ).api_keys?.[0];
+    if (found) return found;
+    await sleep(400);
+  }
+  return undefined;
+};
+/** One `.security` refresh (1 s): searches and name invalidation then see newly minted keys. */
+const SETTLE_MS = 1_200;
 
 const appKeyCount = async (ctx: SuiteContext): Promise<number> =>
   (
@@ -124,6 +144,10 @@ const probe = async (ctx: SuiteContext, user: UiUser, operation: { op: string })
     status: response.status,
     reason: record?.event?.reason as string | undefined,
     keyId: record?.api_key?.id as string | undefined,
+    rules: (
+      (response.json as { result?: { records?: Array<{ rule?: string }> } } | undefined)?.result
+        ?.records ?? []
+    ).map(({ rule }) => rule),
   };
 };
 
@@ -206,16 +230,26 @@ export const runK1 = async (ctx: SuiteContext) => {
     superViewerOnly.code === 'app_denied' && superViewerOnly.reason === 'native_denied',
     superViewerOnly
   );
-  for (const index of ['.security-7', '.kibana', 'kbn-apps-prototype-*']) {
+  for (const index of ['.security-7', '.kibana']) {
     const result = await probe(ctx, users.superuser, search(index));
     report.expect(
       T,
-      `bypass on: superuser, ${index} → denied by ES (or no data)`,
+      `bypass on: superuser, ${index} → 403 from ES (native_denied)`,
       HTTP,
-      result.code === 'app_denied' || (result.code === 'ok' && index === 'kbn-apps-prototype-*'),
+      result.code === 'app_denied' && result.reason === 'native_denied',
       result
     );
   }
+  // A pattern over granted and ungranted indices: ES either denies it or returns only granted data.
+  const pattern = await probe(ctx, users.superuser, search('kbn-apps-prototype-*'));
+  report.expect(
+    T,
+    'bypass on: superuser, kbn-apps-prototype-* → denied by ES, or only granted-index data',
+    HTTP,
+    (pattern.code === 'app_denied' && pattern.reason === 'native_denied') ||
+      (pattern.code === 'ok' && pattern.rules.length > 0 && !pattern.rules.includes('viewer-only')),
+    pattern
+  );
   const control = await probe(ctx, users.viewer, search(SYNTHETIC_INDEX));
   report.expect(T, 'control: the granted index still works', HTTP, control.code === 'ok', control);
   // K2 under the bypass: the scope check is skipped, so Kibana's native feature authz decides.
@@ -299,8 +333,43 @@ export const runK2 = async (ctx: SuiteContext) => {
           metadata: {},
           transient_metadata: { enabled: true },
         },
-      }) && Array.isArray(viewerKey?.limited_by),
+      }),
     { roleDescriptors: viewerKey?.role_descriptors, metadata: viewerKey?.metadata }
+  );
+  // limited_by is the viewer's own roles, as Elasticsearch stores them.
+  const viewerRoles =
+    (
+      (await esAdmin(ctx, `/_security/user/${users.viewer.username}`)).body as Record<
+        string,
+        { roles?: string[] }
+      >
+    )[users.viewer.username]?.roles ?? [];
+  const roleBodies = (await esAdmin(ctx, `/_security/role/${viewerRoles.join(',')}`))
+    .body as Record<string, Record<string, unknown>>;
+  const pick = (role: Record<string, unknown> | undefined) => ({
+    cluster: role?.cluster,
+    indices: role?.indices,
+    applications: role?.applications,
+    run_as: role?.run_as,
+  });
+  const limitedBy = (viewerKey?.limited_by ?? []) as Array<Record<string, Record<string, unknown>>>;
+  const limitedRoles = Object.keys(limitedBy[0] ?? {}).sort();
+  report.expect(
+    T,
+    "limited_by = the viewer's roles (names and index/application/cluster/run_as privileges)",
+    HTTP,
+    limitedBy.length === 1 &&
+      viewerRoles.length > 0 &&
+      JSON.stringify(limitedRoles) === JSON.stringify([...viewerRoles].sort()) &&
+      viewerRoles.every(
+        (role) =>
+          JSON.stringify(pick(limitedBy[0][role])) === JSON.stringify(pick(roleBodies[role]))
+      ),
+    {
+      viewerRoles,
+      limitedRoles,
+      limitedIndices: viewerRoles.map((role) => limitedBy[0]?.[role]?.indices),
+    }
   );
   await release(ctx, { mutate: withoutDashboardScope });
   const noScope = await probe(ctx, users.superuser, dashboard(ctx));
@@ -435,23 +504,242 @@ export const runK3 = async (ctx: SuiteContext) => {
 };
 
 // ---------------------------------------------------------------- K4
-const LOG_FILES = [
+const kibanaLog = () => process.env.KIBANA_LOG ?? 'kibana-key.log';
+const ES_QUERY_LOG = join(LOGS, 'es_query_debug.ndjson');
+const logFiles = () => [
   'app_host_audit.ndjson',
   'kibana_audit.ndjson',
   'http_debug.ndjson',
   'kibana_debug.ndjson',
-  'kibana-key.log',
+  'es_query_debug.ndjson',
+  kibanaLog(),
   'wrangler.log',
 ];
+
+interface EsQueryEntry {
+  readonly message: string;
+  readonly authorization?: unknown;
+}
+
+/** Outgoing ES requests logged by Kibana's `elasticsearch.query` debug logger since `offset`. */
+const esQueriesSince = (offset: number): EsQueryEntry[] | undefined =>
+  readSince(ES_QUERY_LOG, offset)
+    ?.split('\n')
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        const record = JSON.parse(line) as {
+          message?: string;
+          http?: { request?: { headers?: Record<string, unknown> } };
+        };
+        return {
+          message: String(record.message ?? ''),
+          authorization: record.http?.request?.headers?.authorization,
+        };
+      } catch {
+        return { message: '' };
+      }
+    });
+
+/**
+ * Grants a key directly (as kibana_system, from `user`'s password) with exactly the descriptor
+ * Kibana would mint, and seals a handle for it with the local handle key: a session whose secret
+ * the test knows, so that the real Kibana ES/self clients and their loggers can be checked for it.
+ * The secret is held in memory only and never written to a report.
+ */
+const knownKeySession = async (ctx: SuiteContext, user: UiUser) => {
+  const manifest = ctx.current;
+  const consent = readConsent();
+  if (!manifest || !consent) throw new Error('no approved release');
+  // Same name, metadata and descriptor as server/ui/app_key.ts derives from this manifest (K2
+  // asserts the minted descriptor equals this).
+  const request = {
+    name: appKeyName(manifest.id, manifest.releaseDigest),
+    expiration: '1h',
+    metadata: {
+      app_host: true,
+      app: manifest.id,
+      release: manifest.releaseDigest,
+      space: 'default',
+    },
+    role_descriptors: {
+      app: {
+        cluster: [],
+        indices: [{ names: [...manifest.permissions.indices], privileges: ['read'] }],
+        applications: manifest.ui.scopes.includes('kibana.dashboard.read')
+          ? [
+              {
+                application: 'kibana-.kibana',
+                privileges: ['feature_dashboard_v2.read'],
+                resources: ['space:default'],
+              },
+            ]
+          : [],
+        run_as: [],
+      },
+    },
+  };
+  const granted = await http(`${ctx.es}/_security/api_key/grant`, {
+    method: 'POST',
+    auth: kibanaSystemAuth(),
+    body: {
+      grant_type: 'password',
+      username: user.username,
+      password: user.password,
+      api_key: {
+        name: request.name,
+        expiration: request.expiration,
+        metadata: request.metadata,
+        role_descriptors: request.role_descriptors,
+      },
+    },
+  });
+  const { id, api_key: secret } = granted.body as { id?: string; api_key?: string };
+  if (granted.status !== 200 || !id || !secret) throw new Error(`grant ${granted.status}`);
+  const me = await kfetch(ctx, '/internal/security/me', {
+    user,
+    headers: { 'x-elastic-internal-origin': 'Kibana' },
+  });
+  const realm = (me.json as { authentication_realm?: { type?: string; name?: string } })
+    .authentication_realm;
+  const handle = new SessionHandles(
+    readFileSync(join(LOCAL_DIR, 'handle_key'), 'utf8').trim()
+  ).seal({
+    id,
+    apiKey: secret,
+    app: 'alert-digest',
+    release: manifest.releaseDigest,
+    space: 'default',
+    principal: JSON.stringify([realm?.type, realm?.name, user.username]),
+    generation: consent.generation,
+    exp: Date.now() + 10 * 60 * 1000,
+  });
+  return { key: { id, secret }, held: { user, handle } as TestSession };
+};
 
 export const runK4 = async (ctx: SuiteContext) => {
   const { report, users } = ctx;
   const T = 'K4';
   await ensureMain(ctx);
-  const sizes = Object.fromEntries(LOG_FILES.map((file) => [file, sizeOf(join(LOGS, file))]));
+  const files = logFiles();
+  const sizes = Object.fromEntries(files.map((file) => [file, sizeOf(join(LOGS, file))]));
   const auditFrom = readLines(AUDIT_LOG).length;
-  const observed: Array<{ where: string; text: string }> = [];
+
+  // A. Known secret through the real Kibana clients and loggers (search, Dashboard, Worker path,
+  // and one native ES rejection), with the outgoing `elasticsearch.query` logger at debug.
+  const known = await knownKeySession(ctx, users.viewer);
+  const knownNoIndex = await knownKeySession(ctx, users.noIndex);
+  const responses: Surface[] = [];
+  const step = async (
+    name: string,
+    held: TestSession,
+    operation: { op: string },
+    accept: (json: Record<string, any>) => boolean,
+    expectLogged: (entries: EsQueryEntry[]) => boolean
+  ) => {
+    const offset = sizeOf(ES_QUERY_LOG);
+    const response = await execute(ctx, held, operation);
+    await sleep(500);
+    responses.push({ where: `response ${name}`, text: response.text });
+    const entries = esQueriesSince(offset);
+    const ok = accept((response.json ?? {}) as Record<string, any>);
+    const logged = entries !== undefined && expectLogged(entries);
+    const observed = entries === undefined ? 'NOT_VERIFIED' : ok && logged ? 'PASS' : 'FAIL';
+    report.add(
+      T,
+      `known key, ${name}: operation as expected and its outgoing ES request logged`,
+      HTTP,
+      observed,
+      {
+        status: response.status,
+        code: codeOf(response),
+        esQueryEntries: entries?.length ?? 'missing log',
+        matched: logged,
+      }
+    );
+    return entries ?? [];
+  };
+  const searchPath = (entries: EsQueryEntry[], status: number) =>
+    entries.filter(({ message }) =>
+      new RegExp(`^${status}\\b[\\s\\S]*/${SYNTHETIC_INDEX}/_search`).test(message)
+    );
+  const searchEntries = await step(
+    'es.search',
+    known.held,
+    search(SYNTHETIC_INDEX),
+    (json) => json.ok === true && json.result?.records?.length > 0,
+    (entries) => searchPath(entries, 200).length > 0
+  );
+  await step(
+    'kibana.dashboard.read',
+    known.held,
+    dashboard(ctx),
+    (json) => json.ok === true && json.result?.id === ctx.seed.dashboardId,
+    (entries) => entries.some(({ message }) => message.includes(ctx.seed.dashboardId))
+  );
+  await step(
+    'app.summary (Worker HostEs)',
+    known.held,
+    SUMMARY,
+    (json) => json.ok === true && typeof json.result?.counts?.high === 'number',
+    (entries) => searchPath(entries, 200).length > 0
+  );
+  await step(
+    'native ES rejection (viewer without index read)',
+    knownNoIndex.held,
+    search(SYNTHETIC_INDEX),
+    (json) => json.attributes?.code === 'app_denied',
+    (entries) => searchPath(entries, 403).length > 0
+  );
+  const redacted = searchPath(searchEntries, 200).map(({ authorization }) => authorization);
+  report.expect(
+    T,
+    'outgoing ES request log: authorization header present and [REDACTED]',
+    HTTP,
+    redacted.length > 0 && redacted.every((value) => value === '[REDACTED]'),
+    { values: [...new Set(redacted.map(String))] }
+  );
+  const knownSurfaces: Surface[] = [
+    ...responses,
+    ...files.map((file) => ({ where: file, text: readSince(join(LOGS, file), sizes[file]) })),
+  ];
+  const needles = [...credentialNeedles(known.key), ...credentialNeedles(knownNoIndex.key)];
+  const knownScan = scanSurfaces(knownSurfaces, needles);
+  report.add(
+    T,
+    'known key: neither the bare secret nor id:secret nor the base64 credential in responses or any log (incl. elasticsearch.query debug, wrangler)',
+    HTTP,
+    knownScan.status,
+    { hits: knownScan.hits, missing: knownScan.missing, surfaces: knownSurfaces.length }
+  );
+  // Negative controls: the same checker must catch an injected leak of each form.
+  const injected = credentialNeedles(known.key).map((needle, index) =>
+    scanSurfaces([...knownSurfaces, { where: `injected-${index}`, text: `x ${needle} y` }], needles)
+  );
+  const withoutLog = scanSurfaces(
+    knownSurfaces.map((surface) =>
+      surface.where === 'es_query_debug.ndjson' ? { ...surface, text: undefined } : surface
+    ),
+    needles
+  );
+  report.expect(
+    T,
+    'negative controls: injected bare/pair/base64/base64url leaks FAIL; a removed ES query log is NOT_VERIFIED',
+    HTTP,
+    injected.every((r) => r.status === 'FAIL' && r.hits.some((h) => h.startsWith('injected-'))) &&
+      withoutLog.status !== 'PASS',
+    { injected: injected.map((r) => r.status), withoutLog: withoutLog.status }
+  );
+  await http(`${ctx.es}/_security/api_key`, {
+    method: 'DELETE',
+    auth: ctx.adminAuth,
+    body: { ids: [known.key.id, knownNoIndex.key.id] },
+  });
+
+  // B. Kibana-minted keys (secret unknown to the test) across the three browsers.
+  const observed: Surface[] = [];
   const handles: string[] = [];
+  let boundEngines = 0;
   for (const engine of ctx.engines) {
     await report.guard(T, 'browser', engine, async () => {
       const s = await session(ctx, engine, users.viewer, POST_RECORDER);
@@ -464,38 +752,18 @@ export const runK4 = async (ctx: SuiteContext) => {
           if (handle) handles.push(handle);
         });
         const child = await openBound(s.page, ctx);
-        await child
-          .waitForFunction(() => document.body.innerText.includes('high'), undefined, {
-            timeout: 30_000,
-          })
-          .catch(() => undefined);
+        const panels = await readPanels(child);
+        if (/^Digest .*: high \d+/.test(panels.summary ?? '') && panels.dashboard)
+          boundEngines += 1;
         await sleep(1000);
         for (const frame of s.page.frames()) {
           const posted = (await frame
             .evaluate(() => (window as unknown as { __posted?: string[] }).__posted ?? [])
-            .catch(() => [])) as string[];
-          observed.push({ where: `${engine} posted ${frame.url()}`, text: posted.join('\n') });
+            .catch(() => undefined)) as string[] | undefined;
+          observed.push({ where: `${engine} posted ${frame.url()}`, text: posted?.join('\n') });
           observed.push({
             where: `${engine} dom ${frame.url()}`,
-            text: await frame.content().catch(() => ''),
-          });
-          observed.push({
-            where: `${engine} storage ${frame.url()}`,
-            text: String(
-              await frame
-                .evaluate(() => {
-                  try {
-                    return JSON.stringify([
-                      { ...localStorage },
-                      { ...sessionStorage },
-                      window.name,
-                    ]);
-                  } catch {
-                    return '';
-                  }
-                })
-                .catch(() => '')
-            ),
+            text: await frame.content().catch(() => undefined),
           });
         }
       } finally {
@@ -507,37 +775,30 @@ export const runK4 = async (ctx: SuiteContext) => {
   const keyIds = [
     ...new Set(
       auditSince(auditFrom)
+        .filter((r) => r.event?.reason === 'session_created')
         .map((r) => r.api_key?.id as string | undefined)
         .filter((id): id is string => Boolean(id))
     ),
-  ];
-  // Any encoding of the credential (`ApiKey base64(id:key)`) starts with base64(`${id}:`) cut to
-  // whole 3-byte groups, which is fully determined by the public id.
-  const encodedPrefixes = keyIds.map((id) => {
-    const prefix = Buffer.from(`${id}:`);
-    return prefix.subarray(0, prefix.length - (prefix.length % 3)).toString('base64');
-  });
-  const logText = LOG_FILES.map((file) => ({
+  ].filter((id) => id !== known.key.id && id !== knownNoIndex.key.id);
+  const logText: Surface[] = files.map((file) => ({
     where: file,
     text: readSince(join(LOGS, file), sizes[file]),
   }));
-  const surfaces = [...observed, ...logText];
-  const credentialHits = surfaces.filter(
-    ({ text }) =>
-      encodedPrefixes.some((prefix) => text.includes(prefix)) ||
-      /ApiKey [A-Za-z0-9+/=]{20,}/.test(text)
-  );
-  report.expect(
+  const minted = scanSurfaces([...observed, ...logText], keyIds.map(encodedPrefixNeedle));
+  report.add(
     T,
-    'no encoding of any session API key in responses, window/port messages, frame DOM, storage or logs',
+    'Kibana-minted keys: no encoding in responses, window/port messages, frame DOM or logs (all engines, data read)',
     'all',
-    keyIds.length >= ctx.engines.length && observed.length > 0 && credentialHits.length === 0,
-    { keys: keyIds.length, surfaces: surfaces.length, hits: credentialHits.map((h) => h.where) }
+    boundEngines === ctx.engines.length && keyIds.length >= ctx.engines.length
+      ? minted.status
+      : 'FAIL',
+    { boundEngines, keys: keyIds.length, hits: minted.hits, missing: minted.missing }
   );
-  const handleHits = surfaces.filter(
+  const handleHits = [...observed, ...logText].filter(
     ({ where, text }) =>
+      text !== undefined &&
       !/response \/internal\/app_host\/ui\/session$/.test(where) &&
-      handles.some((handle) => text.includes(handle) || text.includes(handle.split('.')[1]))
+      handles.some((handle) => text.includes(handle.split('.')[2]))
   );
   report.expect(
     T,
@@ -546,23 +807,13 @@ export const runK4 = async (ctx: SuiteContext) => {
     handles.length >= ctx.engines.length && handleHits.length === 0,
     { handles: handles.length, hits: handleHits.map((h) => h.where) }
   );
-  const idOnlyInAudit = logText
-    .filter(({ where }) => where !== 'app_host_audit.ndjson')
-    .filter(({ text }) => keyIds.some((id) => text.includes(id)));
-  report.add(
-    T,
-    'key id outside the app_host audit (attribution only; ids are not credentials)',
-    'all',
-    idOnlyInAudit.length === 0 ? 'PASS' : 'DIAGNOSTIC',
-    { files: idOnlyInAudit.map((h) => h.where) }
-  );
   await jestEvidence(
     ctx,
     T,
     ['server/ui/bridge_service.test.ts'],
     [
       [
-        'known raw key absent from responses, audit and logs; present only in the key-scoped clients',
+        'known raw key absent from bridge responses, audit and logger calls (unit)',
         'K4: the raw key never leaves the server; it reaches only the key-scoped clients',
       ],
     ]
@@ -590,9 +841,20 @@ export const runK5 = async (ctx: SuiteContext) => {
     adminVisibleTotal: adminTotal,
     note: 'kibana_system only sees its own keys; invalidation by name is what works',
   });
-  // Disable.
+  const generationOf = (held: TestSession) => Number(held.handle.split('.')[1]);
+  const mintedKeyId = async (user: UiUser) => {
+    const from = readLines(AUDIT_LOG).length;
+    const held = await mint(ctx, user);
+    await sleep(200);
+    return {
+      held,
+      id: lastRecord(from, user, 'session.create')?.api_key?.id as string | undefined,
+    };
+  };
+  // 1. Serial disable of settled keys: state flip, then name invalidation as kibana_system.
   const before = await mint(ctx, users.viewer);
   const ok = await execute(ctx, before, SUMMARY);
+  await sleep(SETTLE_MS); // refresh=false: let the key become searchable for the name invalidation
   const revoked = await setAppEnabled(false, { esUrl: ctx.es });
   const name = appKeyName('alert-digest', ctx.current?.releaseDigest ?? '');
   const afterDisable = await keysByName(ctx, name);
@@ -601,7 +863,7 @@ export const runK5 = async (ctx: SuiteContext) => {
   const mintDisabled = await createSession(ctx, users.viewer);
   report.expect(
     T,
-    'disable: state flipped, then all app keys invalidated by name as kibana_system; next call app_disabled',
+    'disable: generation raised, then all app keys invalidated by name as kibana_system; next call app_disabled',
     HTTP,
     codeOf(ok) === 'ok' &&
       (revoked?.invalidated ?? 0) >= 1 &&
@@ -623,13 +885,155 @@ export const runK5 = async (ctx: SuiteContext) => {
   const stillDead = await execute(ctx, before, SUMMARY);
   report.expect(
     T,
-    're-enable does not resurrect an invalidated key (ES denies the old handle)',
+    're-enable does not resurrect a pre-disable handle (superseded generation)',
     HTTP,
-    codeOf(stillDead) === 'app_denied',
+    codeOf(stillDead) === 'app_stale',
     codeOf(stillDead)
   );
+  // 2. Immediate mint → disable → enable with refresh=false: the name invalidation may miss the
+  // unrefreshed key; the generation must still kill the handle.
+  const quick = await mintedKeyId(users.viewer);
+  await setAppEnabled(false, { esUrl: ctx.es });
+  await setAppEnabled(true, { esUrl: ctx.es });
+  await sleep(STATE_CACHE_WAIT_MS);
+  const quickCode = codeOf(await execute(ctx, quick.held, SUMMARY));
+  const quickKey = quick.id ? await keyById(ctx, quick.id) : undefined;
+  report.expect(
+    T,
+    'mint → immediate disable → enable: the old handle is dead',
+    HTTP,
+    quickCode === 'app_stale',
+    { code: quickCode, esInvalidatedTheKey: quickKey?.invalidated }
+  );
+  if (quick.id && quickKey && !quickKey.invalidated) {
+    await http(`${ctx.es}/_security/api_key`, {
+      method: 'DELETE',
+      auth: ctx.adminAuth,
+      body: { ids: [quick.id] },
+    });
+  }
+  // 3. Partial invalidation (HTTP 200, error_count 1; the real key is left valid).
+  const partial = await mintedKeyId(users.viewer);
+  await sleep(SETTLE_MS);
+  const partialHttp: typeof http = async () => ({
+    status: 200,
+    body: { invalidated_api_keys: [], previously_invalidated_api_keys: [], error_count: 1 },
+    headers: new Headers(),
+    ms: 0,
+  });
+  const partialError = await setAppEnabled(false, { esUrl: ctx.es, http: partialHttp }).then(
+    () => undefined,
+    (error: unknown) => error
+  );
+  const stateAfterPartial = readConsent();
+  const leftValid = partial.id ? await keyById(ctx, partial.id) : undefined;
+  await setAppEnabled(true, { esUrl: ctx.es });
+  await sleep(STATE_CACHE_WAIT_MS);
+  const partialCode = codeOf(await execute(ctx, partial.held, SUMMARY));
+  const retry = await invalidateAppKeys({ esUrl: ctx.es, appId: 'alert-digest' });
+  const afterRetry = partial.id ? await keyById(ctx, partial.id) : undefined;
+  const freshAfterRetry = await mint(ctx, users.viewer);
+  const freshCode = codeOf(await execute(ctx, freshAfterRetry, SUMMARY));
+  report.expect(
+    T,
+    'partial invalidation: disable reports failure and stays disabled; re-enable cannot revive the still-valid key; retry invalidates it; a new consent works',
+    HTTP,
+    partialError instanceof AppKeyInvalidationError &&
+      stateAfterPartial?.enabled === false &&
+      leftValid?.invalidated === false &&
+      partialCode === 'app_stale' &&
+      retry.invalidated >= 1 &&
+      afterRetry?.invalidated === true &&
+      freshCode === 'ok',
+    {
+      reported: partialError instanceof AppKeyInvalidationError,
+      disabled: stateAfterPartial?.enabled === false,
+      keyLeftValid: leftValid?.invalidated === false,
+      oldHandle: partialCode,
+      retryInvalidated: retry.invalidated,
+      keyInvalidatedAfterRetry: afterRetry?.invalidated,
+      newSession: freshCode,
+    }
+  );
+  // 4. Operator CLI with an HTTP failure (wrong internal-user password): non-zero exit, state stays
+  // disabled; enable is not blocked.
+  const operator = (command: string, auth: string) =>
+    spawnSync(process.execPath, ['--import', 'tsx', 'scripts/ui_operator.ts', command], {
+      cwd: PROTOTYPE_DIR,
+      env: { ...process.env, ES_URL: ctx.es, KIBANA_SYSTEM_AUTH: auth },
+      encoding: 'utf8',
+    });
+  const cliHandle = await mint(ctx, users.viewer);
+  const cliDisable = operator('disable', 'kibana_system:not-the-password');
+  const cliOut = JSON.parse(cliDisable.stdout.trim().split('\n').pop() ?? '{}') as {
+    consent?: { enabled?: boolean };
+    revoked?: { failed?: { status?: unknown } };
+  };
+  const cliEnable = operator('enable', kibanaSystemAuth());
+  await sleep(STATE_CACHE_WAIT_MS);
+  const cliCode = codeOf(await execute(ctx, cliHandle, SUMMARY));
+  report.expect(
+    T,
+    'ui:operator disable with an invalidation HTTP failure exits non-zero and reports it; state disabled; old handle dead after enable',
+    HTTP,
+    cliDisable.status === 1 &&
+      cliOut.consent?.enabled === false &&
+      cliOut.revoked?.failed?.status === 401 &&
+      cliEnable.status === 0 &&
+      cliCode === 'app_stale',
+    {
+      disableExit: cliDisable.status,
+      failure: cliOut.revoked?.failed?.status,
+      enableExit: cliEnable.status,
+      oldHandle: cliCode,
+    }
+  );
+  await invalidateAppKeys({ esUrl: ctx.es, appId: 'alert-digest' });
+  // 5. Live race: a mint racing disable + enable. A returned handle works iff it carries the
+  // current generation; no handle with a superseded generation ever works.
+  const race: Array<{ minted: boolean; generation?: number; current?: number; code?: string }> = [];
+  for (let i = 0; i < 6; i++) {
+    const [created] = await Promise.all([
+      createSession(ctx, users.viewer),
+      (async () => {
+        await sleep(i * 40);
+        await setAppEnabled(false, { esUrl: ctx.es });
+        await setAppEnabled(true, { esUrl: ctx.es });
+      })(),
+    ]);
+    await sleep(STATE_CACHE_WAIT_MS);
+    const current = readConsent()?.generation;
+    if (!created.session) {
+      race.push({ minted: false, code: codeOf(created.response), current });
+      continue;
+    }
+    race.push({
+      minted: true,
+      generation: generationOf(created.session),
+      current,
+      code: codeOf(await execute(ctx, created.session, SUMMARY)),
+    });
+  }
+  report.expect(
+    T,
+    'mint racing disable + enable (6 runs): only current-generation handles work',
+    HTTP,
+    race.every(({ minted, generation, current, code }) =>
+      minted
+        ? (generation === current) === (code === 'ok') && (code === 'ok' || code === 'app_stale')
+        : code === 'app_disabled' || code === 'app_stale'
+    ),
+    race.map(({ minted, generation, current, code }) => ({
+      minted,
+      code,
+      current: minted ? generation === current : undefined,
+    }))
+  );
+  await sleep(SETTLE_MS);
+  await invalidateAppKeys({ esUrl: ctx.es, appId: 'alert-digest' });
   // Release change: a new approved release invalidates the previous release's keys.
   const v1 = await mint(ctx, users.viewer);
+  await sleep(SETTLE_MS);
   const v1Name = appKeyName('alert-digest', ctx.current?.releaseDigest ?? '');
   await release(ctx, { label: 'Digest K5 replacement', approve: false });
   const approval = await approveRelease({
@@ -670,13 +1074,14 @@ export const runK6 = async (ctx: SuiteContext) => {
   const { report, users } = ctx;
   const T = 'K6';
   await ensureMain(ctx);
+  await sleep(SETTLE_MS);
   const before = await appKeyCount(ctx);
   const held = await mint(ctx, users.viewer);
   const codes: string[] = [];
   for (let i = 0; i < 30; i++) {
     codes.push(codeOf(await execute(ctx, held, i % 3 === 0 ? SUMMARY : search(SYNTHETIC_INDEX))));
   }
-  await sleep(1500);
+  await sleep(SETTLE_MS);
   const after = await appKeyCount(ctx);
   report.expect(
     T,

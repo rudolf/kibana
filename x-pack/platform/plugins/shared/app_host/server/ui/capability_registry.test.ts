@@ -51,6 +51,7 @@ describe('CapabilityRegistry (T11)', () => {
     // Host-internal broker: one viewer-credential grant on consent, never an app capability.
     expect(hits.sort()).toEqual([
       'register_session_routes.ts:apiKeys.',
+      'register_session_routes.ts:apiKeys.',
       'register_session_routes.ts:grantAsInternalUser',
     ]);
   });

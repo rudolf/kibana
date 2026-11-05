@@ -86,6 +86,11 @@ writeFileSync(
     `      fileName: ${q(resolve(logs, 'http_debug.ndjson'))}`,
     '      layout:',
     '        type: json',
+    '    es_query_debug:',
+    '      type: file',
+    `      fileName: ${q(resolve(logs, 'es_query_debug.ndjson'))}`,
+    '      layout:',
+    '        type: json',
     '    kibana_debug:',
     '      type: file',
     `      fileName: ${q(resolve(logs, 'kibana_debug.ndjson'))}`,
@@ -105,6 +110,10 @@ writeFileSync(
     '    - name: plugins.security',
     '      level: debug',
     '      appenders: [kibana_debug]',
+    // K4: outgoing Elasticsearch requests (Core redacts authorization and security bodies).
+    '    - name: elasticsearch.query',
+    '      level: debug',
+    '      appenders: [es_query_debug]',
     '',
   ].join('\n'),
   { mode: 0o600 }

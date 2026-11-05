@@ -35,6 +35,12 @@ export const consentSchema = schema.object({
   }),
   approvedBy: schema.string({ minLength: 1, maxLength: 256 }),
   installerGrantDigest: hex64(),
+  // Monotonic approval generation: raised on every disable, uninstall and new approval. App session
+  // handles carry it, so a handle from before any of these is refused forever, even after re-enable.
+  generation: schema.number({
+    min: 1,
+    validate: (value) => (Number.isSafeInteger(value) ? undefined : 'must be an integer'),
+  }),
 });
 
 export type ConsentRecord = TypeOf<typeof consentSchema>;

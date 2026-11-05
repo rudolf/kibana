@@ -22,10 +22,15 @@ const RAW_KEY = 'RAWKEYsecretNeverLeaves';
 const KEY_ID = 'KeyIdForTheAppSession';
 const HANDLE_KEY = 'h'.repeat(32);
 const manifest = uiManifest() as never as ApprovedManifest;
-const asApproved = (m: ApprovedManifest): UiReleaseState => ({
+const asApproved = (m: ApprovedManifest, generation = 1): UiReleaseState => ({
   status: 'approved',
   manifest: m,
-  consent: {} as never,
+  consent: { generation } as never,
+});
+const asDisabled = (m: ApprovedManifest, generation: number): UiReleaseState => ({
+  status: 'disabled',
+  manifest: m,
+  consent: { generation } as never,
 });
 const approved = asApproved(manifest);
 const SEARCH = { op: 'es.search', params: { index: 'kbn-apps-prototype-alerts', size: 5 } };
@@ -126,6 +131,7 @@ const setup = ({ state = () => approved, es, self, summary, now, skipInputSchema
     })
   );
   const asKey = jest.fn((_key: AppKey) => ({ esClient, selfClient }));
+  const invalidateKey = jest.fn(async (_id: string) => undefined);
   const caller = (overrides: Partial<CallerContext> = {}): CallerContext => ({
     principal: '["native","native","viewer"]',
     userName: 'viewer',
@@ -136,6 +142,7 @@ const setup = ({ state = () => approved, es, self, summary, now, skipInputSchema
     requestAborted: new AbortController().signal,
     grantKey,
     asKey,
+    invalidateKey,
     dashboardPathname: (id) => `/api/dashboards/${id}`,
     ...overrides,
   });
@@ -153,6 +160,7 @@ const setup = ({ state = () => approved, es, self, summary, now, skipInputSchema
     selfClient,
     grantKey,
     asKey,
+    invalidateKey,
     runner,
     readState,
     logger,
@@ -186,7 +194,7 @@ describe('BridgeService app session (K3/K4/K6)', () => {
 
   it('refuses to mint for a disabled or unapproved release', async () => {
     for (const [state, expected] of [
-      [{ status: 'disabled', manifest, consent: {} }, 'app_disabled'],
+      [asDisabled(manifest, 2), 'app_disabled'],
       [{ status: 'not_approved', manifest }, 'app_denied'],
     ] as const) {
       const { service, caller, grantKey } = setup({ state: () => state as never });
@@ -309,6 +317,90 @@ describe('BridgeService app session (K3/K4/K6)', () => {
     }
     expect(grantKey).toHaveBeenCalledTimes(1);
     expect(new Set(asKey.mock.calls.map(([key]) => key.id))).toEqual(new Set([`${KEY_ID}0`]));
+  });
+});
+
+describe('BridgeService approval generation (review fix 1)', () => {
+  /** A grant that stays pending until `finish()`, after the initial approval read. */
+  const heldGrant = (grantKey: jest.Mock) => {
+    let finish: (() => void) | undefined;
+    grantKey.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = () => resolve({ id: `${KEY_ID}late`, apiKey: RAW_KEY });
+        })
+    );
+    return () => finish?.();
+  };
+
+  it('disable completing during a held grant: the late key is invalidated and never issued', async () => {
+    let state = asApproved(manifest, 1);
+    const { service, caller, grantKey, invalidateKey } = setup({ state: () => state });
+    const finish = heldGrant(grantKey);
+    const pending = service.createSession(caller(), 'alert-digest', manifest.releaseDigest);
+    await new Promise((resolve) => setImmediate(resolve));
+    state = asDisabled(manifest, 2);
+    finish();
+    const result = await pending;
+    expect(result.body).toEqual({ ok: false, code: 'app_disabled' });
+    expect(invalidateKey).toHaveBeenCalledWith(`${KEY_ID}late`);
+    expect(JSON.stringify(result)).not.toContain(RAW_KEY);
+  });
+
+  it('disable and re-enable both completing during a held grant: no usable handle survives', async () => {
+    let state = asApproved(manifest, 1);
+    const { service, caller, grantKey, invalidateKey, asKey } = setup({ state: () => state });
+    const finish = heldGrant(grantKey);
+    const pending = service.createSession(caller(), 'alert-digest', manifest.releaseDigest);
+    await new Promise((resolve) => setImmediate(resolve));
+    state = asDisabled(manifest, 2);
+    state = asApproved(manifest, 2);
+    finish();
+    const result = await pending;
+    expect(result.body).toEqual({ ok: false, code: 'app_stale' });
+    expect(invalidateKey).toHaveBeenCalledWith(`${KEY_ID}late`);
+    // Same release, same principal, enabled again: a handle sealed by the old code path would work.
+    const forged = (result.body as { handle?: string }).handle;
+    expect(forged).toBeUndefined();
+    expect(asKey).not.toHaveBeenCalled();
+  });
+
+  it('a completed pre-disable handle stays dead after re-enable, even if ES invalidation missed its key', async () => {
+    let now = 0;
+    let state = asApproved(manifest, 1);
+    const { service, caller, mint, asKey } = setup({ state: () => state, now: () => now });
+    const handle = await mint();
+    expect(code(await service.execute(caller(), handle, SUMMARY))).toBe('ok');
+    state = asDisabled(manifest, 2);
+    state = asApproved(manifest, 2);
+    now += 2_000;
+    // The mocked key client still accepts the key: only the generation refuses the handle.
+    expect(code(await service.execute(caller(), handle, SUMMARY))).toBe('app_stale');
+    expect(asKey).toHaveBeenCalledTimes(1);
+    const fresh = await mint();
+    expect(code(await service.execute(caller(), fresh, SUMMARY))).toBe('ok');
+  });
+
+  it('a handle minted right after a generation change is not refused by a stale cached state', async () => {
+    let state = asApproved(manifest, 1);
+    const { service, caller, mint } = setup({ state: () => state, now: () => 0 });
+    expect(code(await service.execute(caller(), await mint(), SUMMARY))).toBe('ok');
+    state = asApproved(manifest, 2);
+    // The cache (same instant) still holds generation 1; refusals re-read the state.
+    expect(code(await service.execute(caller(), await mint(), SUMMARY))).toBe('ok');
+  });
+
+  it('the generation is authenticated: editing the clear-text generation fails closed', async () => {
+    let now = 0;
+    let state = asApproved(manifest, 1);
+    const { service, caller, mint } = setup({ state: () => state, now: () => now });
+    const handle = await mint();
+    state = asApproved(manifest, 2);
+    now += 2_000;
+    const [release, , sealed] = handle.split('.');
+    expect(code(await service.execute(caller(), `${release}.2.${sealed}`, SUMMARY))).toBe(
+      'app_denied'
+    );
   });
 });
 
@@ -569,7 +661,7 @@ describe('BridgeService execute as the key (K1/K2/T8/T11/T13)', () => {
     const handle = await mint();
     expect(code(await service.execute(caller(), handle, SUMMARY))).toBe('ok');
     const reads = readState.mock.calls.length;
-    state = { status: 'disabled', manifest, consent: {} as never };
+    state = asDisabled(manifest, 1);
     now += 1_999;
     // Within the cache window the key's own invalidation is what stops it (Elasticsearch denies).
     expect(code(await service.execute(caller(), handle, SUMMARY))).toBe('ok');

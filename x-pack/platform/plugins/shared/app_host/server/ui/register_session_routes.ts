@@ -82,11 +82,17 @@ export const registerSessionRoutes = ({
       runAs,
       requestAborted: signal,
       grantKey: async (keyRequest) => {
-        const granted = await start.security.authc.apiKeys.grantAsInternalUser(request, {
-          ...keyRequest,
-          role_descriptors: { ...keyRequest.role_descriptors },
-        });
+        // No refresh wait: a key that a concurrent name-based invalidation misses is still
+        // unusable, because its handle carries the superseded approval generation.
+        const granted = await start.security.authc.apiKeys.grantAsInternalUser(
+          request,
+          { ...keyRequest, role_descriptors: { ...keyRequest.role_descriptors } },
+          { refresh: false }
+        );
         return granted ? { id: granted.id, apiKey: granted.api_key } : null;
+      },
+      invalidateKey: async (id) => {
+        await start.security.authc.apiKeys.invalidateAsInternalUser({ ids: [id] });
       },
       asKey: (key) => {
         const headers = { authorization: apiKeyAuthorization(key) };

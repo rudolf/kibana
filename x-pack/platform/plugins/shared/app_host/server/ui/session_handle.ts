@@ -15,6 +15,8 @@ export interface SessionPayload {
   readonly release: string;
   readonly space: string;
   readonly principal: string;
+  /** Approval generation at mint time (see `consentSchema.generation`). */
+  readonly generation: number;
   readonly exp: number;
 }
 
@@ -31,12 +33,16 @@ export type OpenedHandle =
 
 const IV_BYTES = 12;
 const TAG_BYTES = 16;
-// `<release digest>.<base64url(iv | tag | ciphertext)>`; the digest is public (it is in the URL of
-// the frame) and only selects the AAD, so a release change is reported as stale, not tampered.
-const HANDLE = /^([0-9a-f]{64})\.([A-Za-z0-9_-]{40,1024})$/;
+// `<release digest>.<generation>.<base64url(iv | tag | ciphertext)>`. Digest and generation are
+// public and authenticated through the AAD; they are in clear so that a release or generation change
+// is reported as stale, not tampered.
+const HANDLE = /^([0-9a-f]{64})\.([1-9][0-9]{0,15})\.([A-Za-z0-9_-]{40,1024})$/;
 
-const aad = ({ app, space, principal }: SessionBinding, release: string): Buffer =>
-  Buffer.from(`${app}|${release}|${space}|${principal}`, 'utf8');
+const aad = (
+  { app, space, principal }: SessionBinding,
+  release: string,
+  generation: number
+): Buffer => Buffer.from(`${app}|${release}|${space}|${principal}|${generation}`, 'utf8');
 
 const isPayload = (value: unknown): value is SessionPayload => {
   if (typeof value !== 'object' || value === null) return false;
@@ -44,12 +50,15 @@ const isPayload = (value: unknown): value is SessionPayload => {
   return (
     ['id', 'apiKey', 'app', 'release', 'space', 'principal'].every(
       (key) => typeof record[key] === 'string'
-    ) && typeof record.exp === 'number'
+    ) &&
+    typeof record.exp === 'number' &&
+    typeof record.generation === 'number'
   );
 };
 
 /**
- * Stateless app session handle: AES-256-GCM over the payload with AAD `app|release|space|principal`.
+ * Stateless app session handle: AES-256-GCM over the payload with AAD
+ * `app|release|space|principal|generation`.
  * Any node with the same `xpack.app_host.handleEncryptionKey` can open it; nothing is stored. A
  * tampered handle or one presented by another principal or in another space fails authentication.
  */
@@ -65,17 +74,17 @@ export class SessionHandles {
   seal(payload: SessionPayload): string {
     const iv = randomBytes(IV_BYTES);
     const cipher = createCipheriv('aes-256-gcm', this.#key, iv, { authTagLength: TAG_BYTES });
-    cipher.setAAD(aad(payload, payload.release));
+    cipher.setAAD(aad(payload, payload.release, payload.generation));
     const sealed = Buffer.concat([cipher.update(JSON.stringify(payload), 'utf8'), cipher.final()]);
-    return `${payload.release}.${Buffer.concat([iv, cipher.getAuthTag(), sealed]).toString(
-      'base64url'
-    )}`;
+    const encoded = Buffer.concat([iv, cipher.getAuthTag(), sealed]).toString('base64url');
+    return `${payload.release}.${payload.generation}.${encoded}`;
   }
 
   open(handle: string, binding: SessionBinding): OpenedHandle {
     const match = HANDLE.exec(handle);
     if (!match) return { status: 'invalid' };
-    const [, release, encoded] = match;
+    const [, release, generationText, encoded] = match;
+    const generation = Number(generationText);
     const bytes = Buffer.from(encoded, 'base64url');
     // Canonical encoding only: trailing junk that base64 decoding would silently drop is refused.
     if (bytes.length <= IV_BYTES + TAG_BYTES || bytes.toString('base64url') !== encoded) {
@@ -86,7 +95,7 @@ export class SessionHandles {
       const decipher = createDecipheriv('aes-256-gcm', this.#key, bytes.subarray(0, IV_BYTES), {
         authTagLength: TAG_BYTES,
       });
-      decipher.setAAD(aad(binding, release));
+      decipher.setAAD(aad(binding, release, generation));
       decipher.setAuthTag(bytes.subarray(IV_BYTES, IV_BYTES + TAG_BYTES));
       const plain = Buffer.concat([
         decipher.update(bytes.subarray(IV_BYTES + TAG_BYTES)),
@@ -100,6 +109,7 @@ export class SessionHandles {
       !isPayload(payload) ||
       payload.app !== binding.app ||
       payload.release !== release ||
+      payload.generation !== generation ||
       payload.space !== binding.space ||
       payload.principal !== binding.principal
     ) {

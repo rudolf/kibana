@@ -90,7 +90,9 @@ U2 — delegation and consent:
   profile, `common/ui_contract.ts`), non-numeric versions and digest mismatches are rejected at parse.
   Legacy backend-only manifests stay valid and carry none of these fields.
 - Operator approval `consent.json` (`xpack.app_host.consentPath`, mode 0600, exact keys `appId, enabled,
-  approvedReleaseDigest, approvedVersion, approvedBy, installerGrantDigest`), re-read on every request.
+  approvedReleaseDigest, approvedVersion, approvedBy, installerGrantDigest, generation`), re-read on every
+  request. `generation` is a monotonic integer raised on every disable, uninstall and new approval
+  (`max(previous + 1, now in ms)`, so it also moves forward after `reset` deletes the record).
   Written only by the local approval tool (`release --with-ui --approve-local-synthetic`), which checks the
   installer is a `superuser` in ES, the same principal in Kibana, has ES `_has_privileges` read on the exact
   index and can natively GET the exact dashboard; it refuses downgrades and is idempotent for the same
@@ -104,19 +106,23 @@ U2 — delegation and consent:
   (authenticated, both privileges, Kibana XSRF, exact configured `Origin`, default space, no run_as; the
   release must be enabled and approved). The server mints one key with the security service's
   `grantAsInternalUser` from the viewer's own credentials: name `app:{appId}@{releaseDigest}`, metadata
-  `{app_host, app, release, space}`, expiration 1 h, and a role descriptor derived **only** from the
+  `{app_host, app, release, space}`, expiration 1 h, `refresh=false`, and a role descriptor derived **only** from the
   approved manifest: `read` on `permissions.indices`, `feature_dashboard_v2.read` on `space:default` only
   with the `kibana.dashboard.read` scope, no cluster privileges, no `run_as`
   (`server/ui/app_key.ts`). Elasticsearch caps the key at the viewer's privileges (`limited_by`), so
-  every call is enforced natively as **viewer ∩ app**.
-- The response is an opaque **handle** `<releaseDigest>.<base64url(iv|tag|ciphertext)>`: AES-256-GCM
-  (key = SHA-256 of `xpack.app_host.handleEncryptionKey`) over `{id, apiKey, app, release, space,
-  principal, exp}` with AAD `app|release|space|principal` (`server/ui/session_handle.ts`). It is
+  every call is enforced natively as **viewer ∩ app**. After the grant returns, the server re-reads the
+  state: if the app was disabled or the generation changed meanwhile (a disable, or a disable plus
+  re-enable, during the grant), the new key is invalidated by id as the internal user and never issued.
+- The response is an opaque **handle** `<releaseDigest>.<generation>.<base64url(iv|tag|ciphertext)>`:
+  AES-256-GCM (key = SHA-256 of `xpack.app_host.handleEncryptionKey`) over `{id, apiKey, app, release,
+  space, principal, generation, exp}` with AAD `app|release|space|principal|generation`
+  (`server/ui/session_handle.ts`). It is
   stateless: nothing is stored and any node with the same key can open it. The raw API key never
   leaves the Kibana server process (not to parent JS, the frame, the port, the Worker, logs or audit).
 - `POST /internal/app_host/ui/execute` `{handle, op, params}` (same route checks). The server opens
   the handle (tampered, another principal or space → `app_denied`; expired → `app_expired`), reads
-  enablement and approval (cached ≤ 2 s; disabled → `app_disabled`, release changed → `app_stale`),
+  enablement, approval and generation (a cached read ≤ 2 s may only accept; refusals use a fresh read;
+  disabled → `app_disabled`, release or generation changed → `app_stale`),
   validates the closed operation union, scope, the exact synthetic index and size, and the declared
   dashboard id **as input validation only**, then runs the operation **as the key**: `es.search` via
   `elasticsearch.client.asScoped({headers: {authorization: 'ApiKey …'}})`, `kibana.dashboard.read`
@@ -126,12 +132,18 @@ U2 — delegation and consent:
   key-scoped client. 5 s deadline. Errors are fixed codes only (`app_denied`, `app_unavailable`,
   `app_stale`, `app_disabled`, `app_expired`, `app_rate_limited` (backend invocation limiter only),
   `app_timeout`, `app_cpu_limit`, `bridge_invalid_request`, `bridge_protocol_error`).
-- **Revocation.** The operator command flips the persisted state first (`ui:operator -- disable|reset`,
-  or a new approval), then invalidates the app's keys by name as Kibana's internal user
-  (`DELETE /_security/api_key {name: "app:alert-digest@*"}` or `@<previous release>`). `kibana_system`
-  can invalidate by name (wildcards included) but cannot list or query other users' keys, so
-  query-then-invalidate-by-id is not available to it. The per-call state check covers the window
-  before invalidation lands. Unmount or navigation just drops the handle in the parent; no server call.
+- **Revocation.** The operator command raises the generation and persists the state first
+  (`ui:operator -- disable|reset`, or a new approval). From then on every earlier handle is refused
+  (`app_stale`), also after a re-enable, whether or not the key's invalidation succeeded. It then
+  invalidates the app's keys by name as Kibana's internal user (`DELETE /_security/api_key {name:
+  "app:alert-digest@*"}` or `@<previous release>`) as cleanup; an HTTP or transport error or
+  `error_count > 0` is reported and the command exits non-zero (the state stays as written, and enable
+  is not blocked). `kibana_system` can invalidate by name (wildcards included) but cannot list or query
+  other users' keys, so query-then-invalidate-by-id is not available to it. Name invalidation can miss a
+  key minted less than one `.security` refresh earlier; the generation makes that key's handle useless.
+  Restoring the exact approved release while the app stays enabled (no disable, uninstall or new
+  approval in between) keeps the generation, so unexpired handles for it work again. Unmount or
+  navigation just drops the handle in the parent; no server call.
 - No leases, lease secrets, lease caps, token buckets, operation counters, in-flight caps or UI process
   cap remain. Abuse is handled by audit plus disable; ES-native protections (search timeouts,
   `search.max_buckets`, circuit breakers) cover node safety.
@@ -192,8 +204,8 @@ csp.frame_ancestors: ["'self'"]                 # trusted chrome cannot be embed
 `npm run kibana:config` writes all of the above for local development (the handle key is generated once
 into `.local/handle_key`, never printed), plus a synthetic CSP report collector (`csp.report_uri`),
 Kibana's security audit log, the JSON `app_host.bridge` audit appender and debug appenders for
-`http.server.response`, `plugins.appHost` and `plugins.security` (used to prove neither handle nor key
-reaches logs). It also writes `.local/kibana.app_host.k1.yml` (the K1 bypass; pass it as a second `-c`).
+`http.server.response`, `plugins.appHost`, `plugins.security` and the outgoing `elasticsearch.query`
+logger (used to prove neither handle nor key reaches logs). It also writes `.local/kibana.app_host.k1.yml` (the K1 bypass; pass it as a second `-c`).
 Logs go to `prototype/.local/logs/`. Elasticsearch must have API keys enabled
 (`xpack.security.authc.api_key.enabled`, the default; `node scripts/es snapshot` needs nothing extra).
 

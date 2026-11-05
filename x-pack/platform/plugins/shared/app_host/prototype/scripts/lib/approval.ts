@@ -29,7 +29,16 @@ export interface ConsentRecord {
   readonly approvedVersion: string;
   readonly approvedBy: string;
   readonly installerGrantDigest: string;
+  /** Raised on every disable, uninstall and new approval; app session handles must match it. */
+  readonly generation: number;
 }
+
+/**
+ * Next approval generation: one more than the previous record, and never below the wall clock in
+ * milliseconds, so a re-install after `reset` (which deletes the record) still moves forward.
+ */
+export const nextGeneration = (previous: ConsentRecord | undefined, now = Date.now()): number =>
+  Math.max((previous?.generation ?? 0) + 1, now);
 
 export const installerGrantDigest = (manifest: UiManifest, approvedBy: string): string =>
   sha256(
@@ -69,17 +78,27 @@ export const writeConsent = (record: ConsentRecord, path = CONSENT_FILE): void =
 };
 
 /**
- * Operator enable/disable: flips the persisted state, then (on disable) invalidates every app
- * session key of the app. The per-call state check covers the window before invalidation lands.
+ * Operator enable/disable. Disable raises the generation and persists it first, which already makes
+ * every earlier handle unusable forever; it then invalidates the app's keys in Elasticsearch as
+ * cleanup and rejects (`AppKeyInvalidationError`) if that cleanup failed. Enable keeps the
+ * generation, so handles from before the disable stay dead.
  */
 export const setAppEnabled = async (
   enabled: boolean,
-  { consentPath = CONSENT_FILE, esUrl }: { consentPath?: string; esUrl?: string } = {}
+  {
+    consentPath = CONSENT_FILE,
+    esUrl,
+    http,
+  }: { consentPath?: string; esUrl?: string; http?: typeof defaultHttp } = {}
 ): Promise<InvalidationResult | undefined> => {
   const consent = readConsent(consentPath);
   if (!consent) throw new Error('No approval to change');
-  writeConsent({ ...consent, enabled }, consentPath);
-  return enabled ? undefined : invalidateAppKeys({ esUrl, appId: consent.appId });
+  if (enabled) {
+    writeConsent({ ...consent, enabled }, consentPath);
+    return undefined;
+  }
+  writeConsent({ ...consent, enabled, generation: nextGeneration(consent) }, consentPath);
+  return invalidateAppKeys({ esUrl, appId: consent.appId, http });
 };
 
 export type ApprovalFailure =
@@ -226,6 +245,7 @@ export const approveRelease = async ({
       approvedVersion: manifest.version,
       approvedBy,
       installerGrantDigest: grant,
+      generation: nextGeneration(existing),
     },
     consentPath
   );

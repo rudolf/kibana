@@ -531,7 +531,7 @@ export const runT12 = async (ctx: SuiteContext) => {
       Object.keys(consent ?? {})
         .sort()
         .join(',') ===
-        'appId,approvedBy,approvedReleaseDigest,approvedVersion,enabled,installerGrantDigest',
+        'appId,approvedBy,approvedReleaseDigest,approvedVersion,enabled,generation,installerGrantDigest',
     { approvedBy: consent?.approvedBy, keys: Object.keys(consent ?? {}) }
   );
   ctx.current = base.manifest;
