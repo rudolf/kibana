@@ -91,8 +91,9 @@ U2 — delegation and consent:
   Legacy backend-only manifests stay valid and carry none of these fields.
 - Operator approval `consent.json` (`xpack.app_host.consentPath`, mode 0600, exact keys `appId, enabled,
   approvedReleaseDigest, approvedVersion, approvedBy, installerGrantDigest, generation`), re-read on every
-  request. `generation` is a monotonic integer raised on every disable, uninstall and new approval
-  (`max(previous + 1, now in ms)`, so it also moves forward after `reset` deletes the record).
+  request. `generation` is a fresh random token (16 bytes, base64url) written on every approval
+  (including the first one after a `reset`, which deletes the record) and every disable. Execute only
+  compares it for equality; no clock or ordering is involved.
   Written only by the local approval tool (`release --with-ui --approve-local-synthetic`), which checks the
   installer is a `superuser` in ES, the same principal in Kibana, has ES `_has_privileges` read on the exact
   index and can natively GET the exact dashboard; it refuses downgrades and is idempotent for the same
@@ -132,7 +133,7 @@ U2 — delegation and consent:
   key-scoped client. 5 s deadline. Errors are fixed codes only (`app_denied`, `app_unavailable`,
   `app_stale`, `app_disabled`, `app_expired`, `app_rate_limited` (backend invocation limiter only),
   `app_timeout`, `app_cpu_limit`, `bridge_invalid_request`, `bridge_protocol_error`).
-- **Revocation.** The operator command raises the generation and persists the state first
+- **Revocation.** The operator command replaces the generation and persists the state first
   (`ui:operator -- disable|reset`, or a new approval). From then on every earlier handle is refused
   (`app_stale`), also after a re-enable, whether or not the key's invalidation succeeded. It then
   invalidates the app's keys by name as Kibana's internal user (`DELETE /_security/api_key {name:

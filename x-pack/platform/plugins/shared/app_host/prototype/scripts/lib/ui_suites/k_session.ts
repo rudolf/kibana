@@ -11,10 +11,10 @@
 // default and reports the ES-side checks as NOT_VERIFIED. Everything else runs on the default config.
 
 import { spawnSync } from 'node:child_process';
-import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readFileSync, readSync, rmSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Page } from '@playwright/test';
-import { approveRelease, readConsent, setAppEnabled } from '../approval';
+import { CONSENT_FILE, approveRelease, readConsent, setAppEnabled } from '../approval';
 import { AppKeyInvalidationError, appKeyName, invalidateAppKeys } from '../app_keys';
 import { http } from '../http';
 import { credentialNeedles, encodedPrefixNeedle, scanSurfaces, type Surface } from '../leak_scan';
@@ -43,6 +43,7 @@ const SYNTHETIC_INDEX = 'kbn-apps-prototype-alerts';
 const STATE_CACHE_WAIT_MS = 2_100;
 
 const SUMMARY = { op: 'app.summary' };
+const HANDLE_SYNTAX = /^([0-9a-f]{64})\.([A-Za-z0-9_-]{22})\.([A-Za-z0-9_-]{40,1024})$/;
 const search = (index: string) => ({ op: 'es.search', params: { index, size: 1 } });
 const dashboard = (ctx: SuiteContext) => ({
   op: 'kibana.dashboard.read',
@@ -407,26 +408,52 @@ export const runK3 = async (ctx: SuiteContext) => {
   const T = 'K3';
   await ensureMain(ctx);
   const held = await mint(ctx, users.viewer);
-  const [prefix, sealed] = held.handle.split('.');
-  const flipped = `${sealed.slice(0, 30)}${sealed[30] === 'A' ? 'B' : 'A'}${sealed.slice(31)}`;
+  const [releasePart, generation, sealed] = held.handle.split('.');
+  const flipByte = (index: number) => {
+    const bytes = Buffer.from(sealed, 'base64url');
+    bytes[index] = (bytes[index] + 1) % 256;
+    return bytes.toString('base64url');
+  };
+  const otherGeneration = `${generation.slice(0, 21)}${generation[21] === 'A' ? 'B' : 'A'}`;
+  // Each tampered token keeps every other segment, is syntactically valid and canonical, and must be
+  // refused at the handle (audit reason bad_handle), before any key-scoped request.
+  const tampered: Array<[string, number, string]> = [
+    ['tampered ciphertext', 2, `${releasePart}.${generation}.${flipByte(40)}`],
+    ['tampered GCM tag', 2, `${releasePart}.${generation}.${flipByte(20)}`],
+    ['replaced release (another valid digest)', 0, `${'0'.repeat(64)}.${generation}.${sealed}`],
+    ['replaced generation (another valid token)', 1, `${releasePart}.${otherGeneration}.${sealed}`],
+  ];
+  const original = held.handle.split('.');
+  for (const [name, field, token] of tampered) {
+    const parts = token.split('.');
+    const wellFormed =
+      HANDLE_SYNTAX.test(token) &&
+      Buffer.from(parts[2], 'base64url').toString('base64url') === parts[2] &&
+      parts.every((part, i) => (part !== original[i]) === (i === field));
+    const from = readLines(AUDIT_LOG).length;
+    const response = await execute(ctx, held, SUMMARY, { handle: token });
+    await sleep(200);
+    const reasons = auditSince(from)
+      .filter((r) => r.user?.name === users.viewer.username)
+      .map((r) => r.event?.reason);
+    report.expect(
+      T,
+      `${name}: refused before key-scoped I/O`,
+      HTTP,
+      wellFormed &&
+        codeOf(response) === 'app_denied' &&
+        JSON.stringify(reasons) === '["bad_handle"]',
+      { wellFormed, code: codeOf(response), reasons }
+    );
+  }
   const cases: Array<[string, Promise<Awaited<ReturnType<typeof execute>>>, string]> = [
-    [
-      'tampered ciphertext',
-      execute(ctx, held, SUMMARY, { handle: `${prefix}.${flipped}` }),
-      'app_denied',
-    ],
-    [
-      'swapped release prefix',
-      execute(ctx, held, SUMMARY, { handle: `${'0'.repeat(64)}.${sealed}` }),
-      'app_denied',
-    ],
     [
       "another user's handle with their own credentials",
       execute(ctx, held, SUMMARY, { user: users.viewer2 }),
       'app_denied',
     ],
     ['another space', execute(ctx, held, SUMMARY, { space: ctx.seed.emptySpaceId }), 'app_denied'],
-    ['control: own handle', execute(ctx, held, SUMMARY), 'ok'],
+    ['control: the original handle', execute(ctx, held, SUMMARY), 'ok'],
   ];
   for (const [name, pending, expected] of cases) {
     const response = await pending;
@@ -841,7 +868,7 @@ export const runK5 = async (ctx: SuiteContext) => {
     adminVisibleTotal: adminTotal,
     note: 'kibana_system only sees its own keys; invalidation by name is what works',
   });
-  const generationOf = (held: TestSession) => Number(held.handle.split('.')[1]);
+  const generationOf = (held: TestSession) => held.handle.split('.')[1];
   const mintedKeyId = async (user: UiUser) => {
     const from = readLines(AUDIT_LOG).length;
     const held = await mint(ctx, user);
@@ -991,7 +1018,7 @@ export const runK5 = async (ctx: SuiteContext) => {
   await invalidateAppKeys({ esUrl: ctx.es, appId: 'alert-digest' });
   // 5. Live race: a mint racing disable + enable. A returned handle works iff it carries the
   // current generation; no handle with a superseded generation ever works.
-  const race: Array<{ minted: boolean; generation?: number; current?: number; code?: string }> = [];
+  const race: Array<{ minted: boolean; generation?: string; current?: string; code?: string }> = [];
   for (let i = 0; i < 6; i++) {
     const [created] = await Promise.all([
       createSession(ctx, users.viewer),
@@ -1067,6 +1094,86 @@ export const runK5 = async (ctx: SuiteContext) => {
     HTTP,
     codeOf(await execute(ctx, fresh, SUMMARY)) === 'ok'
   );
+};
+
+// ---------------------------------------------------------------- K5 reset / re-approval
+/**
+ * Reset (uninstall) is an explicit revocation. Re-approving exactly the same release afterwards must
+ * not revive a handle from before the reset, even with the ES key left valid and an operator clock
+ * that is frozen or moves backward (the approval generation must not repeat).
+ */
+export const runK5Reset = async (ctx: SuiteContext) => {
+  const { report, users } = ctx;
+  const T = 'K5';
+  await ensureMain(ctx);
+  const manifest = ctx.current;
+  if (!manifest) throw new Error('no release');
+  const realNow = Date.now;
+  const approveAt = async (now: number) => {
+    Date.now = () => now;
+    try {
+      await approveRelease({
+        manifest: manifest as never,
+        esUrl: ctx.es,
+        kbUrl: ctx.kibana,
+        esAuth: ctx.adminAuth,
+        kbAuth: ctx.adminAuth,
+      });
+    } finally {
+      Date.now = realNow;
+    }
+    return readConsent()?.generation;
+  };
+  /** Uninstall without key cleanup: the old key deliberately stays valid in Elasticsearch. */
+  const resetLeavingKeys = () => rmSync(CONSENT_FILE, { force: true });
+  const FROZEN = 1_800_000_000_000;
+  for (const [name, clocks] of [
+    ['frozen operator clock', [FROZEN, FROZEN]],
+    ['operator clock moving backward, then back', [FROZEN, FROZEN - 500, FROZEN]],
+  ] as const) {
+    resetLeavingKeys();
+    const generations = [await approveAt(clocks[0])];
+    const from = readLines(AUDIT_LOG).length;
+    const old = await mint(ctx, users.viewer);
+    await sleep(300);
+    const oldKeyId = lastRecord(from, users.viewer, 'session.create')?.api_key?.id as
+      | string
+      | undefined;
+    const before = codeOf(await execute(ctx, old, SUMMARY));
+    for (const now of clocks.slice(1)) {
+      resetLeavingKeys();
+      generations.push(await approveAt(now));
+    }
+    await sleep(STATE_CACHE_WAIT_MS);
+    const after = codeOf(await execute(ctx, old, SUMMARY));
+    const key = oldKeyId ? await keyById(ctx, oldKeyId) : undefined;
+    const fresh = await mint(ctx, users.viewer);
+    const freshCode = codeOf(await execute(ctx, fresh, SUMMARY));
+    report.expect(
+      T,
+      `reset + re-approval of exactly the same release (${name}): old handle app_stale with its key still valid; new handle works`,
+      HTTP,
+      before === 'ok' &&
+        new Set(generations).size === generations.length &&
+        key?.invalidated === false &&
+        after === 'app_stale' &&
+        freshCode === 'ok',
+      {
+        before,
+        distinctGenerations: new Set(generations).size === generations.length,
+        oldKeyStillValid: key?.invalidated === false,
+        oldHandleAfter: after,
+        newHandle: freshCode,
+      }
+    );
+    if (oldKeyId) {
+      await http(`${ctx.es}/_security/api_key`, {
+        method: 'DELETE',
+        auth: ctx.adminAuth,
+        body: { ids: [oldKeyId] },
+      });
+    }
+  }
 };
 
 // ---------------------------------------------------------------- K6
@@ -1172,6 +1279,7 @@ export const runK = async (ctx: SuiteContext) => {
     ['K3', runK3],
     ['K4', runK4],
     ['K5', runK5],
+    ['K5', runK5Reset],
     ['K6', runK6],
   ] as const) {
     await ctx.report.guard(name, 'suite', 'all', () => run(ctx));

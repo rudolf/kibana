@@ -22,16 +22,25 @@ const RAW_KEY = 'RAWKEYsecretNeverLeaves';
 const KEY_ID = 'KeyIdForTheAppSession';
 const HANDLE_KEY = 'h'.repeat(32);
 const manifest = uiManifest() as never as ApprovedManifest;
+/** A 22-character base64url approval generation token, distinct per `n`. */
+const G = (n: number) => `Generation${String(n).padStart(12, '0')}`;
 const asApproved = (m: ApprovedManifest, generation = 1): UiReleaseState => ({
   status: 'approved',
   manifest: m,
-  consent: { generation } as never,
+  consent: { generation: G(generation) } as never,
 });
 const asDisabled = (m: ApprovedManifest, generation: number): UiReleaseState => ({
   status: 'disabled',
   manifest: m,
-  consent: { generation } as never,
+  consent: { generation: G(generation) } as never,
 });
+const HANDLE_SYNTAX = /^([0-9a-f]{64})\.([A-Za-z0-9_-]{22})\.([A-Za-z0-9_-]{40,1024})$/;
+/** Flips one bit of the decoded sealed bytes at `index`; the result is canonical base64url. */
+const flipByte = (sealed: string, index: number) => {
+  const bytes = Buffer.from(sealed, 'base64url');
+  bytes[index] = (bytes[index] + 1) % 256;
+  return bytes.toString('base64url');
+};
 const approved = asApproved(manifest);
 const SEARCH = { op: 'es.search', params: { index: 'kbn-apps-prototype-alerts', size: 5 } };
 const DASHBOARD = { op: 'kibana.dashboard.read', params: { id: DASHBOARD_ID } };
@@ -259,20 +268,40 @@ describe('BridgeService app session (K3/K4/K6)', () => {
 
   it('K3: tampered, other-principal, other-space and expired handles are refused', async () => {
     let now = 1_000;
-    const { service, caller, mint, asKey } = setup({ now: () => now });
+    const { service, caller, mint, asKey, audit } = setup({ now: () => now });
     const handle = await mint();
-    const [release, sealed] = handle.split('.');
-    const flipped = `${sealed.slice(0, 20)}${sealed[20] === 'A' ? 'B' : 'A'}${sealed.slice(21)}`;
+    const [release, generation, sealed] = handle.split('.');
+    // Each case keeps every other segment and is a syntactically valid, canonical handle.
+    const tampered: Array<[field: number, token: string]> = [
+      [2, `${release}.${generation}.${flipByte(sealed, 40)}`], // ciphertext
+      [2, `${release}.${generation}.${flipByte(sealed, 20)}`], // GCM tag
+      [2, `${release}.${generation}.${flipByte(sealed, 3)}`], // IV
+      [0, `${'0'.repeat(64)}.${generation}.${sealed}`], // release
+      [1, `${release}.${G(99)}.${sealed}`], // generation
+    ];
+    for (const [field, token] of tampered) {
+      const parts = token.split('.');
+      expect(HANDLE_SYNTAX.test(token)).toBe(true);
+      expect(Buffer.from(parts[2], 'base64url').toString('base64url')).toBe(parts[2]);
+      expect(parts.map((part, i) => part !== handle.split('.')[i])).toEqual(
+        [0, 1, 2].map((i) => i === field)
+      );
+      expect(code(await service.execute(caller(), token, SUMMARY))).toBe('app_denied');
+    }
     for (const [bad, c] of [
-      [`${release}.${flipped}`, caller()],
-      [`${'0'.repeat(64)}.${sealed}`, caller()],
       ['not-a-handle', caller()],
       [handle, caller({ principal: '["native","native","viewer2"]' })],
       [handle, caller({ principal: '["saml","cloud-saml","viewer"]' })],
     ] as const) {
       expect(code(await service.execute(c, bad, SUMMARY))).toBe('app_denied');
     }
+    // Refused at the handle, before any key-scoped client exists.
     expect(asKey).not.toHaveBeenCalled();
+    expect(
+      audit()
+        .slice(1)
+        .every((r) => r.event.reason === 'bad_handle')
+    ).toBe(true);
     expect(code(await service.execute(caller(), handle, SUMMARY))).toBe('ok');
     now += 60 * 60 * 1000;
     expect(code(await service.execute(caller(), handle, SUMMARY))).toBe('app_expired');
@@ -390,17 +419,49 @@ describe('BridgeService approval generation (review fix 1)', () => {
     expect(code(await service.execute(caller(), await mint(), SUMMARY))).toBe('ok');
   });
 
-  it('the generation is authenticated: editing the clear-text generation fails closed', async () => {
+  it('the generation is authenticated: a handle relabelled with the current generation fails closed', async () => {
     let now = 0;
     let state = asApproved(manifest, 1);
-    const { service, caller, mint } = setup({ state: () => state, now: () => now });
+    const { service, caller, mint, asKey } = setup({ state: () => state, now: () => now });
     const handle = await mint();
     state = asApproved(manifest, 2);
     now += 2_000;
     const [release, , sealed] = handle.split('.');
-    expect(code(await service.execute(caller(), `${release}.2.${sealed}`, SUMMARY))).toBe(
+    expect(code(await service.execute(caller(), `${release}.${G(2)}.${sealed}`, SUMMARY))).toBe(
       'app_denied'
     );
+    expect(asKey).not.toHaveBeenCalled();
+  });
+
+  it('reset and re-approval of exactly the same release: the old handle is stale, a new one works', async () => {
+    let now = 0;
+    let state = asApproved(manifest, 1);
+    const { service, caller, mint, asKey } = setup({ state: () => state, now: () => now });
+    const old = await mint();
+    expect(code(await service.execute(caller(), old, SUMMARY))).toBe('ok');
+    state = { status: 'not_installed' };
+    now += 2_000;
+    expect(code(await service.execute(caller(), old, SUMMARY))).toBe('app_stale');
+    // Re-approval writes a new token; the (mocked) key is still valid in Elasticsearch.
+    state = asApproved(manifest, 2);
+    now += 2_000;
+    expect(code(await service.execute(caller(), old, SUMMARY))).toBe('app_stale');
+    expect(code(await service.execute(caller(), await mint(), SUMMARY))).toBe('ok');
+    expect(asKey).toHaveBeenCalledTimes(2);
+  });
+
+  it('a held grant spanning reset and re-approval of the same release is never issued', async () => {
+    let state = asApproved(manifest, 1);
+    const { service, caller, grantKey, invalidateKey } = setup({ state: () => state });
+    const finish = heldGrant(grantKey);
+    const pending = service.createSession(caller(), 'alert-digest', manifest.releaseDigest);
+    await new Promise((resolve) => setImmediate(resolve));
+    state = { status: 'not_installed' };
+    state = asApproved(manifest, 2);
+    finish();
+    const result = await pending;
+    expect(result.body).toEqual({ ok: false, code: 'app_stale' });
+    expect(invalidateKey).toHaveBeenCalledWith(`${KEY_ID}late`);
   });
 });
 

@@ -7,10 +7,10 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, existsSync } from 'node:fs';
+import { mkdtempSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ApprovalError, approveRelease } from '../scripts/lib/approval';
+import { ApprovalError, approveRelease, readConsent, setAppEnabled } from '../scripts/lib/approval';
 import type { HttpResult } from '../scripts/lib/http';
 import { buildUiRelease } from '../scripts/lib/ui_release';
 
@@ -91,4 +91,53 @@ test('F5: same username in two realms is two principals (mixed_identities, nothi
 test('F5 positive control: same username and realm passes the identity check', async () => {
   const realm = { type: 'reserved', name: 'reserved' };
   assert.deepEqual(await attempt(realm, { ...realm }), { outcome: 'written', wrote: true });
+});
+
+test('generation: approve, reset and re-approve exactly the same release never reuses an identity (frozen and backward clocks)', async () => {
+  const realm = { type: 'reserved', name: 'reserved' };
+  const { manifest } = await buildUiRelease({
+    version: '2.0.0',
+    label: 'x',
+    dashboardId: DASHBOARD,
+  });
+  const consentPath = join(mkdtempSync(join(tmpdir(), 'generation-')), 'consent.json');
+  const approve = () =>
+    approveRelease({
+      manifest,
+      esUrl: ES,
+      kbUrl: KB,
+      esAuth: 'admin:x',
+      kbAuth: 'admin:x',
+      consentPath,
+      http: fakeHttp(realm, realm) as never,
+    });
+  const invalidated = (async () =>
+    result(200, { invalidated_api_keys: [], error_count: 0 })) as never;
+  const realNow = Date.now;
+  const seen: string[] = [];
+  const record = () => seen.push(readConsent(consentPath)?.generation as unknown as string);
+  try {
+    // Frozen clock: approve R, disable + enable (a generation "ahead of the clock"), reset, approve R.
+    Date.now = () => 1_000;
+    await approve();
+    record();
+    await setAppEnabled(false, { consentPath, esUrl: ES, http: invalidated });
+    record();
+    await setAppEnabled(true, { consentPath, esUrl: ES, http: invalidated });
+    rmSync(consentPath);
+    await approve();
+    record();
+    // Backward clock: approve at 2000, reset, roll back to 1500, approve, reset, return to 2000.
+    for (const now of [2_000, 1_500, 2_000]) {
+      rmSync(consentPath);
+      Date.now = () => now;
+      await approve();
+      record();
+    }
+  } finally {
+    Date.now = realNow;
+  }
+  assert.equal(seen.length, 6);
+  assert.equal(new Set(seen).size, seen.length, 'every lifecycle identity is new');
+  for (const generation of seen) assert.match(String(generation), /^[A-Za-z0-9_-]{22}$/);
 });

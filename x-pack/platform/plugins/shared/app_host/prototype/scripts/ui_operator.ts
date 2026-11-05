@@ -8,7 +8,7 @@
 // Operator commands on the local approval file (not reachable through the bridge):
 //   npm run ui:operator -- disable | enable | status | reset
 // `reset` removes the approval (uninstall); the next approval starts a new version history.
-// `disable` and `reset` raise the approval generation first (every earlier app session handle is
+// `disable` replaces the approval generation and `reset` deletes the record first (every earlier handle is
 // then refused for good), then invalidate the app's session keys by name as Kibana's internal user
 // (ES_URL, KIBANA_SYSTEM_AUTH) as cleanup. A failed or partial invalidation is reported and the
 // command exits non-zero; the state stays as written.

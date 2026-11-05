@@ -16,7 +16,7 @@ export interface SessionPayload {
   readonly space: string;
   readonly principal: string;
   /** Approval generation at mint time (see `consentSchema.generation`). */
-  readonly generation: number;
+  readonly generation: string;
   readonly exp: number;
 }
 
@@ -36,12 +36,12 @@ const TAG_BYTES = 16;
 // `<release digest>.<generation>.<base64url(iv | tag | ciphertext)>`. Digest and generation are
 // public and authenticated through the AAD; they are in clear so that a release or generation change
 // is reported as stale, not tampered.
-const HANDLE = /^([0-9a-f]{64})\.([1-9][0-9]{0,15})\.([A-Za-z0-9_-]{40,1024})$/;
+const HANDLE = /^([0-9a-f]{64})\.([A-Za-z0-9_-]{22})\.([A-Za-z0-9_-]{40,1024})$/;
 
 const aad = (
   { app, space, principal }: SessionBinding,
   release: string,
-  generation: number
+  generation: string
 ): Buffer => Buffer.from(`${app}|${release}|${space}|${principal}|${generation}`, 'utf8');
 
 const isPayload = (value: unknown): value is SessionPayload => {
@@ -52,7 +52,7 @@ const isPayload = (value: unknown): value is SessionPayload => {
       (key) => typeof record[key] === 'string'
     ) &&
     typeof record.exp === 'number' &&
-    typeof record.generation === 'number'
+    typeof record.generation === 'string'
   );
 };
 
@@ -83,8 +83,7 @@ export class SessionHandles {
   open(handle: string, binding: SessionBinding): OpenedHandle {
     const match = HANDLE.exec(handle);
     if (!match) return { status: 'invalid' };
-    const [, release, generationText, encoded] = match;
-    const generation = Number(generationText);
+    const [, release, generation, encoded] = match;
     const bytes = Buffer.from(encoded, 'base64url');
     // Canonical encoding only: trailing junk that base64 decoding would silently drop is refused.
     if (bytes.length <= IV_BYTES + TAG_BYTES || bytes.toString('base64url') !== encoded) {

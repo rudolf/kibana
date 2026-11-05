@@ -11,7 +11,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AppKeyInvalidationError, invalidateAppKeys } from '../scripts/lib/app_keys';
-import { nextGeneration, readConsent, setAppEnabled, writeConsent } from '../scripts/lib/approval';
+import { readConsent, setAppEnabled, writeConsent } from '../scripts/lib/approval';
 import type { HttpResult } from '../scripts/lib/http';
 
 const ES = 'http://es.invalid';
@@ -26,7 +26,8 @@ const unreachable = async (): Promise<HttpResult> => {
   throw new TypeError('fetch failed');
 };
 
-const consentFile = (generation = 5) => {
+const ORIGINAL = 'OriginalGenerationTok0';
+const consentFile = (generation = ORIGINAL) => {
   const path = join(mkdtempSync(join(tmpdir(), 'app-keys-')), 'consent.json');
   writeConsent(
     {
@@ -65,8 +66,8 @@ test('invalidation: HTTP 200 with error_count > 0, HTTP errors and transport err
   );
 });
 
-test('disable with a partial invalidation: reports failure, stays disabled with a raised generation; enable keeps it', async () => {
-  const path = consentFile(5);
+test('disable with a partial invalidation: reports failure, stays disabled with a new generation; enable keeps it', async () => {
+  const path = consentFile();
   await assert.rejects(
     setAppEnabled(false, {
       consentPath: path,
@@ -77,7 +78,8 @@ test('disable with a partial invalidation: reports failure, stays disabled with 
   );
   const disabled = readConsent(path);
   assert.equal(disabled?.enabled, false);
-  assert.ok((disabled?.generation ?? 0) > 5);
+  assert.match(disabled?.generation ?? '', /^[A-Za-z0-9_-]{22}$/);
+  assert.notEqual(disabled?.generation, ORIGINAL);
   // Re-enable is not blocked, and it does not restore the pre-disable generation.
   await setAppEnabled(true, { consentPath: path, esUrl: ES, http: unreachable });
   const enabled = readConsent(path);
@@ -85,17 +87,11 @@ test('disable with a partial invalidation: reports failure, stays disabled with 
   assert.equal(enabled?.generation, disabled?.generation);
 });
 
-test('disable with an unreachable cluster: still raises the generation, then reports failure', async () => {
-  const path = consentFile(7);
+test('disable with an unreachable cluster: still replaces the generation, then reports failure', async () => {
+  const path = consentFile();
   await assert.rejects(
     setAppEnabled(false, { consentPath: path, esUrl: ES, http: unreachable }),
     AppKeyInvalidationError
   );
-  assert.ok((readConsent(path)?.generation ?? 0) > 7);
-});
-
-test('generations only move forward, also across uninstall (no record)', () => {
-  assert.equal(nextGeneration(undefined, 1_000), 1_000);
-  assert.equal(nextGeneration({ generation: 5_000 } as never, 1_000), 5_001);
-  assert.equal(nextGeneration({ generation: 5 } as never, 1_000), 1_000);
+  assert.notEqual(readConsent(path)?.generation, ORIGINAL);
 });

@@ -12,6 +12,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Frame, Page } from '@playwright/test';
 import { approveRelease, setAppEnabled } from '../approval';
+import { scanSurfaces } from '../leak_scan';
 import { LOCAL_DIR } from '../secrets';
 import { DASHBOARD_TITLE, HOSTILE_RULE } from '../ui_seed_state';
 import {
@@ -376,6 +377,10 @@ const handlesFromResponses = (page: Page) => {
   return handles;
 };
 
+/** Replayable forms of each handle: the full handle and its encrypted segment. */
+const handleNeedles = (handles: readonly string[]): string[] =>
+  handles.flatMap((handle) => [handle, handle.split('.')[2]]);
+
 /** Longer than the server's 2 s enablement/approval cache. */
 const STATE_CACHE_WAIT_MS = 2_100;
 
@@ -656,9 +661,10 @@ export const runT10 = async (ctx: SuiteContext) => {
         );
       }
       handles.push(...pageHandles);
-      const leaked = posted.filter((p) =>
-        pageHandles.some((h) => p.includes(h) || p.includes(h.split('.')[1]))
-      );
+      const leaked = scanSurfaces(
+        posted.map((text, index) => ({ where: `posted-${index}`, text })),
+        handleNeedles(pageHandles)
+      ).hits;
       report.expect(
         T,
         'S11: the session handle never in window or port messages',
@@ -739,8 +745,27 @@ export const runT10 = async (ctx: SuiteContext) => {
     auditLines(KIBANA_AUDIT_LOG).join('\n'),
     auditLines(join(LOCAL_DIR, 'logs', 'kibana_debug.ndjson')).join('\n'),
   ];
-  const handleLeaks = handles.filter((handle) =>
-    logs.some((log) => log.includes(handle.split('.')[1]))
+  // A replayable handle leak is the full handle or its encrypted segment; the clear-text release and
+  // generation alone are not (they are public, authenticated through the AAD).
+  const handleLeaks = scanSurfaces(
+    logs.map((text, index) => ({ where: `log-${index}`, text })),
+    handleNeedles(handles)
+  ).hits;
+  const [sample] = handles;
+  const control = (text: string) =>
+    scanSurfaces(
+      [...logs.map((log) => ({ where: 'log', text: log })), { where: 'injected', text }],
+      handleNeedles(handles)
+    ).hits.includes('injected');
+  report.expect(
+    T,
+    'scanner controls: an injected ciphertext-only or full-handle leak is caught; a generation-only value is not a handle leak',
+    'http',
+    Boolean(sample) &&
+      control(`x ${sample?.split('.')[2]} y`) &&
+      control(`x ${sample} y`) &&
+      !control(`generation=${sample?.split('.')[1]}`),
+    { handles: handles.length }
   );
   const keyLeaks = logs.filter((log) => /ApiKey [A-Za-z0-9+/=]{20,}|"api_key"\s*:\s*"/.test(log));
   report.expect(
@@ -762,7 +787,8 @@ export const runT10 = async (ctx: SuiteContext) => {
     T,
     'no handles, keys, tokens, payloads or raw errors in bridge audit records',
     'http',
-    handles.every((handle) => !raw.includes(handle.split('.')[1])) &&
+    scanSurfaces([{ where: 'bridge audit', text: raw }], handleNeedles(handles)).status ===
+      'PASS' &&
       !raw.includes(HOSTILE_RULE) &&
       !raw.includes('Synthetic <b>') &&
       !/\bat\s.+\.ts:/.test(raw)

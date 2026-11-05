@@ -56,3 +56,21 @@ test('K4 scanner: a missing observer or no surfaces is NOT_VERIFIED, never PASS'
   );
   assert.equal(scanSurfaces([], needles).status, 'NOT_VERIFIED');
 });
+
+test('T10 handle needles: ciphertext-only and full-handle leaks are caught; the generation alone is not a leak', () => {
+  const handle = `${'a'.repeat(64)}.GenerationTokenAbc012.${'C'.repeat(60)}`;
+  const [, generation, sealed] = handle.split('.');
+  const handleNeedles = [handle, sealed];
+  assert.equal(
+    scanSurfaces([{ where: 'log', text: `x ${sealed} y` }], handleNeedles).status,
+    'FAIL'
+  );
+  assert.equal(
+    scanSurfaces([{ where: 'log', text: `x ${handle} y` }], handleNeedles).status,
+    'FAIL'
+  );
+  assert.equal(
+    scanSurfaces([{ where: 'log', text: `gen=${generation}` }], handleNeedles).status,
+    'PASS'
+  );
+});

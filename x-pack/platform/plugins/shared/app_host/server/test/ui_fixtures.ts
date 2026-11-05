@@ -89,7 +89,7 @@ export const writeConsentFile = async (
       approvedVersion: manifest.version,
       approvedBy: 'elastic',
       installerGrantDigest: grantDigest(manifest, 'elastic'),
-      generation: 1,
+      generation: 'GenerationToken0000001',
       ...overrides,
     })
   );
