@@ -832,7 +832,7 @@ export const runT9Browser = async (ctx: SuiteContext) => {
         await waitForStatus(s.page, /ended: protocol_error/, 10_000).catch(() => undefined);
         report.expect(
           'T9',
-          '33 KiB frame from the real app frame → parent terminates (frame_too_large)',
+          '1 MiB + 1 byte frame from the real app frame → parent terminates (frame_too_large)',
           engine,
           /ended: protocol_error \(frame_too_large\)/.test(await frameStatus(s.page)),
           await frameStatus(s.page)

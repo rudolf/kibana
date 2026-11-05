@@ -21,6 +21,8 @@ import type { AuditReason, BridgeAuditEvent, BridgeAuditLogger } from './audit';
 import { CapabilityRegistry } from './capability_registry';
 import { readUiReleaseState, type UiReleaseState } from './consent';
 import { readDashboardPreview } from './dashboard_preview';
+import { getDataView, listDataViews } from './data_views';
+import { runEsql } from './esql';
 import { SessionHandles, type SessionPayload } from './session_handle';
 
 /** Clients that authenticate as one app session key, never as the viewer's own session. */
@@ -46,8 +48,8 @@ export interface CallerContext {
   /** Invalidates one key by id as Kibana's internal user (cleanup of a key that is never issued). */
   readonly invalidateKey: (id: string) => Promise<void>;
   readonly asKey: (key: AppKey) => KeyScopedClients;
-  /** Absolute pathname the dashboard self call must hit (server base path, default space). */
-  readonly dashboardPathname: (id: string) => string;
+  /** Absolute pathname a self call to `path` must hit (server base path, default space). */
+  readonly selfPathname: (path: string) => string;
 }
 
 export interface ServiceResponse {
@@ -255,12 +257,33 @@ export class BridgeService {
         const outcome = await readDashboardPreview(
           clients.selfClient,
           id,
-          caller.dashboardPathname(id),
+          caller.selfPathname(`/api/dashboards/${encodeURIComponent(id)}`),
           signal
         );
         return outcome.ok ? { ok: true, result: { ...outcome.result } } : outcome;
       }
     );
+    this.#registry.register(
+      descriptor('kibana.dataViews.read'),
+      async ({ operation, clients, caller, signal }) => {
+        if (operation.op !== 'kibana.dataViews.read') {
+          return { ok: false, code: 'app_denied', reason: 'invalid_operation' };
+        }
+        const { id } = operation.params;
+        const outcome =
+          id === undefined
+            ? await listDataViews(clients.selfClient, caller.selfPathname, signal)
+            : await getDataView(clients.selfClient, id, caller.selfPathname, signal);
+        return outcome.ok ? { ok: true, result: { ...outcome.result } } : outcome;
+      }
+    );
+    this.#registry.register(descriptor('es.esql'), async ({ operation, clients, signal }) => {
+      if (operation.op !== 'es.esql') {
+        return { ok: false, code: 'app_denied', reason: 'invalid_operation' };
+      }
+      const outcome = await runEsql(clients.esClient, operation.params.query, signal);
+      return outcome.ok ? { ok: true, result: { ...outcome.result } } : outcome;
+    });
     this.#registry.freeze();
   }
 
@@ -431,8 +454,9 @@ export class BridgeService {
     if (state.consent.generation !== session.generation) {
       return deny('app_stale', 'stale_generation');
     }
-    // 3. Input schema only (closed union, scope, exact index and dashboard id). Not authorization:
-    // the key's role descriptor and the viewer's own privileges are enforced natively.
+    // 3. Input schema only (closed union, scope, exact index and dashboard id; data view ids and
+    // ES|QL queries are only bounded). Not authorization: the key's role descriptor and the
+    // viewer's own privileges are enforced natively.
     const operation = parseUiOperation(rawOperation);
     if (!operation) return deny('bridge_invalid_request', 'invalid_operation');
     if (!this.#skipInputSchema) {
@@ -479,7 +503,11 @@ export class BridgeService {
         timedOut,
       ]);
       if (!outcome.ok) return deny(outcome.code, outcome.reason);
-      if (Buffer.byteLength(JSON.stringify(outcome.result)) > UI_LIMITS.resultBytes) {
+      const maxBytes =
+        operation.op === 'kibana.dataViews.read' || operation.op === 'es.esql'
+          ? UI_LIMITS.largeResultBytes
+          : UI_LIMITS.resultBytes;
+      if (Buffer.byteLength(JSON.stringify(outcome.result)) > maxBytes) {
         return deny('app_unavailable', 'invalid_result');
       }
       this.#record(sessionApp, caller, operation.op, 'success', 'ok', correlationId);

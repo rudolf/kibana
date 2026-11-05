@@ -15,7 +15,7 @@ test('tool scope-map digest equals the plugin-pinned bridgeApi 1 contract digest
   // Same value as the inline snapshot in server/ui/contract.test.ts.
   assert.equal(
     scopeMapDigest(),
-    '23880e2aacc868856f20bd93bac94098a9050223512d9b9a96681e413c5c2888'
+    'f46b850c3116e006552cab012d76df65e63ec4bea4814233f99e6c1282d10a4c'
   );
 });
 
@@ -30,6 +30,10 @@ test('UI release: one classic IIFE, digest-named entry, empty egress, full relea
   assert.equal(manifest.digest, sha256(serverBundle));
   assert.deepEqual(manifest.ui.egress, { client: [], server: [] });
   assert.deepEqual(manifest.permissions.dashboardIds, [DASHBOARD]);
+  assert.deepEqual(manifest.permissions.indices, [
+    'kbn-apps-prototype-alerts',
+    'kbn-apps-demo-logs-*',
+  ]);
   assert.equal(
     manifest.releaseDigest,
     releaseDigestOf(manifest as unknown as Record<string, unknown>)

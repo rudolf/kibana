@@ -66,6 +66,32 @@ export const BRIDGE_V1_CAPABILITIES: readonly CapabilityDescriptor[] = [
     acceptsReferences: false,
   },
   {
+    id: 'kibana.dataViews.read',
+    bridgeMethod: 'listDataViews,getDataView',
+    kind: 'server',
+    description:
+      'App-session-key GET /api/data_views and /api/data_views/data_view/{id} (2023-10-31), projected',
+    input: '() | {id}',
+    output:
+      '[{id,name,title,timeFieldName}] | {id,name,title,timeFieldName,fields:[{name,type,esTypes,aggregatable,searchable}]}<=960KiB',
+    mintsCredential: false,
+    executesLater: false,
+    egressSideEffect: false,
+    acceptsReferences: false,
+  },
+  {
+    id: 'es.esql',
+    bridgeMethod: 'esql',
+    kind: 'server',
+    description: 'App-authored ES|QL query (no command allowlist) as the app session key',
+    input: '{query<=4KiB}',
+    output: '{columns:[{name,type}],values}<=500 rows,<=960KiB',
+    mintsCredential: false,
+    executesLater: false,
+    egressSideEffect: false,
+    acceptsReferences: false,
+  },
+  {
     id: 'host.theme',
     bridgeMethod: 'getTheme',
     kind: 'parent',

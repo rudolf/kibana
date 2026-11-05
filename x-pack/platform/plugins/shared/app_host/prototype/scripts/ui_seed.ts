@@ -16,7 +16,13 @@ import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { http, requireEnv } from './lib/http';
 import { LOCAL_DIR } from './lib/secrets';
-import { DASHBOARD_TITLE, HOSTILE_RULE, UI_SEED_FILE, writeUiSeed } from './lib/ui_seed_state';
+import {
+  DASHBOARD_TITLE,
+  DEMO,
+  HOSTILE_RULE,
+  UI_SEED_FILE,
+  writeUiSeed,
+} from './lib/ui_seed_state';
 
 const INDEX = 'kbn-apps-prototype-alerts';
 /** K1: a synthetic index the viewer can read but no app grant ever names. */
@@ -64,6 +70,95 @@ check(
   ).status,
   [200, 201]
 );
+
+// 1c. Mini Discover: two granted demo log indices (24 h of documents, the newest ones carrying
+// attacker-style messages) and one secret index outside the grant and the demo prefix. Recreated on
+// every seed so the timestamps stay within the last 24 hours.
+const demoMappings = {
+  settings: { number_of_shards: 1, number_of_replicas: 0 },
+  mappings: {
+    dynamic: 'strict',
+    properties: {
+      '@timestamp': { type: 'date' },
+      log: { properties: { level: { type: 'keyword' } } },
+      service: { properties: { name: { type: 'keyword' } } },
+      message: { type: 'text' },
+    },
+  },
+};
+const LEVELS = ['info', 'info', 'info', 'warn', 'error'];
+const SERVICES = ['checkout', 'cart', 'search', 'auth'];
+const DAY_MS = 24 * 60 * 60 * 1000;
+const seededAt = Date.now();
+const lines: string[] = [];
+for (const index of [...DEMO.indices, DEMO.secretIndex]) {
+  check(
+    `delete ${index}`,
+    (await http(`${esUrl}/${index}`, { method: 'DELETE', auth: esAuth })).status,
+    [200, 404]
+  );
+  check(
+    `create ${index}`,
+    (await http(`${esUrl}/${index}`, { method: 'PUT', auth: esAuth, body: demoMappings })).status,
+    [200]
+  );
+}
+DEMO.indices.forEach((index, n) => {
+  for (let i = 0; i < DEMO.docsPerIndex; i++) {
+    const hostile = n === 0 ? DEMO.hostileMessages[i] : undefined;
+    lines.push(
+      JSON.stringify({ index: { _index: index } }),
+      JSON.stringify({
+        // Newest first: i = 0 is "now", the oldest just under 24 h ago; denser towards now so the
+        // count-over-time chart has a shape.
+        '@timestamp': new Date(
+          seededAt - Math.floor((i / DEMO.docsPerIndex) ** 1.6 * DAY_MS) - n * 1000
+        ).toISOString(),
+        log: { level: LEVELS[i % LEVELS.length] },
+        service: { name: SERVICES[(i + n) % SERVICES.length] },
+        message: hostile ?? `synthetic ${index.slice(-1)} event ${i}`,
+      })
+    );
+  }
+});
+for (let i = 0; i < DEMO.secretDocs; i++) {
+  lines.push(
+    JSON.stringify({ index: { _index: DEMO.secretIndex } }),
+    JSON.stringify({
+      '@timestamp': new Date(seededAt - i * 60_000).toISOString(),
+      log: { level: 'info' },
+      service: { name: 'vault' },
+      message: `${DEMO.secretMarker}-${i}`,
+    })
+  );
+}
+const demoBulk = await http(`${esUrl}/_bulk?refresh=wait_for`, {
+  method: 'POST',
+  auth: esAuth,
+  body: `${lines.join('\n')}\n`,
+  headers: { 'content-type': 'application/x-ndjson' },
+});
+check('demo bulk', demoBulk.status, [200]);
+if ((demoBulk.body as { errors?: boolean }).errors) throw new Error('demo bulk had item errors');
+
+// 1d. Data views (default space): one inside the grant, one on the secret index. The second is
+// visible to the app through listDataViews (saved-object privileges are per type), but ES refuses
+// any query against its index for the app key.
+for (const [id, title, name] of [
+  [DEMO.dataViewId, DEMO.dataViewTitle, 'Demo logs'],
+  [DEMO.secretDataViewId, DEMO.secretIndex, 'Other secret'],
+] as const) {
+  check(
+    `data view ${id}`,
+    (
+      await kb('/api/data_views/data_view', 'POST', {
+        override: true,
+        data_view: { id, title, name, timeFieldName: '@timestamp' },
+      })
+    ).status,
+    [200]
+  );
+}
 
 // 2. Synthetic dashboard via the public create API (reuse an existing one from a previous seed).
 const previous = existsSync(UI_SEED_FILE)
@@ -126,11 +221,20 @@ if (space.status === 404) {
 
 // 4. Roles and users.
 type Features = Record<string, string[]>;
+// Viewers with index read may also read the secret index: the app key, not the viewer, keeps it out.
 const role = async (name: string, indices: boolean, feature: Features) => {
   const result = await kb(`/api/security/role/${name}`, 'PUT', {
     elasticsearch: {
       cluster: [],
-      indices: indices ? [{ names: [INDEX, VIEWER_ONLY_INDEX], privileges: ['read'] }] : [],
+      indices: indices
+        ? [
+            { names: [INDEX, VIEWER_ONLY_INDEX], privileges: ['read'] },
+            {
+              names: [DEMO.dataViewTitle, DEMO.secretIndex],
+              privileges: ['read', 'view_index_metadata'],
+            },
+          ]
+        : [],
     },
     kibana: Object.keys(feature).length
       ? [{ base: [], feature, spaces: ['default', EMPTY_SPACE] }]
@@ -139,9 +243,19 @@ const role = async (name: string, indices: boolean, feature: Features) => {
   check(`role ${name}`, result.status, [204]);
 };
 const app = { appHost: ['read'], appHostAlertDigest: ['read'] };
-await role('app_host_ui_viewer', true, { ...app, dashboard_v2: ['read'] });
-await role('app_host_ui_no_index', false, { ...app, dashboard_v2: ['read'] });
+await role('app_host_ui_viewer', true, {
+  ...app,
+  dashboard_v2: ['read'],
+  indexPatterns: ['read'],
+});
+await role('app_host_ui_no_index', false, {
+  ...app,
+  dashboard_v2: ['read'],
+  indexPatterns: ['read'],
+});
 await role('app_host_ui_no_dashboard', true, app);
+// Index read on the demo indices but no feature that grants `index-pattern` saved objects.
+await role('app_host_ui_no_data_views', true, app);
 await role('app_host_ui_global_only', true, { appHost: ['read'], dashboard_v2: ['read'] });
 
 const USERS_FILE = join(LOCAL_DIR, 'ui_users.json');
@@ -150,6 +264,7 @@ const roles = {
   viewer2: ['app_host_ui_viewer'],
   noIndex: ['app_host_ui_no_index'],
   noDashboard: ['app_host_ui_no_dashboard'],
+  noDataViews: ['app_host_ui_no_data_views'],
   globalOnly: ['app_host_ui_global_only'],
   superuser: ['superuser'],
   nonSuperInstaller: ['app_host_ui_viewer'],
@@ -177,6 +292,12 @@ writeUiSeed({ dashboardId, ungrantedDashboardId, emptySpaceId: EMPTY_SPACE });
 process.stdout.write(
   `${JSON.stringify({
     hostileRecord: 'synthetic-hostile (severity medium)',
+    demo: {
+      indices: DEMO.indices,
+      docs: DEMO.indices.length * DEMO.docsPerIndex,
+      secretIndex: DEMO.secretIndex,
+      dataViews: [DEMO.dataViewId, DEMO.secretDataViewId],
+    },
     dashboardId,
     ungrantedDashboardId,
     emptySpace: EMPTY_SPACE,

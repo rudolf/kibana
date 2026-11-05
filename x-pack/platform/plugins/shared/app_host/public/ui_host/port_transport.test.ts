@@ -46,19 +46,19 @@ describe('utf8Bytes', () => {
 });
 
 describe('BoundedPortTransport (T9)', () => {
-  it('delivers a frame at the 32 KiB limit, terminates at 33 KiB ASCII before parsing', async () => {
+  it('delivers a frame at the 1 MiB limit, terminates at 1 MiB + 1 KiB ASCII before parsing', async () => {
     const { port, reasons, transport } = setup();
-    port.deliver('x'.repeat(32 * 1024));
-    await expect(transport.receive()).resolves.toHaveLength(32 * 1024);
-    port.deliver('x'.repeat(33 * 1024));
+    port.deliver('x'.repeat(1024 * 1024));
+    await expect(transport.receive()).resolves.toHaveLength(1024 * 1024);
+    port.deliver('x'.repeat(1025 * 1024));
     expect(reasons).toEqual(['frame_too_large']);
     expect(port.closed).toBe(true);
     await expect(transport.receive()).rejects.toThrow('bridge_protocol_error:frame_too_large');
   });
 
-  it('counts UTF-8 bytes, not code units (11,000 x U+6F22 = 33,000 bytes)', () => {
+  it('counts UTF-8 bytes, not code units (350,000 x U+6F22 = 1,050,000 bytes)', () => {
     const { port, reasons } = setup();
-    port.deliver('\u6f22'.repeat(11_000));
+    port.deliver('\u6f22'.repeat(350_000));
     expect(reasons).toEqual(['frame_too_large']);
   });
 
@@ -70,9 +70,9 @@ describe('BoundedPortTransport (T9)', () => {
     }
   });
 
-  it('terminates when the receive queue exceeds 256 KiB or 1,024 frames', () => {
+  it('terminates when the receive queue exceeds 4 MiB or 1,024 frames', () => {
     const bytes = setup();
-    for (let i = 0; i < 9; i++) bytes.port.deliver('y'.repeat(30 * 1024));
+    for (let i = 0; i < 5; i++) bytes.port.deliver('y'.repeat(1000 * 1024));
     expect(bytes.reasons).toEqual(['queue_overflow']);
     const count = setup();
     for (let i = 0; i <= MAX_QUEUED_FRAMES; i++) count.port.deliver('z');

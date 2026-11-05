@@ -30,6 +30,7 @@ export type AuditReason =
   | 'process_limit'
   | 'deadline'
   | 'native_denied'
+  | 'native_rejected'
   | 'native_failed'
   | 'invalid_result'
   | 'cpu_limit';

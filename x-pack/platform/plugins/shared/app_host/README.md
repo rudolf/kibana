@@ -4,8 +4,10 @@ Prototype plugin that runs one operator-installed backend app bundle in a fresh 
 Worker. It gives the app a request-scoped, read-only Elasticsearch capability for the current user,
 and renders the app's result on a static host page. With an operator approval file it also hosts the
 app's own UI in a guardian-wrapped, opaque-origin iframe with a typed bridge whose calls run as a
-restricted, short-lived Elasticsearch API key (the synthetic, local-only UI cut below). It is **disabled by default**, is not production code, and does not offer an SDK,
-install API, saved objects or tasks. App-authored browser code never runs in Kibana's origin.
+restricted, short-lived Elasticsearch API key (the synthetic, local-only UI cut below). The sample
+app's UI includes a **Mini Discover** tile that lists and reads Kibana data views and runs ES|QL, all as
+that key. It is **disabled by default**, is not production code, and does not offer an SDK, install API,
+saved objects or tasks. App-authored browser code never runs in Kibana's origin.
 
 ## What it does
 
@@ -72,9 +74,10 @@ U1 — browser shell (no data capability):
   listeners. Any later child or guardian load revokes; nothing is rebound. The host child bootstrap
   clears `window.name`, answers the challenge, then loads only the verified UI bundle. Lifecycle notices
   use the control port; the parent has no window `message` listener.
-- Parent RPC: capnweb `RpcSession` over a bounded string-only port transport (32 KiB UTF-8 per frame,
-  256 KiB / 1,024-frame queue, `messageerror` terminates; depth 12, BigInt 64, 8 invalid calls
-  terminate). These are structural memory bounds, not usage quotas; there are no rate limits. The cap of 128 live capnweb imports + exports is checked by the
+- Parent RPC: capnweb `RpcSession` over a bounded string-only port transport (1 MiB UTF-8 per frame,
+  4 MiB / 1,024-frame queue, `messageerror` terminates; depth 12, BigInt 64, 8 invalid calls
+  terminate). There is no streaming: one result travels in one frame, so large results are capped
+  below the frame size (960 KiB). These are structural memory bounds, not usage quotas; there are no rate limits. The cap of 128 live capnweb imports + exports is checked by the
   transport each time capnweb asks for the next frame and after every send, so protocol-only growth
   (retained pushes, guest-exported stubs, unknown-method pipelines) terminates the session too
   (`live_stubs`), not only bridge-method entry. Depth and BigInt breaches terminate with
@@ -85,8 +88,12 @@ U2 — delegation and consent:
 
 - Manifest UI envelope `{entry, digest, bridgeApi: 1, scopeMapDigest, scopes, egress: {client: [],
   server: []}}`, `permissions.dashboardIds` (one UUID) and `releaseDigest` (canonical SHA-256 of every
-  other manifest field). Non-empty egress, unknown/duplicate scopes, any index but the synthetic literal
-  (S8), a scope-map digest other than the host's pinned bridgeApi 1 contract (capabilities + UI security
+  other manifest field). Scopes: `app.summary`, `es.search`, `kibana.dashboard.read`,
+  `kibana.dataViews.read`, `es.esql`. `permissions.indices` is a list that must contain the backend
+  literal `kbn-apps-prototype-alerts` (the Worker's only index) and may add `kbn-apps-demo-` names or
+  trailing-wildcard patterns (the release uses `kbn-apps-demo-logs-*`); anything else is rejected (S8,
+  synthetic data only; Elasticsearch enforces the grant through the key). Non-empty egress,
+  unknown/duplicate scopes, other indices, a scope-map digest other than the host's pinned bridgeApi 1 contract (capabilities + UI security
   profile, `common/ui_contract.ts`), non-numeric versions and digest mismatches are rejected at parse.
   Legacy backend-only manifests stay valid and carry none of these fields.
 - Operator approval `consent.json` (`xpack.app_host.consentPath`, mode 0600, exact keys `appId, enabled,
@@ -95,8 +102,8 @@ U2 — delegation and consent:
   (including the first one after a `reset`, which deletes the record) and every disable. Execute only
   compares it for equality; no clock or ordering is involved.
   Written only by the local approval tool (`release --with-ui --approve-local-synthetic`), which checks the
-  installer is a `superuser` in ES, the same principal in Kibana, has ES `_has_privileges` read on the exact
-  index and can natively GET the exact dashboard; it refuses downgrades and is idempotent for the same
+  installer is a `superuser` in ES, the same principal in Kibana, has ES `_has_privileges` `read` and
+  `view_index_metadata` on every granted index and pattern and can natively GET the exact dashboard; it refuses downgrades and is idempotent for the same
   digest. Once an approval file exists, the native `/api/apps/{appId}/summary` also runs only the enabled,
   approved release; without one, only legacy manifests run. The approval tool's same-principal check
   compares username **and** authentication realm (type and name) in ES and Kibana (F5).
@@ -108,9 +115,10 @@ U2 — delegation and consent:
   release must be enabled and approved). The server mints one key with the security service's
   `grantAsInternalUser` from the viewer's own credentials: name `app:{appId}@{releaseDigest}`, metadata
   `{app_host, app, release, space}`, expiration 1 h, `refresh=false`, and a role descriptor derived **only** from the
-  approved manifest: `read` on `permissions.indices`, `feature_dashboard_v2.read` on `space:default` only
-  with the `kibana.dashboard.read` scope, no cluster privileges, no `run_as`
-  (`server/ui/app_key.ts`). Elasticsearch caps the key at the viewer's privileges (`limited_by`), so
+  approved manifest: `read` and `view_index_metadata` on `permissions.indices`, and on `space:default`
+  `feature_dashboard_v2.read` with the `kibana.dashboard.read` scope and `feature_indexPatterns.read` with
+  the `kibana.dataViews.read` scope; empty `cluster` (so ES|QL `ENRICH` and inference are refused by ES),
+  no `run_as` (`server/ui/app_key.ts`). Elasticsearch caps the key at the viewer's privileges (`limited_by`), so
   every call is enforced natively as **viewer ∩ app**. After the grant returns, the server re-reads the
   state: if the app was disabled or the generation changed meanwhile (a disable, or a disable plus
   re-enable, during the grant), the new key is invalidated by id as the internal user and never issued.
@@ -120,17 +128,33 @@ U2 — delegation and consent:
   (`server/ui/session_handle.ts`). It is
   stateless: nothing is stored and any node with the same key can open it. The raw API key never
   leaves the Kibana server process (not to parent JS, the frame, the port, the Worker, logs or audit).
-- `POST /internal/app_host/ui/execute` `{handle, op, params}` (same route checks). The server opens
+- `POST /internal/app_host/ui/execute` `{handle, op, params}` (same route checks, body ≤ 16 KiB). The server opens
   the handle (tampered, another principal or space → `app_denied`; expired → `app_expired`), reads
   enablement, approval and generation (a cached read ≤ 2 s may only accept; refusals use a fresh read;
   disabled → `app_disabled`, release or generation changed → `app_stale`),
-  validates the closed operation union, scope, the exact synthetic index and size, and the declared
-  dashboard id **as input validation only**, then runs the operation **as the key**: `es.search` via
-  `elasticsearch.client.asScoped({headers: {authorization: 'ApiKey …'}})`, `kibana.dashboard.read`
-  via the local `selfClient` on a fake request carrying the same header (`GET /api/dashboards/{id}`
-  version `2023-10-31`; fails closed on redirects, non-200, bodies over 256 KiB and
-  `body.id !== grantedId`, S5), and `app.summary` → Worker → `HostEs` callbacks with the same
-  key-scoped client. 5 s deadline. Errors are fixed codes only (`app_denied`, `app_unavailable`,
+  validates the closed operation union, scope, the exact synthetic index and size, the declared
+  dashboard id, the data view id syntax and the ES|QL query size **as input validation only**, then runs
+  the operation **as the key**:
+  - `es.search` via `elasticsearch.client.asScoped({headers: {authorization: 'ApiKey …'}})`;
+  - `kibana.dashboard.read` via the local `selfClient` on a fake request carrying the same header
+    (`GET /api/dashboards/{id}` version `2023-10-31`; fails closed on redirects, non-200, bodies over
+    256 KiB and `body.id !== grantedId`, S5);
+  - `kibana.dataViews.read` the same way: `GET /api/data_views` → `{dataViews: [{id, name, title,
+    timeFieldName}]}`, `GET /api/data_views/data_view/{id}` → `{id, name, title, timeFieldName,
+    fields: [{name, type, esTypes, aggregatable, searchable}]}` (`server/ui/data_views.ts`; redirect,
+    non-200 and bodies over 4 MiB fail closed, the returned id must equal the requested one). Data
+    view ids are `[A-Za-z0-9_][A-Za-z0-9_.:*-]*`, ≤ 128 characters;
+  - `es.esql` via `esql.query` on the key-scoped ES client (`server/ui/esql.ts`): any query of at most
+    4 KiB UTF-8, no command allowlist, `maxRetries: 0`, request timeout and response read bounded
+    (5 s, 4 MiB); the projected `{columns: [{name, type}], values}` is refused (`app_unavailable`) above
+    500 rows;
+  - `app.summary` → Worker → `HostEs` callbacks with the same key-scoped client.
+
+  Results are capped at 16 KiB (960 KiB for data views and ES|QL). 5 s deadline. Native refusals map
+  to `app_denied`, with the audit reason `native_denied` for a 401/403/404 and `native_rejected` for a
+  400: ES|QL reports an index the key may not read exactly like a missing one (`400 Unknown index`), and
+  the Data Views API reports an unauthorized saved-object read as `400 Unable to bulk_get
+  index-pattern`. Errors are fixed codes only (`app_denied`, `app_unavailable`,
   `app_stale`, `app_disabled`, `app_expired`, `app_rate_limited` (backend invocation limiter only),
   `app_timeout`, `app_cpu_limit`, `bridge_invalid_request`, `bridge_protocol_error`).
 - **Revocation.** The operator command replaces the generation and persists the state first
@@ -145,15 +169,16 @@ U2 — delegation and consent:
   Restoring the exact approved release while the app stays enabled (no disable, uninstall or new
   approval in between) keeps the generation, so unexpired handles for it work again. Unmount or
   navigation just drops the handle in the parent; no server call.
-- No leases, lease secrets, lease caps, token buckets, operation counters, in-flight caps or UI process
-  cap remain. Abuse is handled by audit plus disable; ES-native protections (search timeouts,
+- There are no rate limits, budgets, operation counters or in-flight caps on the UI path. Abuse
+  is handled by audit plus disable; ES-native protections (search timeouts,
   `search.max_buckets`, circuit breakers) cover node safety.
 - A closed capability registry (`server/ui/capability_registry.ts`) refuses credential-minting, deferred,
   egress-side-effect and reference-accepting capabilities. The never-delegable list is enforced by *not
   granting* it in the key's role descriptor plus the typed surface. Minting the session key is a
   host-internal broker on consent, never an app capability.
 - Parent bridge: exactly `callAppRoute({method:'GET', path:'/summary'})`, `search({index, size})`,
-  `getDashboardPreview({id})`, `getTheme()`; plain-data arguments only; the handle stays in the parent's
+  `getDashboardPreview({id})`, `listDataViews()`, `getDataView({id})`, `esql({query})`, `getTheme()`;
+  plain-data arguments only; results are forwarded only in their exact projected shapes; the handle stays in the parent's
   closure and travels only in the execute JSON body. No metadata polling: the page reads metadata on
   load and once more after a server rejection that ends the frame (`app_disabled`, `app_stale`,
   `app_expired`), so a different release unmounts the old frame before its consent prompt appears (S10).
@@ -172,12 +197,24 @@ U3 — adversarial demo and attribution:
   `user.name`, `kibana.{space_id,correlation_id}`, `event.{action,outcome,reason}`. Worker-path `HostEs`
   reads inside `app.summary` are recorded with the same correlation id (S9). No keys, handles, payloads,
   titles or raw errors; control characters are replaced and fields capped. Prototype attribution, not tamper-proof audit storage.
-- Release v2 needs operator approval and a new viewer click; no Kibana restart or dispatcher redeploy.
+- A new release needs operator approval and a new viewer click; no Kibana restart or dispatcher redeploy.
 - The native `GET /api/apps/{appId}/summary` serves the default space only (404 elsewhere) and writes one
   `app_host.bridge` record per call (`event.provider: native`; app attribution from the approved release,
   none in legacy mode) (F7).
 
-capnweb sessions use `maxMessageSize: 256 KiB`, `maxDepth: 32` and `maxBigIntDigits: 64`, plus a
+Mini Discover (sample UI, `prototype/ui/src/discover.ts`): plain DOM in the same classic IIFE, no EUI. A
+data view picker filled from `listDataViews()`; on selection `getDataView({id})` lists the fields and
+prefills an editable ES|QL box with `FROM <title> | SORT <timeField> DESC | LIMIT 50`; **Run** renders a
+results table and a second query, `FROM <title> | STATS c = COUNT(*) BY b = BUCKET(<timeField>, 1 hour) |
+SORT b`, renders a bar chart of DOM elements. Every value is set with `textContent`; errors show their
+uniform code. What the app can read is decided natively: index patterns by ES through the key (a data
+view on an index outside the grant is listed, because Kibana privileges are per saved-object type, but
+any query against its index is refused by ES), data views by Kibana's saved-object authorization for the
+key. Note that `feature_dashboard_v2.read` also grants `index-pattern` read, so a release that keeps
+`kibana.dashboard.read` but drops `kibana.dataViews.read` is refused data views only by the bridge's
+scope check, not by Kibana.
+
+Backend (Node ↔ dispatcher) capnweb sessions use `maxMessageSize: 256 KiB`, `maxDepth: 32` and `maxBigIntDigits: 64`, plus a
 transport that rejects binary frames, frames over 256 KiB and a receive queue over 1 MiB before
 parsing. Both caps count **UTF-8 bytes** (capnweb's own `maxMessageSize` counts UTF-16 code units).
 Node's built-in WebSocket cannot cap `maxPayload`, so one oversized frame is still buffered before it
@@ -256,10 +293,12 @@ npm --prefix "$P/prototype" run benchmark -- --kibana "$KB_URL" --samples 20 \
 
 # Third-party UI cut (start Kibana with KBN_HMR=false: dev-mode HMR reloads pages whenever files under
 # prototype/.local change, which breaks long browser runs)
-npm --prefix "$P/prototype" run ui:seed           # hostile record, synthetic dashboards, empty space, viewers
+npm --prefix "$P/prototype" run ui:seed           # hostile record, dashboards, demo logs + data views, empty space, viewers
 npm --prefix "$P/prototype" run release -- --with-ui --version 2.0.0 --approve-local-synthetic  # INSTALLER_AUTH or ES_AUTH
+npm --prefix "$P/prototype" run release -- --with-ui --version 2.1.0 --approve-local-synthetic  # next release: viewers consent again
 npm --prefix "$P/prototype" run ui:operator -- disable|enable|status|reset   # disable/reset also invalidate keys
 npm --prefix "$P/prototype" run ui:security -- --kibana "$KB_URL" --engines chromium,firefox,webkit
+npm --prefix "$P/prototype" run ui:security -- --kibana "$KB_URL" --suites discover   # D1–D5 only
 # K1 (ES enforces with the input schema bypassed): restart Kibana with a second config, then
 #   node scripts/kibana --dev --no-base-path -c .../kibana.app_host.yml -c .../kibana.app_host.k1.yml
 npm --prefix "$P/prototype" run ui:security -- --kibana "$KB_URL" --suites k1
@@ -268,7 +307,9 @@ npm --prefix "$P/prototype" run ui:security -- --kibana "$KB_URL" --suites k1
 `acceptance` runs in legacy mode: remove the approval file first (`ui:operator -- reset`); `ui:security`
 starts from a reset approval and resets it again at the end.
 
-Open `$KB_URL/app/appHost` as `app_host_reader`, release another label, and press **Refresh**.
+Open `$KB_URL/app/appHost` as `app_host_reader`, release another label, and press **Refresh**. For the
+Mini Discover tile, open `$KB_URL/app/appHost/alert-digest` as `app_host_ui_viewer` (password in
+`.local/ui_users.json`), click **Allow this version** and pick *Demo logs*.
 `acceptance` and `ui-check` mutate the package directory and restore its original manifest at the end.
 
 `acceptance` and `benchmark` first verify, from the `dispatcher` fingerprint in `x-app-host-timing`,

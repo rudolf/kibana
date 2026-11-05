@@ -7,7 +7,7 @@
 
 // Local superuser-operated approval tool. Before writing consent.json it verifies, with the same
 // authenticated installer principal in ES and Kibana: the reserved `superuser` role, ES
-// `_has_privileges` read on the exact index, and a successful native GET of the exact dashboard.
+// `_has_privileges` read and view_index_metadata on every granted index and pattern, and a successful native GET of the exact dashboard.
 // Every negative or unavailable check fails closed without writing. No credentials are persisted.
 // Replacing an approval flips the state first, then invalidates the previous release's app keys.
 
@@ -196,13 +196,19 @@ export const approveRelease = async ({
   ) {
     throw new ApprovalError('mixed_identities');
   }
-  const [index] = manifest.permissions.indices;
   const privileges = await safe(
     () =>
       http(`${esUrl}/_security/user/_has_privileges`, {
         method: 'POST',
         auth: esAuth,
-        body: { index: [{ names: [index], privileges: ['read'] }] },
+        body: {
+          index: [
+            {
+              names: [...manifest.permissions.indices],
+              privileges: ['read', 'view_index_metadata'],
+            },
+          ],
+        },
       }),
     'es_unavailable'
   );

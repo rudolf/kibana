@@ -5,9 +5,11 @@
  * 2.0.
  */
 
-// Sample alert-digest UI: renders its version plus three panels (app summary, raw synthetic ES
-// records, one dashboard title). All data is rendered with textContent, never as markup.
+// Sample alert-digest UI: renders its version, the Mini Discover tile (data views + ES|QL) and three
+// panels (app summary, raw synthetic ES records, one dashboard title). All data is rendered with
+// textContent, never as markup.
 
+import { mountDiscover } from './discover';
 import { connectBridge, errorCode, type Theme } from './sdk';
 
 declare const __UI_VERSION__: string;
@@ -55,6 +57,7 @@ const run = async () => {
   } catch (error) {
     status.textContent = `theme: ${errorCode(error)}`;
   }
+  mountDiscover(root, bridge);
   const summary = panel('panel-summary', 'App summary (remote app code)');
   const records = panel('panel-records', 'Synthetic records (raw)');
   const dashboard = panel('panel-dashboard', 'Dashboard');

@@ -22,7 +22,15 @@ import { MANIFEST_FILE } from './package_dir';
 const execFileAsync = promisify(execFile);
 
 export const MAX_UI_BUNDLE_BYTES = 512 * 1024;
-export const UI_SCOPES = ['app.summary', 'es.search', 'kibana.dashboard.read'] as const;
+export const UI_SCOPES = [
+  'app.summary',
+  'es.search',
+  'kibana.dashboard.read',
+  'kibana.dataViews.read',
+  'es.esql',
+] as const;
+/** Mini Discover grant: the synthetic demo log indices (ES enforces it through the app key). */
+export const DEMO_INDEX_PATTERN = 'kbn-apps-demo-logs-*';
 
 export const sha256 = (value: string): string =>
   createHash('sha256').update(value, 'utf8').digest('hex');
@@ -136,7 +144,7 @@ export const buildUiRelease = async ({
     version,
     hostApi: HOST_API_VERSION,
     digest: sha256(serverBundle),
-    permissions: { indices: [SYNTHETIC_INDEX], dashboardIds: [dashboardId] },
+    permissions: { indices: [SYNTHETIC_INDEX, DEMO_INDEX_PATTERN], dashboardIds: [dashboardId] },
     routes: [{ method: 'GET', path: '/summary', handler: 'summary' }],
     ui: {
       entry: `${uiDigest}.js`,

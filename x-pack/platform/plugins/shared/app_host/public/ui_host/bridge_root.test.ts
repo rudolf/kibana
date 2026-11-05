@@ -76,6 +76,79 @@ describe('AppBridge', () => {
     expect(calls).toHaveLength(1);
   });
 
+  it('Mini Discover methods: fixed operations, bounded input, exact result shapes', async () => {
+    const results: Record<string, Record<string, unknown>> = {
+      list: {
+        dataViews: [{ id: 'dv', name: 'Demo', title: 'kbn-apps-demo-logs-*', timeFieldName: null }],
+      },
+      get: {
+        id: 'dv',
+        name: 'Demo',
+        title: 'kbn-apps-demo-logs-*',
+        timeFieldName: '@timestamp',
+        fields: [
+          { name: 'm', type: 'string', esTypes: ['text'], aggregatable: false, searchable: true },
+        ],
+      },
+      esql: { columns: [{ name: 'm', type: 'text' }], values: [['<b>x</b>'], [['a', null]]] },
+    };
+    const calls: UiOperation[] = [];
+    const bridge = new AppBridge(
+      { scopes: ['kibana.dataViews.read', 'es.esql'], dashboardIds: [] },
+      () => THEME,
+      async (op) => {
+        calls.push(op);
+        if (op.op === 'es.esql') return { ok: true, result: results.esql };
+        return {
+          ok: true,
+          result: op.op === 'kibana.dataViews.read' && op.params.id ? results.get : results.list,
+        };
+      },
+      { beforeCall: () => true, terminate: () => undefined },
+      new BridgeLifecycle()
+    );
+    expect(await bridge.listDataViews()).toEqual(results.list.dataViews);
+    expect(await bridge.getDataView({ id: 'dv' })).toEqual(results.get);
+    expect(await bridge.esql({ query: 'FROM x' })).toEqual(results.esql);
+    expect(calls).toEqual([
+      { op: 'kibana.dataViews.read', params: {} },
+      { op: 'kibana.dataViews.read', params: { id: 'dv' } },
+      { op: 'es.esql', params: { query: 'FROM x' } },
+    ]);
+    for (const promise of [
+      bridge.listDataViews('x'),
+      bridge.getDataView({ id: '../x' }),
+      bridge.getDataView({ id: 'dv', extra: 1 }),
+      bridge.esql({ query: 'x'.repeat(4097) }),
+      bridge.esql({ query: '' }),
+      bridge.esql('FROM x'),
+    ]) {
+      expect(await codeOf(promise)).toBe('bridge_invalid_request');
+    }
+    expect(calls).toHaveLength(3);
+  });
+
+  it('Mini Discover results outside the exact shapes are never forwarded', async () => {
+    for (const result of [
+      { columns: [{ name: 'm', type: 'text' }], values: [[{ nested: 1 }]] },
+      { columns: [{ name: 'm', type: 'text' }], values: [['a', 'b']] },
+      { columns: [], values: Array.from({ length: 501 }, () => []) },
+      { columns: [{ name: 'm', type: 'text' }], values: [], extra: 1 },
+    ]) {
+      const { bridge } = setup(async () => ({ ok: true, result }));
+      const narrow = new AppBridge(
+        { scopes: ['es.esql'], dashboardIds: [] },
+        () => THEME,
+        async () => ({ ok: true, result }),
+        { beforeCall: () => true, terminate: () => undefined },
+        new BridgeLifecycle()
+      );
+      expect(await codeOf(narrow.esql({ query: 'FROM x' }))).toBe('app_unavailable');
+      // Without the scope the parent refuses before any server call.
+      expect(await codeOf(bridge.esql({ query: 'FROM x' }))).toBe('app_denied');
+    }
+  });
+
   it('denies ungranted dashboard ids before lookup, identically for existing and missing ids', async () => {
     const { bridge, calls } = setup();
     expect(
@@ -142,7 +215,7 @@ describe('AppBridge over capnweb + bounded MessageChannel (T9)', () => {
     );
     // eslint-disable-next-line no-new
     new RpcSession(transport, bridge, {
-      limits: { maxDepth: 12, maxBigIntDigits: 64, maxMessageSize: 32 * 1024 },
+      limits: { maxDepth: 12, maxBigIntDigits: 64, maxMessageSize: 1024 * 1024 },
       onSendError: sanitizeBridgeError,
     });
     const guestTransport = new BoundedPortTransport(

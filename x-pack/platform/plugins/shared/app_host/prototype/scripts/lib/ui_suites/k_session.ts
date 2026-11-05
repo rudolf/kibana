@@ -19,6 +19,7 @@ import { AppKeyInvalidationError, appKeyName, invalidateAppKeys } from '../app_k
 import { http } from '../http';
 import { credentialNeedles, encodedPrefixNeedle, scanSurfaces, type Surface } from '../leak_scan';
 import { SessionHandles } from '../../../../server/ui/session_handle';
+import { appKeyRequest } from '../../../../server/ui/app_key';
 import { LOCAL_DIR, kibanaSystemAuth } from '../secrets';
 import type { UiUser } from '../ui_harness';
 import { sleep } from '../ui_harness';
@@ -34,13 +35,22 @@ import {
 } from './u2_authority';
 
 const HTTP = 'http';
-const LOGS = join(LOCAL_DIR, 'logs');
+export const LOGS = join(LOCAL_DIR, 'logs');
 const PROTOTYPE_DIR = join(LOCAL_DIR, '..');
-const AUDIT_LOG = join(LOGS, 'app_host_audit.ndjson');
+export const AUDIT_LOG = join(LOGS, 'app_host_audit.ndjson');
 const VIEWER_ONLY_INDEX = 'kbn-apps-prototype-viewer-only';
 const SYNTHETIC_INDEX = 'kbn-apps-prototype-alerts';
+const DEMO_PATTERN = 'kbn-apps-demo-logs-*';
+/** The index entry ES stores for the manifest-derived descriptor of the default release. */
+const GRANTED_INDICES = [
+  {
+    names: [SYNTHETIC_INDEX, DEMO_PATTERN],
+    privileges: ['read', 'view_index_metadata'],
+    allow_restricted_indices: false,
+  },
+];
 /** Longer than the server's 2 s enablement/approval cache. */
-const STATE_CACHE_WAIT_MS = 2_100;
+export const STATE_CACHE_WAIT_MS = 2_100;
 
 const SUMMARY = { op: 'app.summary' };
 const HANDLE_SYNTAX = /^([0-9a-f]{64})\.([A-Za-z0-9_-]{22})\.([A-Za-z0-9_-]{40,1024})$/;
@@ -50,11 +60,11 @@ const dashboard = (ctx: SuiteContext) => ({
   params: { id: ctx.seed.dashboardId },
 });
 
-const readLines = (file: string): string[] =>
+export const readLines = (file: string): string[] =>
   existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean) : [];
 /** Byte size now; logs (http_debug) grow by hundreds of MB, so they are read by offset. */
-const sizeOf = (file: string): number => (existsSync(file) ? statSync(file).size : 0);
-const readSince = (file: string, offset: number): string | undefined => {
+export const sizeOf = (file: string): number => (existsSync(file) ? statSync(file).size : 0);
+export const readSince = (file: string, offset: number): string | undefined => {
   if (!existsSync(file)) return undefined;
   const fd = openSync(file, 'r');
   try {
@@ -67,13 +77,13 @@ const readSince = (file: string, offset: number): string | undefined => {
   }
 };
 
-const auditSince = (from: number) =>
+export const auditSince = (from: number) =>
   readLines(AUDIT_LOG)
     .slice(from)
     .map((line) => JSON.parse(line) as Record<string, any>);
 
 /** The newest bridge record for `user` and `capability` after `from`. */
-const lastRecord = (from: number, user: UiUser, capability: string) =>
+export const lastRecord = (from: number, user: UiUser, capability: string) =>
   auditSince(from)
     .filter((r) => r.user?.name === user.username && r.app?.capability === capability)
     .pop();
@@ -98,7 +108,7 @@ const keysByName = async (ctx: SuiteContext, name: string): Promise<KeyInfo[]> =
   ).api_keys ?? [];
 
 /** Keys are minted with refresh=false, so a fresh key may need up to one refresh to be listed. */
-const keyById = async (ctx: SuiteContext, id: string): Promise<KeyInfo | undefined> => {
+export const keyById = async (ctx: SuiteContext, id: string): Promise<KeyInfo | undefined> => {
   for (let attempt = 0; attempt < 8; attempt++) {
     const found = (
       (await esAdmin(ctx, `/_security/api_key?id=${encodeURIComponent(id)}&with_limited_by=true`))
@@ -110,7 +120,7 @@ const keyById = async (ctx: SuiteContext, id: string): Promise<KeyInfo | undefin
   return undefined;
 };
 /** One `.security` refresh (1 s): searches and name invalidation then see newly minted keys. */
-const SETTLE_MS = 1_200;
+export const SETTLE_MS = 1_200;
 
 const appKeyCount = async (ctx: SuiteContext): Promise<number> =>
   (
@@ -127,7 +137,7 @@ const percentile = (values: number[], p: number): number => {
   return Math.round(sorted[Math.min(sorted.length - 1, Math.ceil((p / 100) * sorted.length) - 1)]);
 };
 
-const mint = async (ctx: SuiteContext, user: UiUser): Promise<TestSession> => {
+export const mint = async (ctx: SuiteContext, user: UiUser): Promise<TestSession> => {
   const { response, session: created } = await createSession(ctx, user);
   if (!created) throw new Error(`session for ${user.username}: ${codeOf(response)}`);
   return created;
@@ -196,16 +206,10 @@ export const runK1 = async (ctx: SuiteContext) => {
   const securityKey = security.keyId ? await keyById(ctx, security.keyId) : undefined;
   report.expect(
     T,
-    'the superuser key grants only the synthetic index (no restricted indices, cluster or run_as)',
+    'the superuser key grants only the synthetic indices (no restricted indices, cluster or run_as)',
     HTTP,
     JSON.stringify(securityKey?.role_descriptors?.app?.indices) ===
-      JSON.stringify([
-        {
-          names: [SYNTHETIC_INDEX],
-          privileges: ['read'],
-          allow_restricted_indices: false,
-        },
-      ]) &&
+      JSON.stringify(GRANTED_INDICES) &&
       JSON.stringify(securityKey?.role_descriptors?.app?.cluster) === '[]' &&
       JSON.stringify(securityKey?.role_descriptors?.app?.run_as) === '[]',
     securityKey?.role_descriptors
@@ -320,13 +324,11 @@ export const runK2 = async (ctx: SuiteContext) => {
       JSON.stringify({
         app: {
           cluster: [],
-          indices: [
-            { names: [SYNTHETIC_INDEX], privileges: ['read'], allow_restricted_indices: false },
-          ],
+          indices: GRANTED_INDICES,
           applications: [
             {
               application: 'kibana-.kibana',
-              privileges: ['feature_dashboard_v2.read'],
+              privileges: ['feature_dashboard_v2.read', 'feature_indexPatterns.read'],
               resources: ['space:default'],
             },
           ],
@@ -374,20 +376,17 @@ export const runK2 = async (ctx: SuiteContext) => {
   );
   await release(ctx, { mutate: withoutDashboardScope });
   const noScope = await probe(ctx, users.superuser, dashboard(ctx));
-  const lastKeys = await keysByName(
-    ctx,
-    appKeyName('alert-digest', ctx.current?.releaseDigest ?? '')
-  );
+  // By id (retried): a key minted with refresh=false is not yet visible to a search by name.
+  const noScopeKey = noScope.keyId ? await keyById(ctx, noScope.keyId) : undefined;
   report.expect(
     T,
-    'scope absent from the manifest: superuser denied the dashboard; the key has no Kibana privileges',
+    'scope absent from the manifest: superuser denied the dashboard; the key has no Dashboard privilege',
     HTTP,
     noScope.code === 'app_denied' &&
-      lastKeys.length > 0 &&
-      lastKeys.every(
-        (key) => JSON.stringify(key.role_descriptors?.app?.applications ?? []) === '[]'
-      ),
-    { ...noScope, keys: lastKeys.length }
+      noScopeKey !== undefined &&
+      noScopeKey.name === appKeyName('alert-digest', ctx.current?.releaseDigest ?? '') &&
+      !JSON.stringify(noScopeKey.role_descriptors?.app?.applications ?? []).includes('dashboard'),
+    { ...noScope, keyApplications: noScopeKey?.role_descriptors?.app?.applications }
   );
   await release(ctx);
 };
@@ -532,8 +531,8 @@ export const runK3 = async (ctx: SuiteContext) => {
 
 // ---------------------------------------------------------------- K4
 const kibanaLog = () => process.env.KIBANA_LOG ?? 'kibana-key.log';
-const ES_QUERY_LOG = join(LOGS, 'es_query_debug.ndjson');
-const logFiles = () => [
+export const ES_QUERY_LOG = join(LOGS, 'es_query_debug.ndjson');
+export const logFiles = () => [
   'app_host_audit.ndjson',
   'kibana_audit.ndjson',
   'http_debug.ndjson',
@@ -543,13 +542,13 @@ const logFiles = () => [
   'wrangler.log',
 ];
 
-interface EsQueryEntry {
+export interface EsQueryEntry {
   readonly message: string;
   readonly authorization?: unknown;
 }
 
 /** Outgoing ES requests logged by Kibana's `elasticsearch.query` debug logger since `offset`. */
-const esQueriesSince = (offset: number): EsQueryEntry[] | undefined =>
+export const esQueriesSince = (offset: number): EsQueryEntry[] | undefined =>
   readSince(ES_QUERY_LOG, offset)
     ?.split('\n')
     .filter(Boolean)
@@ -574,38 +573,13 @@ const esQueriesSince = (offset: number): EsQueryEntry[] | undefined =>
  * the test knows, so that the real Kibana ES/self clients and their loggers can be checked for it.
  * The secret is held in memory only and never written to a report.
  */
-const knownKeySession = async (ctx: SuiteContext, user: UiUser) => {
+export const knownKeySession = async (ctx: SuiteContext, user: UiUser) => {
   const manifest = ctx.current;
   const consent = readConsent();
   if (!manifest || !consent) throw new Error('no approved release');
-  // Same name, metadata and descriptor as server/ui/app_key.ts derives from this manifest (K2
-  // asserts the minted descriptor equals this).
-  const request = {
-    name: appKeyName(manifest.id, manifest.releaseDigest),
-    expiration: '1h',
-    metadata: {
-      app_host: true,
-      app: manifest.id,
-      release: manifest.releaseDigest,
-      space: 'default',
-    },
-    role_descriptors: {
-      app: {
-        cluster: [],
-        indices: [{ names: [...manifest.permissions.indices], privileges: ['read'] }],
-        applications: manifest.ui.scopes.includes('kibana.dashboard.read')
-          ? [
-              {
-                application: 'kibana-.kibana',
-                privileges: ['feature_dashboard_v2.read'],
-                resources: ['space:default'],
-              },
-            ]
-          : [],
-        run_as: [],
-      },
-    },
-  };
+  // Exactly the request server/ui/app_key.ts derives from this manifest (K2 asserts the minted
+  // descriptor equals the expected one).
+  const request = appKeyRequest(manifest, 'default');
   const granted = await http(`${ctx.es}/_security/api_key/grant`, {
     method: 'POST',
     auth: kibanaSystemAuth(),

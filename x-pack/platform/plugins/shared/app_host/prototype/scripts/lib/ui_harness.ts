@@ -75,6 +75,7 @@ export type UiUsers = Record<
   | 'viewer2'
   | 'noIndex'
   | 'noDashboard'
+  | 'noDataViews'
   | 'globalOnly'
   | 'superuser'
   | 'nonSuperInstaller',

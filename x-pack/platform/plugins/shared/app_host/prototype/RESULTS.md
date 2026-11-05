@@ -1,358 +1,165 @@
 # App Host prototype results
 
-This file has two parts: the third-party UI cut (below, newest) and the earlier backend results.
-The backend acceptance was re-run at each UI milestone and after the UI review fixes (`seam` and
-`acceptance --local-workerd`: exit 0, verdict PASS, 34 of 37 true, the same three `NOT_ENFORCED_LOCALLY`
-CPU checks, no failures).
+**Synthetic data, local only.** ES snapshot 9.7.0 (trial license), `node scripts/kibana --dev
+--no-base-path` with `KBN_HMR=false`, local `wrangler dev` 4.157.0, Node 24.22.1, the Playwright browsers
+installed for the worktree (Chromium 153.0.8010.12, Firefox 155.0, WebKit 26.6). Run date 2026-11-05. No
+Cloudflare account, deploy, secret write or push. Reports and screenshots are git-ignored under `.local/`.
 
-## Restricted API key as the app session (K1–K6) — local results
-
-**Synthetic data, local only.** Spec: `kibana-apps-key-session-spec.md`; rationale:
-`kibana-apps-design.md` §3. Same stack as below (ES snapshot 9.7.0 trial license, `node scripts/kibana
---dev --no-base-path` with `KBN_HMR=false`, local `wrangler dev`, Node 24.22.1, Playwright Chromium,
-Firefox and WebKit). Run date 2026-11-05. No Cloudflare, deploy or push.
-
-What changed: the lease, lease secret, lease caps (32/4), per-lease/per-app token buckets, operation
-counters, in-flight caps, the UI process cap, parent metadata polling, the parent idle-expiry timer and
-the transport ingress pacing are gone. Consent mints one restricted API key (`grantAsInternalUser`,
-role descriptor from the approved manifest only, 1 h); the parent holds only an AES-256-GCM handle; every
-bridge operation (ES search, Dashboard read via `selfClient`, `app.summary` → Worker → `HostEs`) runs as
-that key. Config added: `xpack.app_host.handleEncryptionKey` (required) and the dev-only
-`xpack.app_host.testOnlySkipInputSchema`. ES needed nothing extra: `xpack.security.authc.api_key.enabled`
-is on by default in the `node scripts/es snapshot` cluster (`_xpack/usage` → `api_key_service.enabled:
-true`).
-
-| Check | Result | Evidence |
-|---|---|---|
-| K1 ES enforces, not Kibana | **PASS** (9/9, Kibana restarted with `-c .local/kibana.app_host.k1.yml`) | With the input schema bypassed: superuser viewer → `.security`, `.security-7`, `.kibana` each `app_denied` with audit reason `native_denied` specifically (raised only for an Elasticsearch 401/403 response; the schema's refusal is `resource_not_granted`); `kbn-apps-prototype-viewer-only` (direct ES read as the viewer: 200) → `native_denied` for the viewer and for a superuser; `kbn-apps-prototype-*` → `native_denied` (an `ok` would have to return only granted-index records); the granted index returns its records. The superuser key's descriptor is `indices:[{names:[kbn-apps-prototype-alerts], privileges:[read], allow_restricted_indices:false}]`, `cluster:[]`, `run_as:[]`. A separate direct ES probe with the same descriptor (superuser key) returned **403** on `.security/_search`; the bridge itself does not distinguish ES 401 from 403. Default config: `.security` is refused by the input schema, so the bypass is not reachable by default; outside `--dev` the setting fails config validation (Jest). |
-| K2 viewer ∩ app | **PASS** (7/7) | `app_host_ui_no_index`: key grants the index, ES denies (`native_denied`); the Worker-path summary is denied too (that alone would also happen as the current user; the key wiring is shown by source, Jest and K4's known-key run); `app_host_ui_no_dashboard`: key has `feature_dashboard_v2.read`, Kibana's native feature authz denies (`native_denied`); manifest without `kibana.dashboard.read` → the key has `applications: []`, superuser denied. The stored key descriptor equals the manifest-derived one, and `limited_by` holds exactly the viewer's role (`app_host_ui_viewer`) with the same cluster/index/application/run_as privileges as `GET /_security/role`. |
-| K3 handle integrity | **PASS** (HTTP 10/10, browser 1/1 per engine ×3, Jest 3/3) | Four tampered handles, each a syntactically valid, canonical three-segment token that differs from the original only in the intended field (ciphertext byte, GCM tag byte, release digest, generation token), are refused with `app_denied` and audit reason `bad_handle`, i.e. at the handle, before any key-scoped request; the original handle works. Another user's handle with their own basic auth **and** with their own cookie (all three engines), another space → `app_denied`; no credentials → 401; expired → `app_expired` (fake clock, Jest); the parent re-mints once only inside the session this page's consent created, never after teardown (Jest). The previous cut's live and Jest tamper probes built two-segment tokens after the generation was added, so they were refused by syntax only; those PASS results are superseded. |
-| K4 key confinement | **PASS** (10/10) | (a) **Known secret through the real clients and loggers:** the harness grants a key with the exact manifest descriptor as `kibana_system` from the viewer's (and the no-index viewer's) password and seals a handle for it with the local handle key; the secret stays in memory and is never written to a report. With `elasticsearch.query` at debug, each of es.search (records returned), Dashboard read (granted id returned), Worker-path `app.summary` (counts returned) and one native ES rejection (403) produced fresh outgoing-request entries (`/kbn-apps-prototype-alerts/_search` 200/403, the dashboard object request), with `http.request.headers.authorization` = `[REDACTED]`. Neither the bare secret, `id:secret`, nor its base64/base64url credential appears in the responses or in any new log output (`es_query_debug`, `kibana_debug`, `http_debug`, security audit, `app_host.bridge` audit, Kibana stdout, `wrangler.log`). Negative controls: an injected leak of each form makes the same checker FAIL, and a removed ES query log makes it NOT_VERIFIED (also node:test `leak_scan_test.ts`). (b) **Kibana-minted keys, three engines** (data panels rendered in each): no encoding of any minted key (base64 prefix of `id:`) in responses, window/port messages, frame DOM or logs; the handle appears only in the session response. Not observed: which credential the Worker-path ES request carried (the header is redacted, by design). |
-| K5 revocation | **PASS** (10 checks) | See *Review fixes* and *Re-review fixes* below: serial disable (keys invalidated by name, next call `app_disabled`, re-enable → old handle `app_stale`), mint → immediate disable → enable (ES name invalidation **missed** the unrefreshed key, the handle is still dead), partial invalidation (HTTP 200, `error_count: 1`, real key left valid) and an operator CLI HTTP failure (exit 1), a 6-run live race, a release change (`app_stale`, old-release keys invalidated), and reset + re-approval of exactly the same release with a frozen and a backward-moving operator clock (old handle `app_stale` with its key still valid; new handle works). |
-| K6 cost | **PASS** | 30 calls on one handle → exactly 1 new key (`_query/api_key` on `metadata.app`, after one `.security` refresh). Mint latency via `POST /internal/app_host/ui/session`, 20 mints, `refresh=false`: **p50 13 ms, p95 15 ms** (previous cut with ES's default `wait_for`: p50 1013 / p95 1018 ms). Direct ES grant as `kibana_system`: default refresh ≈ 1 s; `refresh=false` ≈ 11 ms. |
-
-### Review fixes (`kibana-apps-key-session-review.md`)
-
-1. **Mint in flight across disable (review #1).** The approval record has a `generation`
-   (`server/ui/consent.ts`), replaced on every disable and approval (`prototype/scripts/lib/approval.ts`:
-   `newGeneration`, `setAppEnabled`, `approveRelease`). It was first a clock-based integer; the
-   re-review showed that it could repeat after `reset`, so it is now a random token (see *Re-review
-   fixes*). The handle carries it in
-   clear and in the GCM AAD (`server/ui/session_handle.ts`); execute refuses any other generation
-   (`app_stale`, reason `stale_generation`). After the grant returns, the server re-reads the state and,
-   if the app was disabled or the generation changed, invalidates the new key by id as the internal user
-   and issues nothing (`revoked_during_mint`). A cached state read may only accept; refusals are decided
-   on a fresh read, so a handle minted just after a change is not refused from a stale cache. Proving
-   tests (Jest, `bridge_service.test.ts` "approval generation"): disable during a held grant; disable
-   **and** re-enable during a held grant; a completed pre-disable handle after re-enable while the
-   mocked key stays valid. The first three **fail on the previous commit** (`5f7af19a6324`: 3 of 4
-   failed, the 4th is new-format only). Live (ES): mint → immediate disable → enable leaves the old
-   handle dead although ES name invalidation missed the key (`esInvalidatedTheKey: false`); 6 runs of a
-   mint racing disable + enable never produced a working handle with a superseded generation (the runs
-   hit mint-refused and completed-before-disable orders; the held-grant orders are Jest-only).
-2. **Partial invalidation (review #2).** `invalidateAppKeys` rejects (`AppKeyInvalidationError`) on an
-   HTTP error, a transport error or `error_count > 0` (`prototype/scripts/lib/app_keys.ts`); `ui:operator`
-   reports the failure and exits 1, the written state stays (`prototype/scripts/ui_operator.ts`); enable
-   is not blocked, and old handles stay dead because the generation moved. Proving tests: node:test
-   `app_keys_test.ts` (fails to load on the previous commit; the old `invalidateAppKeys` resolved
-   `{errors: 1}` for HTTP 200 `error_count: 1` without reporting), and live K5: partial failure with the
-   real key left valid → disable reported, state disabled, re-enable → old handle `app_stale`, retry
-   invalidates the key, a new consent works; CLI with a wrong `kibana_system` password → exit 1,
-   `failed.status: 401`, state disabled, enable exit 0, old handle `app_stale`.
-3. **`refresh=false`.** With the generation in place the grant no longer waits for the `.security`
-   refresh (`server/ui/register_session_routes.ts`): mint p50 12 / p95 14 ms.
-4. **K4 evidence (review #3).** Outgoing `elasticsearch.query` debug logging, required fresh entries per
-   path, the known-secret run, bare-secret and credential needles, NOT_VERIFIED for missing observers,
-   FAIL for a failed operation, and negative controls (`prototype/scripts/lib/leak_scan.ts`,
-   `test/leak_scan_test.ts`, `k_session.ts` K4). The previous checker would have passed with the ES
-   query logger off, with missing log files and without detecting a bare secret.
-5. **K1/K2 tightening.** K1 requires `native_denied` for each restricted index and checks returned data
-   for the pattern case; K2 compares `limited_by` with the viewer's roles.
-
-### Re-review fixes (`## Re-review of bc98cdb43b77`)
-
-1. **Generation reuse across reset or a clock rollback.** The clock-based integer
-   (`max(previous + 1, now)`) repeated after `reset` (which deletes the record) whenever the operator clock
-   was frozen or returned to an earlier value, so re-approving exactly the same release revived old
-   handles. The generation is now a fresh random token, `randomBytes(16)` as base64url
-   (`prototype/scripts/lib/approval.ts` `newGeneration`), written on every approval (including the one
-   after a reset) and every disable; `nextGeneration` and all ordering are gone. Schema
-   `server/ui/consent.ts` (22-character base64url), handle syntax and AAD `server/ui/session_handle.ts`.
-   Proving tests: node:test `approval_test.ts` (frozen clock with a disable "ahead of the clock", then
-   reset and re-approve; backward clock 2000 → reset → 1500 → reset → 2000; all six identities must
-   differ) **fails on `bc98cdb43b77`** ("every lifecycle identity is new"). Live K5 `k5r`: with the
-   operator clock frozen, and moving backward then back, approve R, mint, reset leaving the ES key valid,
-   re-approve exactly R; after the cache window the old handle must be `app_stale` and a new one must
-   work. On `bc98cdb43b77` (old server and approval tool, same harness) both runs **FAILED** live: the
-   generations were equal and the old handle returned `ok`
-   (`.local/ui_security-2026-11-05T14-38-09-914Z.json`); on this code both PASS. Jest: reset +
-   re-approval of the same release, and a held grant spanning reset + re-approval (never issued, key
-   invalidated). The held-grant case passes on the old server too, given distinct generations: the
-   server logic was right, the old operator tool produced the repeating identity. The misleading
-   "generations only move forward" test was removed.
-2. **Handle-format tests.** K3 (Jest `bridge_service.test.ts` and live `k_session.ts`) tampers ciphertext,
-   GCM tag (and IV in Jest), release and generation separately; each token is asserted to match the
-   three-segment syntax, to be canonical base64url and to differ only in the intended field, and is
-   refused before any key-scoped client is created (Jest: `asKey` never called; live: audit reason
-   `bad_handle`), with the original handle as the positive control. The old probes' tokens do not even
-   match the handle syntax (checked against the old regular expression). T10
-   (`u3_adversarial.ts`) scans the full handle and its encrypted segment through `scanSurfaces`;
-   controls: an injected ciphertext-only leak and a full-handle leak are caught, a generation-only value
-   is not a handle leak (live T10 and node:test `leak_scan_test.ts`).
-
-**Restoring a release.** The generation changes only on disable, uninstall (the next approval writes a new one) and approval. Restoring the
-exact approved release files while the app stays enabled (no disable/uninstall/approval in between)
-lets unexpired handles for that release work again; that is not a revocation path.
-
-**Which invalidation API works.** As `kibana_system` (Kibana's internal user) on ES 9.7: invalidation **by
-name** works, including a trailing wildcard (`app:alert-digest@*`). Listing by name is refused (`GET
-/_security/api_key?name=…` → 403) and the metadata query returns only its own keys (total 0 while the admin
-sees 101), so "query by metadata, then invalidate by id as the internal user" is **not** available to it.
-Kibana's `invalidateAsInternalUser` only takes ids, so the operator command calls the ES invalidate API by
-name directly, authenticated as `kibana_system` (`KIBANA_SYSTEM_AUTH`, local default).
-
-**Regression after the re-review fixes (default `ui:security` run, three engines, 1,107 s):**
-**483 PASS, 0 FAIL**, 13 NOT_VERIFIED, 6 KNOWN_LEAK, 13 DIAGNOSTIC
-(`.local/ui_security-2026-11-05T14-58-36-936Z.json`; nothing carried forward from earlier runs). Per
-suite: K2 7, K3 14, K4 10, K5 10 + 1 DIAG, K6 2 + 2 DIAG, K1 (default mode) 1 PASS / 1 NV, covered by the
-bypass run (9/9, `.local/ui_security-2026-11-05T15-03-37-977Z.json`); T1 82; T3 87; T4 120 PASS / 11 NV /
-4 KL / 3 DIAG (same channel residuals as before); T5 56 PASS / 2 KL / 4 DIAG; T6 21 PASS / 3 DIAG; T7 18;
-T8 24; T9 browser 3 PASS / 1 NV; T10 11; T11 2; T12 12; T13 3. `seam --local-workerd`: exit 0, all
-assertions true except the three `NOT_ENFORCED_LOCALLY` CPU checks. `acceptance --local-workerd` (legacy
-mode, approval reset): verdict PASS, 34 of 37 true, the same three `NOT_ENFORCED_LOCALLY`. Jest 201/201
-(26 suites), `type_check` exit 0, ESLint clean on the changed files, prototype `lint` and `test` (53/53)
-clean.
-
-(After the first review fixes, `bc98cdb43b77`: 477 PASS, 1 FAIL, a T8 harness assertion;
-`.local/ui_security-2026-11-05T14-18-05-119Z.json`. Its K3 tamper rows and T10 handle scans were
-invalid, see above.)
-(Before the review fixes: 467 PASS, 0 FAIL, `.local/ui_security-2026-11-05T12-58-01-063Z.json`.)
-
-**Removed or replaced tests.** T2 (delegation matrix) → K2; T9 server (lease caps, budgets) and T14
-(cross-lease buckets, lease state) removed; Jest tests for leases, lease caps, buckets, in-flight caps,
-ingress pacing and the parent's lease expiry removed; T5 F2 now checks that after `history.back()`
-navigates the top page the frame and the handle are gone (no later execute call) instead of a revoked
-lease; T8's disable/stale steps tear the frame down on the next bridge call (the sample UI got a *Refresh
-summary* button) instead of on a poll, and the v2 consent prompt is checked after a page load.
-
-**Deviations and limits.**
-
-- Kept: the backend runner's 4-invocation process limiter and the one-`HostEs`-call-per-invocation budget
-  (M2 backend controls, not UI-cut budgets; `app_rate_limited` now only comes from the limiter); the
-  transport's "8 invalid calls terminate" misuse bound; the 5 s operation deadline.
-- Removed beyond the list: the transport ingress pacing (60/s; a rate limit, not a structural bound) and
-  the hit-index post-check of the old grant evaluator (an authorization check; ES enforces now). The
-  post-call state recheck is gone: one cached (≤ 2 s) state read per call, as specified.
-- Revocation runs only on disable/uninstall and on a new approval (spec: "disable or approval change"). An
-  unapproved drop-in release does not invalidate keys; its state is `not_approved`, so execute and minting
-  are refused by the per-call check.
-- Mint uses `refresh=false`; name-based invalidation may then miss a key minted less than one
-  `.security` refresh (~1 s) earlier. The approval generation, not ES invalidation, is what refuses its
-  handle; invalidation is cleanup and its failure is reported.
-- The handle is `<release>.<generation token>.<sealed>` with AAD `app|release|space|principal|generation` (spec plus the review fixes), not the Kibana
-  session id; release digest and generation are plaintext handle prefixes (authenticated through the AAD)
-  so that a release or generation change reads `app_stale` rather than `app_denied`.
-- Within the 2 s state cache an execute may still be accepted after a disable (refusals always use a
-  fresh read); a read authorized before a disable can finish within its 5 s deadline.
-- The direct native summary route (`GET /api/apps/{appId}/summary`, outside the bridge) still runs
-  `asCurrentUser` with the exact-index input schema.
-- "403 from ES" is shown as the bridge audit reason `native_denied` (raised only for an ES 401/403
-  response), the 403 entries in the outgoing `elasticsearch.query` log and the direct ES probe; the bridge
-  does not distinguish 401 from 403, and the redacted header does not show which credential a request
-  carried.
-- Expiry and re-mint are fake-clock/unit evidence, not a live one-hour expiry. The held-grant
-  interleavings are Jest evidence; the live race only hit mint-refused and completed-before-disable
-  orders.
-- Not verified: other auth providers (SAML/OIDC/PKI/Kerberos/UIAM; only basic/token sessions and basic auth
-  were used), multi-node, ES API-key cache invalidation timing across nodes, and Cloudflare.
-
-## Third-party UI cut (U1–U3) — local results
-
-**Synthetic data, local only.** Local ES snapshot 9.7.0, `node scripts/kibana --dev --no-base-path`
-(started with `KBN_HMR=false`), local `wrangler dev` 4.157.0. Node 24.22.1. Browsers: the Playwright
-browsers already installed for the worktree (Chromium 153.0.8010.12, Firefox 155.0, WebKit 26.6); no browser
-was downloaded. No Cloudflare account, deploy, secret write, push or PR. Run date: 2026-11-04/05.
-
-Spec: `kibana-apps-ui-cut-spec.md` §7 (T1–T14) plus the security sign-off conditions S1–S11 and, after the
-review fixes, the spec's "Implementation conformance review" (P1 1–3, P2 4–6) and the security review's
-follow-ups F1–F7. G1–G6 are production gates and are **not implemented**.
-
-### Verdict
+## Verdict
 
 | Question | Result |
 |---|---|
-| U1 stop gate (final-wire CSP composition, sandbox delivery and script loading through the public post-response hook, three engines) | **PASSED**: no Core or sandbox relaxation was needed |
-| Conformance review P1 1–3 (live-stub cap, lease expiry, late lease mount) | **Fixed**; each has a regression test that failed on the pre-fix code (logs below) |
-| Conformance review P2 4–6 | **Fixed** (masked PASS paths removed, SameSite=None HTTPS fixture built and run, second-app / boundary / service-spy tests added); remaining limits listed below |
-| T1–T14 local acceptance | Final full run: **466 PASS, 0 FAIL**, 12 NOT_VERIFIED, 6 KNOWN_LEAK, 10 DIAGNOSTIC; SameSite=None HTTPS fixture run: 98 PASS, 0 FAIL, 4 NOT_VERIFIED, 3 DIAGNOSTIC |
-| Backend acceptance (`seam`, `acceptance --local-workerd`) | **PASS** (CPU checks `NOT_ENFORCED_LOCALLY`, unchanged) |
-| Cloudflare remote run | **BLOCKED** (not run; still needs separate approval) |
-| Zero-egress / DNS / WebRTC / timing | **NOT VERIFIED** (no DNS/UDP observer); not a containment claim |
-| Production | **NOT EVALUATED** (G1–G6 open) |
+| Mini Discover (D1–D5), three engines | **PASS**: 34 PASS, 0 FAIL, 3 DIAGNOSTIC (`--suites discover`) |
+| Full `ui:security` (K, T and D suites), three engines | **PASS**: 517 PASS, 0 FAIL, 13 NOT_VERIFIED, 6 KNOWN_LEAK, 16 DIAGNOSTIC, 1141 s (`.local/ui_security-2026-11-05T20-17-01-000Z.json`) |
+| K1 with the dev-only input-schema bypass (Kibana restarted with `-c .local/kibana.app_host.k1.yml`) | **PASS** 9/9 (`.local/ui_security-2026-11-05T19-56-06-719Z.json`) |
+| Backend `seam` and `acceptance` (local workerd) | **PASS**: `seam` exit 0, 24 assertions true, the 3 CPU-loop checks `NOT_ENFORCED_LOCALLY`; `acceptance` exit 0, verdict PASS, 34 of 37 true, the 3 CPU checks `NOT_ENFORCED_LOCALLY`, no failures |
+| Jest, `type_check`, ESLint, prototype `lint` and `test` | **PASS**: Jest 209/209 (26 suites); `type_check --project …/app_host/tsconfig.json` exit 0; ESLint/oxlint clean on the changed TypeScript files; prototype `lint` (three `tsc` projects + Kibana lint of `prototype/`) clean; prototype `test` 53/53. No i18n strings were added |
+| Cloudflare remote run (CPU limits, latency) | **NOT RUN** (needs separate approval) |
+| Zero egress (DNS, WebRTC, timing) | **NOT VERIFIED** (no DNS/UDP observer); not a containment claim |
+| Production | **NOT EVALUATED** (production gates G1–G6 open) |
 
-### Milestones
+## Mini Discover (D1–D5)
 
-| Milestone | Commit | Gate run (all three engines unless noted) |
+The sample app's UI (`ui/src/discover.ts`) lists data views, reads one with its fields, and runs ES|QL
+(rows plus an hourly count chart), entirely through the bridge; every call runs server-side as the app
+session key. Release 2.x grants `kbn-apps-prototype-alerts` and `kbn-apps-demo-logs-*` with `read` and
+`view_index_metadata`, plus `feature_dashboard_v2.read` and `feature_indexPatterns.read` on
+`space:default`, empty `cluster` and `run_as`. Seed (`ui:seed`): `kbn-apps-demo-logs-a` and `-b` (240
+documents each over the last 24 h; the three newest in `-a` carry attacker-style messages),
+`kbn-apps-other-secret` (5 documents, outside the grant and the demo prefix; the viewer may read it
+directly), data views `kbn-apps-demo-logs` and `kbn-apps-other-secret`.
+
+Run: `ui:security --suites discover --engines chromium,firefox,webkit`, 47 s, **34 PASS, 0 FAIL, 3
+DIAGNOSTIC** (`.local/ui_security-2026-11-05T19-29-51-554Z.json`); the same suite inside the final full run:
+34 PASS, 0 FAIL, 3 DIAGNOSTIC.
+
+| Test | Result | Evidence |
 |---|---|---|
-| U1 shell (no data capability) | `47d278d100a4` | T1/T6: 121 PASS (incl. HTTP); T5 re-run after a harness fix: 21 PASS, 9 DIAGNOSTIC; Jest 144; seam + acceptance PASS |
-| U2 delegation + consent | `624e798dd00c` | T9, T2, T7, T11–T14, T1, T5, T6, T9 browser: 183 PASS, 0 FAIL, 1 NOT_VERIFIED, 12 DIAGNOSTIC; Jest 166; seam + acceptance PASS |
-| U3 adversarial + attribution | `7e2a2d2beeb6` | 270 PASS / 0 FAIL (superseded: the conformance review found masked PASS paths in T3/T4/T5) |
-| UI review fixes | "[App Host] UI review fixes" (this commit) | **final full run below**; Jest 195; seam + acceptance PASS |
+| D1 happy path | **PASS** (HTTP 7, browser 2 per engine) | Release flow: an approved release without the Discover scopes refuses `es.esql` (`scope_not_granted`); the Discover release, approved with the same tooling and no Kibana restart, makes the old handle `app_stale` (re-consent). As the key: `listDataViews` returns the demo view projected to exactly `{id, name, title, timeFieldName}`; `getDataView` returns exactly `{id, name, title, timeFieldName, fields}` with 9 fields (`log.level` = `{type: string, esTypes: [keyword], aggregatable: true, searchable: true}`; field caps run as the key); `FROM kbn-apps-demo-logs-* \| SORT @timestamp DESC \| LIMIT 50` returns 50 rows **identical to the same query run directly as the superuser**, including the three attacker strings verbatim; the hourly histogram returns 25 buckets identical to the superuser query, summing to 480. Bounds: a 4,096-byte query runs, 4,097 bytes → `bridge_invalid_request`; 501 rows → `app_unavailable`; `ENRICH` → `app_denied`, `native_denied` (ES: `cluster:monitor/xpack/enrich/esql/resolve_policy` unauthorized). Browser, each engine: picker filled, *Demo logs* selected, 9 fields listed, prefilled query, 50 rows and 25 bars (sum 480), the attacker strings present as table text with **0** `img`/`script`/`svg`/`iframe`/`object` elements and the top page untouched; an edited query via **Run** returns 10 rows; a 500-row result of ~900 KB crosses the bridge in one frame; a 1,000,000-byte result → `app_unavailable`; `FROM kbn-apps-other-secret` shows `esql: error app_denied`; the frame stays `bound`. |
+| D2 data view outside the grant | **PASS** (9) + 2 DIAGNOSTIC | Control: the viewer reads `kbn-apps-other-secret` directly in ES (5 rows). For the viewer **and** a superuser viewer: the secret data view is listed (saved-object privileges are per type); `FROM kbn-apps-other-secret` → `app_denied`, reason `native_rejected` (ES answers `400 verification_exception: Unknown index`, exactly as for a missing index); `FROM kbn-apps-demo-*,kbn-apps-other-secret` → `app_denied`, `native_denied` (ES 403 `indices:data/read/esql/search_shards` unauthorized for the API key); `FROM kbn-apps-* \| LIMIT 500` → 484 rows, exactly the superuser's count over the granted indices, with **no** `SECRET-ROW` value. DIAGNOSTIC: `getDataView` on the secret view returns its saved-object metadata with 0 fields (Kibana swallows the key's failed field caps), no secret data. |
+| D3 viewer ∩ app | **PASS** (4) + 1 DIAGNOSTIC | Viewer without index read: the key grants the pattern, ES refuses (`native_rejected`, `Unknown index`). Viewer without the data view feature (`app_host_ui_no_data_views`): `listDataViews` → an **empty list** (Kibana's saved-object find filters unauthorized types; it does not return 403), `getDataView` → `app_denied`, `native_rejected` (Kibana: `400 Unable to bulk_get index-pattern`), ES|QL still works. Release without `kibana.dataViews.read`: a superuser is refused `listDataViews`/`getDataView` (`scope_not_granted`), ES|QL still granted. Release without `kibana.dataViews.read` **and** `kibana.dashboard.read`: a key with that release's descriptor, granted from the superuser's password, has `applications: []`; Kibana's own Data Views API lists 0 views and refuses the read (400). **Finding** (DIAGNOSTIC): with `kibana.dashboard.read` kept, the same key lists 2 views and reads them (200): `feature_dashboard_v2.read` includes `index-pattern` read. |
+| D4 key confinement | **PASS** (7) | The K4 known-key method (a key with the exact manifest descriptor, granted as `kibana_system` from the viewer's password, sealed into a handle with the local handle key). `elasticsearch.query` debug had fresh entries for each path: `_has_privileges` (list), `200 … /_field_caps` (get), `200 … /_query` (ES\|QL), `403 … /_query` (refusal); every `/_query` entry's authorization is `[REDACTED]`. No bare secret, `id:secret` or base64/base64url credential in the responses or any new log output (`es_query_debug`, `kibana_debug`, `http_debug`, security audit, bridge audit, Kibana stdout, `wrangler.log`); an injected secret is caught (negative control). |
+| D5 revocation | **PASS** (1) | ES\|QL ok → `ui:operator`-equivalent disable (key invalidated by name, 0 errors) → next `esql` `app_disabled` → re-enable → the old handle `app_stale` → a new consent works. |
 
-### UI review fixes: what changed and what proves it
+Screenshots (one per engine, after selecting *Demo logs*): `.local/discover-chromium.png`,
+`.local/discover-firefox.png`, `.local/discover-webkit.png`.
 
-Paths are relative to `x-pack/platform/plugins/shared/app_host/`. "Failed on old code" means the test was
-run against the pre-fix implementation first; the outputs are kept in `.local/logs/regression-old-p1-*.log`
-(git-ignored). For P1 1 the pre-fix wiring was first moved, unchanged, from `FrameHost` into
-`public/ui_host/bridge_session.ts` so that the test exercises exactly what `FrameHost` runs.
+CLI release check (same tooling, no Kibana restart): `release --with-ui --version 2.0.0
+--approve-local-synthetic` → metadata 2.0.0 with all five scopes and both index entries; an ES|QL call
+on a fresh handle returns `[[480]]`; `release --with-ui --version 2.1.0 --approve-local-synthetic` →
+metadata 2.1.0; the 2.0.0 handle → `409 app_stale`. UI bundle 115,807 bytes (cap 512 KiB).
 
-| Item | Change (file:line) | Proving test | Failed on old code |
-|---|---|---|---|
-| **P1 1** live-stub cap on protocol-only traffic | `public/ui_host/port_transport.ts:81,98,103`: an `admit` check runs every time capnweb asks for the next frame (i.e. right after it processed the previous one) and after every send; breach → `live_stubs` termination. `public/ui_host/bridge_session.ts:52` supplies `imports + exports ≤ 128` | `public/ui_host/bridge_session.test.ts:69` (real `MessageChannel`, protocol-only `["push",0]`: exactly 128 live stays open, 129 terminates, no bridge method ever invoked), `:86` (guest-exported stub imports; unknown-method pipelines), `:102` positive control (100 retained pushes, then a normal call resolves) | Yes: `:69` and `:86` failed (no termination); `:102` passed |
-| **P1 2** expiry during a pending read | `server/ui/leases.ts:106` per-lease expiry timer (unref'd) revokes and aborts at TTL; `:97,:102` `isLive` / `isExpired`; `server/ui/bridge_service.ts:469,475` recheck expiry and liveness before and after the release recheck, before returning data → `app_expired`, no data | `server/ui/bridge_service.test.ts:214` (fake clock: start at `expiresAt−1 ms`, cross TTL, then resolve: `app_expired`, no data, and the handler's signal was aborted *at* expiry) | Yes: returned 200 with data |
-| **P1 2** idle frame teardown | `common/ui_protocol.ts` `CreateLeaseResponse.ttlMs`; `public/ui_host/lease_client.ts:37,48` parent deadline = request time + `ttlMs` (never later than the server's expiry); `public/ui_host/frame_host.ts:112` expiry timer → `end('expired')` | `public/components/app_ui_page.test.tsx:123` (idle bound frame removed, lease released, status `ended: expired`) | Yes: frame stayed |
-| **P1 3** late lease after Disable / unmount / release change | `public/components/app_ui_page.tsx:84,98,151–175`: a generation counter bumped by every teardown; after the lease request settles, a stale generation, a disconnected container, or changed/unapproved/disabled metadata releases the lease and returns without mounting | `public/components/app_ui_page.test.tsx:76` (Disable), `:87` (unmount), `:98` (release change), `:113` positive control | Yes: `:76`, `:87`, `:98` failed (frame mounted and/or lease never released); `:113` passed |
-| **P2 4** T3 masked PASS | `prototype/scripts/lib/ui_suites/u3_adversarial.ts:272` `runBridgeCorpus`: each named case runs alone (`run.bridgeCase`), its exact code is asserted, batches of ≤6 invalid calls (the auto-run already made 1) end with a live-session positive control and a zero-execute-request check; raw capnweb `stream` frames for `constructor`/`__proto__`/`toString`/`hasOwnProperty`/`valueOf` must be rejected stackless; the 8th invalid call must end the session with `repeated_invalid_calls`. `:187` inline handler needs an observed `script-src-attr` violation. `:223` local-only rejections produce no server failure records while permitted reads do | live, 3 engines: 29 PASS each | n/a (harness) |
-| **P2 4** T4 masked PASS | `prototype/ui/fixtures/channels.ts` one channel at a time with per-attempt markers, shared verbatim with an ordinary control page (`ui/fixtures/channel_control.ts`); `prototype/scripts/lib/ui_suites/t4_channels.ts:116` per channel: FAIL on any hit, PASS only with a working control **and** an observed block (attributed violation, thrown error or error event), otherwise NOT_VERIFIED (inert probe / unattributed block). Navigations (`:338`) need a violation or proof the original document still runs | live, 3 engines (table below) | n/a |
-| **P2 4** T5 masked PASS | `prototype/scripts/lib/ui_suites/t5_t6_browser.ts:237`: one fresh bound frame per click action, unique marker, the click must succeed and its handler must have run (`app-host-click:<id>` console line from the frame, `ui/fixtures/hostile.ts:422`), each outcome asserted separately | live, 3 engines: 6 click checks PASS each | n/a |
-| Other literal PASS rows | T8 "pending read/expiry" now **runs** the named Jest tests (`scripts/lib/ui_suites/context.ts:193` `jestEvidence`, `u3_adversarial.ts:566`); T10 "local-only rejections" moved to a real T3 check; T14 "no durable store" is now a query of ES indices and `.kibana*` saved-object types with a positive control (`u2_authority.ts:1088`) | 8 Jest PASS; T14 PASS | n/a |
-| **P2 5** SameSite=None HTTPS fixture | `prototype/scripts/local_kibana_config.ts` `--tls DIR` (server.ssl, `xpack.security.sameSiteCookies: None`, secure cookies, https publicBaseUrl); local self-signed cert in `.local/tls` (git-ignored); `prototype/scripts/lib/receiver.ts` TLS receivers; browser-side login (`scripts/lib/ui_harness.ts` `login({viaBrowser})`); `t4_channels.ts:461` `runT4Tls` | separate run (below) | n/a |
-| **P2 6** second-app binding, budgets, service spies | `server/ui/bridge_service.test.ts:655` (valid lease vs another installed app → `app_stale` before any I/O; a lease never revives), `:699` (different apps of one user: independent buckets), `:728` (100 / 101 operations, reason `lease_budget`), `:742` (exactly 16 KiB result / +1 byte), `:768` (deadline: not at 4,999 ms, aborted at 5,000 ms), `:793` (proxy recorders: ES client touched only by `search`, self client only by `fetch(GET /api/dashboards/{granted})`, nothing else). `public/ui_host/bridge_boundaries.test.ts`: frame 32,768/32,769 B (ASCII and multibyte), queue 256 KiB / +1 B, 1,024 / 1,025 frames, depth 10/11 argument levels (= message depth 12) → `depth_exceeded`, BigInt 64/65 → `bigint_too_large`, 100/101 ops, burst 10/11, 7/8 invalid calls. `public/ui_host/bridge_root.test.ts` depth test now requires `depth_exceeded` and no executor call. Live T9 global cap must be **exactly** 32 (`u2_authority.ts:540`); T12 idempotence requires the tool to report `idempotent` (`:842`). `server/ui/capability_registry.test.ts` (source regex) is kept as a static guard only | Jest; live T9/T12 PASS | n/a |
-| **F1** frame navigating its parent | `prototype/ui/fixtures/hostile.ts:310` six variants (`parent.location=`, `.href`, `.assign`, `.replace`, `parent.open(_self)`, `open(_parent)`); `t5_t6_browser.ts:343` one fresh frame each | 3 engines × 6 PASS: zero receiver hits, top URL and guardian unchanged (SecurityError, Firefox `InvalidAccessError` for `_parent`; Chromium/WebKit `open(_parent)` returns without navigating) | n/a |
-| **F2** history after top navigation | `t5_t6_browser.ts:108` `runHistory`: Kibana `/app/home` precedes the app page; the held lease works before `history.back()`; if the top page changed, the old lease must be refused | Firefox and WebKit: top navigated (**KNOWN_LEAK**, navigation) and the old lease → `app_denied` (PASS). Chromium: top unchanged (DIAGNOSTIC) | n/a |
-| **F3** asset hashing (optional, done) | `server/ui/asset_cache.ts` verified bytes cached by digest; re-hash only when the approved digest or the file's inode/size/mtime changes (tamper → re-verify → 404). No rate limit added | `server/ui/asset_cache.test.ts` (1,000 GETs → 1 hash; digest change and tamper re-verify and refuse) | n/a |
-| **F4** pinned self-client options | — | `server/ui/bridge_service.test.ts:862` exact options object (`target`, `method`, `access:'public'`, `version`, `timeout`, `asResponse`, `rawResponse`; no `prependBasePath`/`forwardRequestHeaders`/headers) | n/a (code unchanged) |
-| **F5** realm-aware approval identity | `prototype/scripts/lib/approval.ts:110,159` username **and** authentication realm (type + name) must match | `prototype/test/approval_test.ts` (4 cross-realm cases + missing realm → `mixed_identities`, nothing written; same-realm positive control); live T12 (`u2_authority.ts:772`): admin via ES basic vs the same admin via a short-lived Kibana API key (realm `_es_api_key`) → `mixed_identities` | Yes: the cross-realm test failed against the old `approval.ts` |
-| **F6** preconnect attribution | `hostile.ts:189` preconnect alone, to a receiver port (5697) that no other code references; `t4_channels.ts:292` ordinary-page control, idle window, then the probe | WebKit: 1 socket after the probe, 0 in the idle window → **KNOWN_LEAK**, now exactly attributed. Chromium/Firefox: 0 (and 0 in their controls) → NOT_VERIFIED | n/a |
-| **F6** top-window `message` listener | `t5_t6_browser.ts:405` records the registration stack and source of each top-window listener | Identified (see residuals) | n/a |
-| **F7** native summary (optional, done) | `server/routes/register_routes.ts`: default space only (404 elsewhere, before any app invocation); one `app_host.bridge` record per call, `event.provider: native`, app attribution from the approved release (none in legacy mode). `server/ui/audit.ts` adds `event.provider` to every record | `server/routes/register_routes.test.ts`; live T14 (`u2_authority.ts:1038`): `/s/app-host-empty/...` → 404 with no dispatcher connection, default space → 200 with one | n/a |
-| **New finding, fixed**: stacks sent to the guest in Firefox | `public/ui_host/bridge_root.ts` `bridgeError` shadows `stack` with an own empty value. `delete error.stack` does not remove Firefox's inherited accessor, and capnweb serializes any truthy `stack`, so every rejection the app received in Firefox carried a stack with Kibana bundle URLs (found by the new T3 raw-frame check) | `public/ui_host/bridge_root.test.ts` (inherited `stack` accessor emulated) and live T3 raw frames in Firefox | Yes: the unit test failed against the old `bridge_root.ts` |
+Limits of this cut:
 
-### Final full run (`npm run ui:security -- --kibana http://localhost:5601 --engines chromium,firefox,webkit`)
+- One result per frame, no streaming. Data views and ES|QL results are capped at 960 KiB (JSON) and 500
+  rows; over the cap the call fails (`app_unavailable`), it is never truncated.
+- No command allowlist: Kibana bounds the query size only. `ENRICH` and inference were not re-tested
+  beyond the `ENRICH` refusal above (empty `cluster`).
+- A data view outside the grant is listed and its metadata (title, time field) is readable; only data is
+  refused. Kibana privileges are per saved-object type and space.
+- Native refusals carry two audit reasons: `native_denied` (401/403/404) and `native_rejected` (400:
+  ES|QL `Unknown index` or a query ES rejects; Data Views `Unable to bulk_get`). The public code is
+  `app_denied` for both. ES|QL syntax errors therefore also read `app_denied`.
+- Not verified: other spaces (the cut is default-space only), runtime fields from data views, large
+  data view field lists near the cap, `LOOKUP JOIN` and `PROMQL` index resolution.
 
-All 15 default suites, 977 s: **466 PASS, 0 FAIL, 12 NOT_VERIFIED, 6 KNOWN_LEAK, 10 DIAGNOSTIC**
-(report: `.local/ui_security-final.json`, git-ignored).
+## App session key (K1–K6)
+
+Consent mints one restricted API key (`grantAsInternalUser`, role descriptor from the approved manifest
+only, 1 h, `refresh=false`); the parent holds only an AES-256-GCM handle; every bridge operation (ES
+search, ES|QL, Dashboard and Data Views reads via `selfClient`, `app.summary` → Worker → `HostEs`) runs
+as that key. ES needs nothing extra (`xpack.security.authc.api_key.enabled` is on by default).
+
+| Check | Result | Evidence |
+|---|---|---|
+| K1 ES enforces, not Kibana | **PASS** (9/9 with the bypass; the default-config run checks that the bypass is off: 1 PASS, 1 NOT_VERIFIED) | With the input schema bypassed: superuser viewer → `.security`, `.security-7`, `.kibana` each `app_denied` with audit reason `native_denied` (raised only for an Elasticsearch 401/403; the schema's refusal is `resource_not_granted`); `kbn-apps-prototype-viewer-only` (direct ES read as the viewer: 200) → `native_denied` for the viewer and for a superuser; `kbn-apps-prototype-*` → denied, or only granted-index records; the granted index returns its records. The superuser key's descriptor is `indices: [{names: [kbn-apps-prototype-alerts, kbn-apps-demo-logs-*], privileges: [read, view_index_metadata], allow_restricted_indices: false}]`, `cluster: []`, `run_as: []`. Without the bypass, Kibana's schema refuses `.security` first; outside `--dev` the setting fails config validation (Jest). |
+| K2 viewer ∩ app | **PASS** (7) | No-index viewer: ES denies although the key grants the index (also on the Worker path); no-dashboard viewer: Kibana's feature authz denies; release without `kibana.dashboard.read`: superuser denied and the key has no Dashboard privilege. The stored descriptor equals the manifest-derived one, and `limited_by` holds exactly the viewer's roles with the same privileges as `GET /_security/role`. |
+| K3 handle integrity | **PASS** (HTTP 8, browser 1 per engine, Jest 3) | Tampered ciphertext, GCM tag, release digest and generation (each a well-formed, canonical token differing only in that field) → `app_denied`, audit `bad_handle`, before any key-scoped request; another user's handle with their own basic auth and own cookie, another space → `app_denied`; no credentials → 401; expired → `app_expired` and a single re-mint inside the consented page (Jest, fake clock). |
+| K4 key confinement | **PASS** (10) | Known key through the real clients and loggers (es.search, Dashboard read, Worker-path `app.summary`, a native 403), with fresh `elasticsearch.query` entries and `[REDACTED]` authorization; no secret encoding in responses or logs; negative controls FAIL/NOT_VERIFIED as designed (also node:test `leak_scan_test.ts`). Kibana-minted keys in three engines: no key encoding in responses, window/port messages, frame DOM or logs; the handle appears only in the session response. |
+| K5 revocation | **PASS** (10) + 1 DIAGNOSTIC | Disable (keys invalidated by name, next call `app_disabled`, re-enable → `app_stale`); mint → immediate disable → enable (name invalidation can miss the unrefreshed key; the handle is dead anyway); partial invalidation (HTTP 200, `error_count: 1`) reported and recoverable; operator CLI HTTP failure exits 1; a 6-run mint/disable race (only current-generation handles work); a release change (`app_stale`, old-release keys invalidated); reset + re-approval of the same release with a frozen and a backward operator clock (old handle `app_stale`, new handle works). |
+| K6 cost | **PASS** (2) + 2 DIAGNOSTIC | 30 calls on one handle → exactly 1 new key. Mint latency through `POST /internal/app_host/ui/session`: p50 12 ms, p95 18 ms (20 mints); a direct ES grant as `kibana_system` takes p50 11 ms with `refresh=false` and p50 1,002 ms with the default refresh. |
+
+Invalidation as `kibana_system` on ES 9.7: by **name** works, including a trailing wildcard
+(`app:alert-digest@*`); listing by name is refused (403) and a metadata query returns only its own keys,
+so query-then-invalidate-by-id is not available to it.
+
+Limits:
+
+- Kept from the backend: the 4-invocation process limiter and the one-`HostEs`-call budget per Worker
+  invocation (`app_rate_limited` comes only from the limiter); the transport's 8-invalid-calls bound;
+  the 5 s deadline. There are no UI-path rate limits or budgets.
+- Within the 2 s state cache an execute may still be accepted after a disable (refusals always use a
+  fresh read); a read authorized before a disable can finish within its deadline.
+- Name invalidation can miss a key minted less than one `.security` refresh (~1 s) earlier; the
+  approval generation makes its handle useless. Restoring the exact approved release while the app
+  stays enabled revives unexpired handles for it (not a revocation path).
+- The bridge does not distinguish an ES 401 from a 403, and the redacted header does not show which
+  credential a request carried.
+- Expiry and re-mint are fake-clock evidence; held-grant interleavings are Jest evidence.
+- The native `GET /api/apps/{appId}/summary` still runs `asCurrentUser` with the exact-index input schema.
+- Not verified: auth providers other than basic/token (SAML, OIDC, PKI, Kerberos, UIAM), multi-node,
+  cross-node API-key cache invalidation timing.
+
+## Third-party UI shell and adversarial suites (T1–T14)
+
+Results of the final full run (`--engines chromium,firefox,webkit`, all default suites). The first table
+counts every suite (K, D and T); the second lists the T-suites:
 
 | Engine | PASS | FAIL | NOT_VERIFIED | KNOWN_LEAK | DIAGNOSTIC |
 |---|---|---|---|---|---|
-| HTTP (Node, curl-equivalent) | 90 | 0 | 0 | 0 | 0 |
-| Jest (executed by the harness) | 8 | 0 | 0 | 0 | 0 |
+| HTTP (Node) | 136 | 0 | 1 | 0 | 6 |
+| Jest (run by the harness) | 11 | 0 | 0 | 0 | 0 |
 | Chromium | 123 | 0 | 3 | 1 | 4 |
 | Firefox | 122 | 0 | 5 | 2 | 3 |
 | WebKit | 123 | 0 | 3 | 3 | 3 |
-| all engines (one row) | 0 | 0 | 1 | 0 | 0 |
+| all engines (one row) | 2 | 0 | 1 | 0 | 0 |
 
-| Test | HTTP / Jest | Chromium | Firefox | WebKit | Notes |
+| Test | HTTP / Jest | Chromium | Firefox | WebKit | all engines |
 |---|---|---|---|---|---|
-| T1 shell, direct-open, headers | 31 PASS | 17 PASS | 17 PASS | 17 PASS | unchanged from U3 |
-| T2 real scoped delegation | 8 PASS | 2 PASS | 2 PASS | 2 PASS | |
-| T3 XSS + compromised UI | — | 29 PASS | 29 PASS | 29 PASS | each abuse case asserted individually; raw prototype-name frames; 8th invalid call terminates |
-| T4 egress channels | — | 41 PASS, 3 NV, 1 KL, 1 DIAG | 39 PASS, 5 NV, 1 KL, 1 DIAG | 40 PASS, 3 NV, 2 KL, 1 DIAG | per-channel controls and observations (below) |
-| T5 chrome, top nav, popups | — | 19 PASS, 2 DIAG | 20 PASS, 1 KL, 1 DIAG | 20 PASS, 1 KL, 1 DIAG | per-action clicks, F1, F2 |
-| T6 bootstrap spoof/replay, S4 flood | — | 7 PASS, 1 DIAG | 7 PASS, 1 DIAG | 7 PASS, 1 DIAG | DIAG = Kibana's own top listener (identified) |
-| T7 bypass / cross-app / CSRF | 18 PASS | — | — | — | |
-| T8 revoke / update / v2 | 8 Jest PASS | 6 PASS | 6 PASS | 6 PASS | Jest rows are executed by the harness |
-| T9 parser / DoS | 4 PASS | 1 PASS | 1 PASS | 1 PASS | global lease cap exactly 32; CPU loop NOT_VERIFIED (all) |
-| T10 attribution | 7 PASS | 1 PASS | 1 PASS | 1 PASS | |
-| T11 never-delegable corpus | 2 PASS | — | — | — | plus Jest behavioural service spies |
-| T12 installer / approval / scope map | 12 PASS | — | — | — | incl. F5 cross-realm |
-| T13 uniform errors / oracles | 3 PASS | — | — | — | |
-| T14 state / space / buckets | 5 PASS | — | — | — | incl. F7 and the store query |
+| T1 shell, direct-open, headers | 31 PASS | 17 PASS | 17 PASS | 17 PASS | — |
+| T3 XSS + compromised UI | — | 29 PASS | 29 PASS | 29 PASS | — |
+| T4 egress channels | — | 41 PASS, 3 NV, 1 KL, 1 DIAG | 39 PASS, 5 NV, 1 KL, 1 DIAG | 40 PASS, 3 NV, 2 KL, 1 DIAG | — |
+| T5 chrome, top nav, popups, history | — | 18 PASS, 2 DIAG | 19 PASS, 1 KL, 1 DIAG | 19 PASS, 1 KL, 1 DIAG | — |
+| T6 bootstrap spoof/replay, S4 flood | — | 7 PASS, 1 DIAG | 7 PASS, 1 DIAG | 7 PASS, 1 DIAG | — |
+| T7 bypass / cross-app / CSRF | 18 PASS | — | — | — | — |
+| T8 revoke / update / new release | 6 PASS | 6 PASS | 6 PASS | 6 PASS | — |
+| T9 parser / frame bounds | — | 1 PASS | 1 PASS | 1 PASS | 1 NV |
+| T10 attribution, handle scans | 8 PASS | 1 PASS | 1 PASS | 1 PASS | — |
+| T11 never-delegable corpus | 2 PASS | — | — | — | — |
+| T12 installer / approval / scope map | 12 PASS | — | — | — | — |
+| T13 uniform errors / oracles | 3 PASS | — | — | — | — |
 
-T4 per channel (resource channels from the hostile frame; each with an ordinary-page control in the same
-engine): fetch, fetch no-cors, XHR, WebSocket, beacon, SSE, image, CSS `@import`, CSS background, font,
-video, audio, `<object>`, `<embed>`, nested frame, prefetch, stylesheet, worker, shared worker, dynamic
-import and script are PASS in every engine except: Firefox CSS `@import` and WebKit prefetch, whose
-**controls issued no request** (inert probe, NOT_VERIFIED). Credentialed requests to Kibana (fetch, fetch
-no-cors, XHR, beacon, image, script, stylesheet, CSS background, nested frame) never reached Kibana's
-access log in any engine (27 PASS). All seven navigations are PASS in every engine except Firefox
-`<a ping>` (no request, but Firefox fired no violation for it: NOT_VERIFIED). The opaque-frame cookie
-control (DIAGNOSTIC) showed 401 (no session cookie) under the ordinary cookie configuration in all engines.
+T4 per channel (from the hostile frame, each with an ordinary-page control in the same engine): fetch,
+fetch no-cors, XHR, WebSocket, beacon, SSE, image, CSS `@import`, CSS background, font, video, audio,
+`<object>`, `<embed>`, nested frame, prefetch, stylesheet, worker, shared worker, dynamic import and script
+are blocked in every engine, except Firefox CSS `@import` and WebKit prefetch, whose controls issued no
+request (NOT_VERIFIED). Credentialed requests to Kibana never reached its access log. All seven
+navigations are blocked, except Firefox `<a ping>` (no request, no violation: NOT_VERIFIED).
 
-### SameSite=None HTTPS cookie fixture (`--suites t4tls`, Kibana restarted over local TLS)
-
-Kibana was restarted once with `.local/kibana.app_host.tls.yml` (self-signed `localhost`/`127.0.0.1`
-certificate under the git-ignored `.local/tls`, `xpack.security.sameSiteCookies: None`, secure cookies,
-`server.publicBaseUrl: https://localhost:5601`), receivers on TLS too, then restored to the HTTP config for
-the final full run. 180 s: **98 PASS, 0 FAIL, 4 NOT_VERIFIED, 3 DIAGNOSTIC** (`.local/ui_security-tls-final.json`).
-
-| Check | Chromium | Firefox | WebKit |
-|---|---|---|---|
-| Session cookie is `SameSite=None; Secure` over HTTPS | PASS | PASS | PASS |
-| Cookie-present control: an opaque (sandboxed) frame **inside the Kibana page** without the app policy sends the session (403/404, not 401) | **NOT_VERIFIED**: 401, the engine did not attach the cookie | **NOT_VERIFIED**: 401 | **PASS**: 403 (session sent) |
-| Frame's 9 credentialed channels to Kibana never sent | 9 PASS | 9 PASS | 9 PASS |
-| Resource channels / Referer (as in T4) | 22 PASS | 21 PASS, 1 NV | 22 PASS, 1 NV |
-
-So the cookie-present condition that A17 is about was reproduced in WebKit, where the app frame's
-credentialed requests were still never sent. Chromium and Firefox did not attach the `SameSite=None`
-cookie to an opaque frame's request even without the app policy (third-party cookie restrictions), so in
-those two engines the fixture shows the requests are blocked but cannot show the cookie-present case:
-reported NOT_VERIFIED, not PASS.
-
-### Remaining limits of the review fixes
-
-- T1's header helper still requires exactly two CSP policies (`t1_shell.ts:44`); the review suggested
-  replacing the count with preservation/intersection assertions. Not changed in this round.
-- F3 caches hashing only; `consent.json` and the manifest are still read per asset request and the
-  unauthenticated route has no rate limit.
-- F7 records the native call without an app actor in legacy (no approval file) mode, because there is no
-  approved release to attribute; `event.provider: native` is present either way. No Origin/fetch-metadata
-  check was added to the native GET route.
-- Dashboard audit correlation remains coarse (user + object + time), as before.
+SameSite=None HTTPS fixture (`--suites t4tls`, Kibana over local TLS): last run 2026-11-05 on the UI
+cut (98 PASS, 0 FAIL, 4 NOT_VERIFIED, 3 DIAGNOSTIC; `.local/ui_security-tls-final.json`); not rerun for
+the Mini Discover change, which does not touch cookies or CSP. In WebKit an opaque frame inside the Kibana
+page sends the `SameSite=None` session cookie, and the app frame's credentialed channels were still never
+sent; Chromium and Firefox did not attach the cookie to an opaque frame at all (cookie-present case
+NOT_VERIFIED there).
 
 ### Conditions S1–S11
 
 | # | Status | Evidence |
 |---|---|---|
-| S1 | **Met** | Composed from `http.csp.header` (never the response); T1 403 guardian/frame and T7 400/403/404/413 carry the composed policy, empty report-only and JSON sandbox policy; Jest covers 400/403/404/500 with an empty Boom header set |
-| S2 | **Met** | Post-Core `Referrer-Policy`, `Permissions-Policy`, `X-DNS-Prefetch-Control: off`, `Cache-Control: no-store`, `nosniff` on every app surface; `/app/home` and `/api/status` keep Core's values (T1) |
+| S1 | **Met** | Composed from `http.csp.header` (never the response); 4xx/5xx carry the composed policy, empty report-only and JSON sandbox policy (T1, T7, Jest) |
+| S2 | **Met** | Post-Core `Referrer-Policy`, `Permissions-Policy`, `X-DNS-Prefetch-Control: off`, `Cache-Control: no-store`, `nosniff` on every app surface; other routes keep Core's values (T1) |
 | S3 | **Met** | Attribute snapshots of both iframes (T1, three engines) |
-| S4 | **Met** | Source/origin checked before `data`; two handshake messages, then listeners removed; control port for lifecycle; 1,000 × 1 MiB flood ran no guardian handler and caused no rebind (T6); `messageerror` terminates (Jest); the 128 live-stub cap now also covers protocol-only growth (P1 1) |
-| S5 | **Met (Jest), live redirect fixture not run** | `asResponse`+`rawResponse`, default `prependBasePath`, final URL must equal the initial path, status 200, 256 KiB cap before parsing, `body.id === grantedId`; Jest: alias match → `app_denied`, followed redirect / redirect error / oversized body (declared and streamed) → `app_unavailable`. No live `server.selfHttp.maxRedirects: 1` restart with a redirecting fixture |
-| S6 | **Met** | Assets under `/api/app_host/ui_assets/`, 404 for unknown/unapproved/tampered; top-level bad-digest navigation keeps the session (T1); tamper (T8) |
-| S7 | **Met** | appId, approved release digest, no query string, before any HTML; markup canary not reflected (T1) |
-| S8 | **Met** | Schema literal + evaluator assertion for the Worker and UI paths; other concrete indices rejected at parse even when approved (Jest, T12); T11 index corpus |
+| S4 | **Met** | Source/origin checked before `data`; two handshake messages, then listeners removed; a 1,000 × 1 MiB flood ran no guardian handler and caused no rebind (T6); `messageerror` terminates (Jest); the 128 live-stub cap covers protocol-only growth (Jest) |
+| S5 | **Met (Jest)**, live redirect fixture not run | Dashboard and Data Views self calls: final URL must equal the requested path, status 200, body cap before parsing, returned id must equal the requested id |
+| S6 | **Met** | Assets under `/api/app_host/ui_assets/`, 404 for unknown/unapproved/tampered (T1, T8) |
+| S7 | **Met** | appId and approved release digest checked, no query string, before any HTML (T1) |
+| S8 | **Met** | Grantable indices are synthetic only: the backend literal plus `kbn-apps-demo-` names or trailing-wildcard patterns, enforced at parse (Jest, T12); `es.search` keeps its exact-literal input check (T11); everything else is enforced by ES through the key (K1, D2) |
 | S9 | **Met** | Worker-path `HostEs` callbacks recorded with the wrapper correlation id (T10, Jest) |
-| S10 | **Met** | Title canary literal in chrome (T3); no v1 frame while the v2 prompt is visible (T8) |
-| S11 | **Met** | Secret in JSON body, stored as SHA-256, constant-time compare; absent from logs with response debug logging on and from window/port messages (T10); exactly 4 per principal and exactly 32 global accepted, the next refused (T9); non-empty egress rejected (Jest, T12) |
+| S10 | **Met** | Title canary literal in chrome (T3); no old frame while a new release's prompt is visible (T8) |
+| S11 | **Met** | Handle in the JSON body only; absent from logs, window/port messages and frames (K4, T10); non-empty egress rejected (Jest, T12) |
 
-
-### Deviations from the spec (with reasons)
-
-- **Asset path**: `/api/app_host/ui_assets/{file}` instead of `/plugins/appHost/ui_assets/{uiDigest}.js` (the S6
-  option: `/api/` paths are never re-rendered by the security plugin). The two host scripts have fixed names
-  (`host-guardian.js`, `host-child.js`) and are served from constants in the plugin.
-- **Lease secret** travels in the execute JSON body, not an `x-app-host-lease` header (S11).
-- **Ingress pacing**: frames above 60/s (burst 16) wait in the bounded queue instead of terminating the session;
-  queue overflow (256 KiB or 1,024 frames), non-string frames, >32 KiB frames, `messageerror`, >128 live
-  capnweb imports + exports (checked at the protocol receive/send boundary) and 8 invalid calls still terminate. capnweb sends about three frames per call, so termination broke
-  ordinary sequential use.
-- **Theme** is not pushed at bootstrap; the UI reads it with `getTheme()`.
-- **`app_expired` is HTTP 403**, not 401: Kibana's browser client treats any 401 as an expired Kibana session.
-- **consent.json carries no index list** (the spec fixes its keys). S8's "consent naming another index" case is
-  covered by the grant fingerprint (which includes the indices) and the manifest parse, which rejects any other
-  index even when approved.
-- **Native summary semantics**: once an approval file exists only the enabled, approved UI release runs; without
-  one only legacy backend-only manifests run. `acceptance` therefore needs `ui:operator -- reset` first.
-- **S5 live redirect fixture** (`server.selfHttp.maxRedirects: 1` restart plus a redirecting route) was not run;
-  the redirect/alias/oversize paths are covered by Jest with a fake self client.
-- **Not built / not run**: the infinite-UI-loop diagnostic and DNS/STUN observers (`NOT_VERIFIED`). The
-  SameSite=None HTTPS fixture is built and run (separate `t4tls` run above, Kibana restarted once over local
-  TLS); its cookie-present condition is reproduced in WebKit only.
-- **Lease response** carries `ttlMs` in addition to `expiresAt`, so the parent derives its teardown deadline
-  from its own clock.
-- **T5 history** now starts from a Kibana page (`/app/home`) before the app page, so `history.back()` has a
-  real previous entry; with that, Firefox navigates the top page as well as WebKit.
-- **Dashboard correlation** with Kibana's own security audit is by user + dashboard id in the URL + time (the
-  native record is an `http_request` event); there is no shared request id.
-- **Origin**: Kibana must be used through the configured `server.publicBaseUrl` origin (here
-  `http://localhost:5601`); another origin fails the guardian's parent-origin check and the lease `Origin`
-  check (fail closed).
-- **Dev mode**: Kibana runs with `KBN_HMR=false`; with HMR the rspack watcher reloads open pages whenever files
-  under `prototype/.local` change.
-- No paths outside `x-pack/platform/plugins/shared/app_host/` were changed.
-
-### Final-wire headers (curl-equivalent, synthetic viewer, `Sec-Fetch-Dest: iframe`)
+### Final-wire headers (synthetic viewer, `Sec-Fetch-Dest: iframe`)
 
 Guardian (`/api/app_host/ui/alert-digest/<releaseDigest>/guardian`, 200):
 
@@ -383,215 +190,70 @@ content-security-policy: <Core policy without reporting>, sandbox; default-src '
 content-security-policy-report-only: (empty)
 ```
 
-Guardian without iframe fetch metadata (403 JSON, Boom path, S1): `content-security-policy: <Core policy without
-reporting>, sandbox; default-src 'none'; frame-ancestors 'none'`, empty report-only, `referrer-policy:
-no-referrer`, the deny-all `permissions-policy`, `x-dns-prefetch-control: off`, `cache-control: private, no-cache,
-no-store, must-revalidate` (Kibana's error value; contains `no-store`).
+Other Kibana routes (for example `/app/home`) keep Core's headers unchanged, including `report-uri`
+and `report-sample` (here pointing at the harness's synthetic local collector).
 
-Control, a normal Kibana route (`/app/home`, 200) — unchanged Core headers:
+### Observed leaks and residuals
 
-```
-content-security-policy: script-src 'report-sample' 'self'; worker-src 'report-sample' 'self' blob:; style-src 'report-sample' 'self' 'unsafe-inline'; object-src 'report-sample' 'none'; form-action 'report-sample' 'self'; frame-src 'report-sample' 'self' kibana.estccdn.com play.vidyard.com videos.elastic.co ela.st; frame-ancestors 'self'; report-uri http://127.0.0.1:5699/csp-report
-content-security-policy-report-only: default-src 'report-sample' 'none'; font-src 'report-sample' 'self'; img-src 'report-sample' 'self' data: tiles.maps.elastic.co; connect-src 'report-sample' 'self' telemetry.elastic.co …; report-uri http://127.0.0.1:5699/csp-report
-referrer-policy: strict-origin-when-cross-origin
-permissions-policy: camera=(), display-capture=(), fullscreen=(self "https://play.vidyard.com"), geolocation=(self), microphone=(), web-share=()
-(no x-dns-prefetch-control)
-```
+- **WebKit preconnect (KNOWN_LEAK)**: `<link rel=preconnect>` to a receiver port nothing else references
+  opens a TCP connection (0 in the idle window before); no HTTP request follows. A timing/existence
+  channel; a hostname could carry data. Chromium and Firefox opened none, but neither did their controls
+  (NOT_VERIFIED).
+- **Exact frame path + query (KNOWN_LEAK, accepted residual)**: CSP path matching ignores the query, so
+  the child can navigate itself to `<frame URL>?<data>`. The request reaches Kibana and its logs; S7
+  answers 404 and the guardian revokes on the reload. All engines.
+- **Joint session history (KNOWN_LEAK)**: `history.back()` from the frame navigates the top page in
+  Firefox and WebKit (Chromium keeps it); the old handle is refused afterwards.
+- **DNS prefetch, WebRTC/STUN, timing: NOT_VERIFIED** (no DNS or UDP observer).
+- **WebKit `load` on fragment navigation**: a same-document `#fragment` navigation fires the iframe's
+  `load` event in WebKit, which the guardian treats as a reload and revokes (fail closed); hash-routing
+  apps would be revoked in WebKit.
+- **Structured clone before validation**: the browser clones each port message before the bounded
+  transport sees it (up to 1 MiB per frame now).
+- **Monaco's top-window `message` listener** (monaco-editor 0.56.0 `setTimeout0`, in
+  `kbn-ui-shared-deps-src`) does not check `event.source`: a frame can post `{vscodeScheduleAsyncWork:
+  n}` to run an already-queued Monaco callback early. Scheduling interference, not data access; the fix
+  belongs in `@kbn/monaco` or upstream.
+- **Tab DoS / CPU**: an iframe is not a CPU quota (no infinite-loop diagnostic run).
+- Already-delivered data cannot be recalled; a compromised UI holds the app's grant (T3 shows successful
+  reads).
 
-`report-uri` points at the harness's synthetic local collector (configured for this run only).
+### Deviations from the UI-cut spec
 
-### Observed leaks, residuals and unverified channels (reported, not hidden)
+- Assets live under `/api/app_host/ui_assets/{file}` (`/api/` paths are never re-rendered by the security
+  plugin); the two host scripts have fixed names.
+- The theme is not pushed at bootstrap; the UI reads it with `getTheme()`.
+- `app_expired` is HTTP 403, not 401 (Kibana's browser client treats any 401 as an expired Kibana session).
+- `consent.json` carries no index list; the grant fingerprint covers the indices.
+- Once an approval file exists the native summary route runs only the enabled, approved UI release;
+  `acceptance` therefore needs `ui:operator -- reset` first.
+- Kibana must be used through the configured `server.publicBaseUrl` origin (fail closed otherwise), and
+  dev mode needs `KBN_HMR=false` for long browser runs.
+- The S5 live redirect fixture is not built; redirects, alias matches and oversized bodies are Jest-only.
 
-- **WebKit preconnect (`KNOWN_LEAK`, F6: now exactly attributed)**: `<link rel=preconnect>` is inserted on
-  its own, pointing at a receiver port (5697) that nothing else references. WebKit opened 1 TCP connection
-  after the probe and 0 in the preceding idle window (its ordinary-page control also opened 1); no HTTP
-  request followed. CSP did not stop the socket: a timing/existence channel, and a hostname could carry data.
-  Chromium and Firefox opened none, but their ordinary-page controls opened none either, so that absence is
-  `NOT_VERIFIED`, not a block.
-- **Exact frame path + query (`KNOWN_LEAK`, accepted residual in the sign-off)**: CSP path matching ignores the
-  query string, so the child may navigate itself to `<exact frame URL>?<data>`. The request reaches Kibana (and
-  its logs); S7 answers 404 JSON (no document) and the guardian revokes on the reload. All three engines.
-- **DNS prefetch, WebRTC/STUN: `NOT_VERIFIED`**. ICE gathering produced candidates (2/4/1 host candidates in
-  Chromium/Firefox/WebKit) toward `stun:127.0.0.1:3478`; no UDP or DNS observer was provisioned, so packet
-  absence is not claimed. Zero Playwright HTTP requests are not treated as proof.
-- **Joint session history (`KNOWN_LEAK`, navigation; F2)**: with a Kibana page before the app page in the
-  tab's history, `history.back()` from the frame navigated the **top** page in Firefox and WebKit (Chromium
-  kept it: DIAGNOSTIC). The app cannot choose the URL, only traverse existing entries. In both engines the
-  lease the old page held was refused afterwards (`app_denied`; PASS), after working just before.
-- **WebKit iframe `load` on fragment navigation (diagnostic)**: a same-document `#fragment` navigation in the
-  child fires the iframe element's `load` event in WebKit, which the guardian treats as a reload and revokes
-  (fail closed). Hash-routing apps would be revoked in WebKit. Some blocked click actions (download / `_top`
-  link / form) also end in a child reload in WebKit; no popup, download, top navigation or form submission
-  happened in any engine.
-- **Structured clone before validation**: the browser clones every incoming port message before the bounded
-  transport sees it; the S4 flood (1,000 × 1 MiB to the guardian and to top) never ran a guardian handler after
-  the handshake, but Kibana's own single top-window `message` listener ran 1,001 times (diagnostic).
-- **That top-window listener (F6, identified)**: monaco-editor 0.56.0 `esm/vs/base/common/platform.js`,
-  `setTimeout0` (bundled into `kbn-ui-shared-deps-src`; registration stack and source recorded in T6 in all
-  three engines). Its handler is
-  `e => { if (e.data && e.data.vscodeScheduleAsyncWork) { /* find pending id, splice, run its callback */ } }`.
-  It ignores every message without a `vscodeScheduleAsyncWork` property that equals one of its own pending
-  ids, so the flood's strings did nothing. It does **not** check `event.source` or origin: any frame,
-  including an app frame, can post `{vscodeScheduleAsyncWork: n}` to `top` and, if `n` is a pending id, make
-  Monaco run its own already-queued callback early (and the real message later finds nothing). That is
-  scheduling interference with Kibana-owned code, not data access or attacker-chosen code. It is outside
-  App Host; the fix belongs upstream or in `@kbn/monaco` (check `e.source === window`).
-- **Firefox stack traces to the guest (found and fixed in this round)**: before the fix every bridge
-  rejection received by app code in Firefox carried a stack with Kibana bundle URLs (see the table above).
-- **Tab DoS / CPU**: an iframe is not a CPU quota; no infinite-loop diagnostic was run (`NOT_VERIFIED`).
-- **SameSite=None HTTPS fixture**: built and run. In WebKit an opaque frame inside the Kibana page sends the
-  `SameSite=None` session cookie, and the app frame's credentialed channels to Kibana were still never sent
-  (PASS). Chromium and Firefox did not attach the cookie to an opaque frame's request even without the app
-  policy, so the cookie-present case is `NOT_VERIFIED` there (their frame requests were blocked as well).
-- **Inert or unattributed probes (`NOT_VERIFIED`)**: Firefox CSS `@import` and WebKit `<link rel=prefetch>`
-  issued no request even from an ordinary page, so no block is claimed for them. Firefox fires no CSP
-  violation for `<a ping>`; no ping request reached the receiver, but the block is not attributed.
-- **Lease ids in Kibana's access logs**: `http.server.response` debug logs contain execute URLs, so lease ids
-  (not secrets) appear there. The bridge audit records contain neither ids nor secrets; the secret never
-  appears in any log (checked with debug logging on).
-- Already-delivered data cannot be recalled; a compromised UI holds the app's grant (T3 shows successful reads).
-
-## Backend prototype results
-
-**Every result below is local workerd (`wrangler dev` 4.157.0 / workerd 2026-11-03), not remote
-acceptance.** No Cloudflare account was used, and nothing was deployed. Run date: 2026-11-04 (Node
-24.22.1, local ES snapshot, `node scripts/kibana --dev`). Rerun after the review fixes
-("[App Host] Review fixes").
-
-### Verdict
+## Backend prototype (M1–M3), local workerd only
 
 | Question | Result |
 |---|---|
-| Backend prototype GO/NO-GO | **BLOCKED**: remote Cloudflare acceptance has not run. Local results are not GO evidence |
-| CPU-limit gate (`app_host:app_cpu_limit`) | **NOT RUN**: mandatory remote gate; `NOT_ENFORCED_LOCALLY` on OSS workerd |
-| Latency decision (p95 ≤ 2 s, synthetic) | **NO DECISION**: verified local target only; local p95 is meaningless for the remote topology |
-| Production | **NOT EVALUATED** (residency/subprocessor, frontend code, caching economics, scale, availability) |
+| Backend GO/NO-GO | **BLOCKED**: remote Cloudflare acceptance has not run |
+| CPU-limit gate (`app_host:app_cpu_limit`) | **NOT RUN** remotely; `NOT_ENFORCED_LOCALLY` on OSS workerd |
+| Latency decision (p95 ≤ 2 s) | **NO DECISION**: local numbers say nothing about the remote topology |
 
-### What the review fixes changed in the evidence
+`seam --url ws://127.0.0.1:8787/rpc --local-workerd`: exit 0, 24 required assertions true, `loopCpuLimited`, `loopWallBounded` and `loopRecovered` `NOT_ENFORCED_LOCALLY` (OSS workerd ignores Dynamic Worker `limits.cpuMs`; the loop fixture is not run), no failures. Required assertions cover `result:42`,
+one callback, authentication (wrong, missing token, idle unauthenticated close), replay, egress
+(`fetch`/`connect` blocked by workerd's `globalOutbound: null` policy), seven misuse cases each in a
+fresh invocation with no Node handler call, the one-call budget, receiver-side transport limits (1009 for a
+257 KiB ASCII frame and for 270,000 UTF-8 bytes in 90,000 code units; `app_host:rpc_limit` / 1011 for
+depth 40, each with a control), fresh module state, concurrency, disconnect and reconnect.
 
-- **Dispatcher target is verified from host-owned evidence.** Kibana reports
-  `dispatcher;desc="scheme=ws,class=loopback,fp=731a85aec9305232"` in `x-app-host-timing`; the tools
-  recompute it from `--rpc`, stop on mismatch, and derive local/remote from it (never from a label).
-- **Regression, live:** `acceptance --rpc wss://kbn-app-host-proto-dispatcher.example.workers.dev/rpc`
-  (remote mode) against this locally configured Kibana → exit 1, verdict `STOPPED`,
-  `"Kibana uses a local dispatcher, remote was requested"` (expected `scheme=wss,class=remote,
-  fp=a2df8e3740afaf0a`, observed the loopback fingerprint). It stopped after **one** dispatcher
-  connection, before the CPU gate. `benchmark` with the same `--rpc` → exit 1, 1 attempted sample,
-  `latency: "NO DECISION: dispatcher target not verified"`. Mode guards (exit 2): `--local-workerd`
-  with a remote URL, remote mode with `ws://` or a loopback URL (acceptance, benchmark and seam).
-- **CPU gate:** `cpuLimitEnforced` / `loopCpuLimited` now require `app_host:app_cpu_limit`; the
-  wall-clock bound is a separate assertion; the gate runs first and stops the run on failure.
-- **No-invocation claims:** reported `NOT_VERIFIED` without an observer (verdict
-  `PASS_WITH_NOT_VERIFIED`, exit 3), separately from the HTTP denial.
-- **Negative assertions** check the specific code, the receiver-side close code and whether the Node
-  handler ran (see below).
+`acceptance --kibana http://localhost:5601 --rpc ws://127.0.0.1:8787/rpc --wrangler-log <abs> --local-workerd`
+(approval reset first): exit 0, verdict **PASS**, 34 of 37 assertions true, `notVerified: []`, `notEnforcedLocally: [cpuLimitEnforced, cpuLoopWallBounded, cpuLoopRecovery]`. It verifies the dispatcher fingerprint from `x-app-host-timing`,
+route authz, ES denial for a no-index user, package failures (digest mismatch, hostApi, unknown field,
+wildcard grant, oversized manifest and bundle, each with a no-invocation assertion), forbidden index,
+unknown method and callback budget, invalid and oversized app output, the 5 s deadline, the 4-invocation
+limiter and abort handling, and an external release served without restart.
 
-### M1 seam (`npm run seam -- --url ws://127.0.0.1:8787/rpc --local-workerd`)
-
-Exit 0. 24 required assertions `true`, 3 `NOT_ENFORCED_LOCALLY`, 0 failures:
-
-- `NOT_ENFORCED_LOCALLY`: **`loopCpuLimited`, `loopWallBounded`, `loopRecovered`**. The loop
-  fixture was not run (OSS workerd ignores Dynamic Worker `limits.cpuMs`; an earlier local run hit
-  the 5 s client deadline and then pinned workerd at ~99% CPU until restart). This is the main gate
-  for the remote run, and a deadline or a generic error does not pass it.
-- `result:42`, `callbackCount:1`, `httpWithoutUpgrade426`, `unauthenticatedInvokeDenied`,
-  `wrongTokenDenied`, `wrongTokenSocketClosed`, `missingTokenDenied`, `idleUnauthClosed` (2006 ms),
-  `replayDenied` (`app_host:capability_used`), `egressCallback`, `freshModuleState`,
-  `concurrentIsolated`, `disconnectRevoked`, `reconnectSucceeded`.
-- `fetchBlocked` / `connectBlocked`: both denial reasons are workerd's `globalOutbound: null` policy
-  message, `This worker is not permitted to access the internet via global functions like fetch()…`,
-  not a DNS/network error.
-- `digestMismatchDenied` (`app_host:digest_mismatch`, handler not called), `oversizedBundleDenied`
-  (`app_host:invalid_bundle`).
-- `misuseDenied`, seven fresh invocations, Node handler called **0** times in each:
-
-  | Case | Contract error |
-  |---|---|
-  | unknown method | `The RPC receiver does not implement the method "deleteIndex".` |
-  | wildcard, alias, array index | `app_host:index_not_granted` |
-  | extra field, bad size, size 101 | `app_host:invalid_search` |
-
-- `callbackBudgetEnforced`: first call 41, second `app_host:callback_budget`, Node handler called once.
-- Transport limits (receiver side, dispatcher):
-
-  | Case | Result |
-  |---|---|
-  | 257 KiB ASCII frame | socket closed **1009** before parsing |
-  | 90,000 × U+6F22 (90,000 code units, 270,000 UTF-8 bytes) | socket closed **1009** (UTF-8 counting) |
-  | control: 70 KiB bundle in a valid frame | `app_host:invalid_bundle`, socket stays open |
-  | depth-40 invoke argument | `app_host:rpc_limit`, socket closed **1011** |
-  | control: same field at depth 2 | `app_host:invalid_request`, socket stays open |
-  | depth-40 callback result (handler ran) | `app_host:rpc_limit` |
-
-The optional raw-stub probe was not rerun. Earlier result (diagnostic, not selected): a raw capnweb
-stub in Loader `env` fails with `DataCloneError`; `ctx.exports.Greeter({props:{}})` works.
-
-### M2/M3 Kibana acceptance
-
-`npm run acceptance -- --kibana http://localhost:5601 --rpc ws://127.0.0.1:8787/rpc --wrangler-log <abs path> --local-workerd`:
-exit 0, verdict **`PASS`**, mode `local workerd (verified loopback dispatcher fingerprint), not
-remote acceptance`. 34 of 37 assertions `true`, 0 failures, `notVerified: []`, and
-**`notEnforcedLocally: [cpuLimitEnforced, cpuLoopWallBounded, cpuLoopRecovery]`**.
-
-The same run without `--wrangler-log`: exit 3, verdict **`PASS_WITH_NOT_VERIFIED`**, 26 `true`,
-0 failures, **`notVerified: [dispatcherCounterPositiveControl, noFeatureNoInvocation,
-package_{digestMismatch,unsupportedHostApi,unknownManifestField,wildcardGrant,oversizedManifest,oversizedBundle}_noInvocation]`**
-(`"No dispatcher connection observer …; the invocation count was not measured. The HTTP denial is
-asserted separately."`), and the same three `NOT_ENFORCED_LOCALLY`. A remote run has no observer,
-so these stay `NOT_VERIFIED` there.
-
-With the observer:
-
-- `dispatcherTargetVerified`: expected = observed `scheme=ws,class=loopback,fp=731a85aec9305232`;
-- `dispatcherCounterPositiveControl`: +1 connection for a normal call;
-- unauthenticated → 401; reader v1 → `{"appId":"alert-digest","version":"1.0.0","label":"Digest v1","counts":{"high":2,"low":1}}`;
-  app list → exactly one `{id,title,version}`;
-- `noFeatureDenied403` (route authz, `read_app_host`) and, separately, `noFeatureNoInvocation`
-  (0 connections); the list route also returns 403;
-- no-index user → 403 `Current user is not authorized to read the app data`; unknown app → 404;
-  superuser → 200;
-- v1.0.1 / `Digest v2` released externally → served immediately, with no Kibana restart and no
-  Worker redeploy;
-- digest mismatch, hostApi 2, unknown manifest field, wildcard grant, 17 KiB manifest and 70 KiB
-  bundle → 500 with the precise code, each with a separate `_noInvocation` assertion (0 connections);
-- superuser + app requesting `.kibana` → `forbidden-index-denied:app_host:index_not_granted`, host
-  callbacks 0; unknown host method → `unknown-method:The RPC receiver does not implement the method
-  "deleteIndex".`, host callbacks 0; second callback →
-  `second-callback-denied:app_host:callback_budget`, host callbacks 1;
-- invalid app output → 502 `invalid_app_output`; 20 KiB app output → 502 `invalid_app_result`;
-- an 8 s app → 504 at 5006 ms; the next call recovers;
-- 6 concurrent slow calls → `[200,200,429,200,429,200]`;
-- 4 client-aborted calls release their slots; 4 follow-up calls → 200.
-
-`npm run ui-check` was not rerun (the page and its API are unchanged). Earlier result: page title
-`Alert digest`, v1.0.0 / `Digest v1` / high 2 / low 1, then v1.0.1 / `Digest v2` after Refresh; no
-foreign scripts, no iframes.
-
-### Benchmark (`npm run benchmark -- --kibana http://localhost:5601 --samples 20 --rpc ws://127.0.0.1:8787/rpc --local-workerd`)
-
-Exit 0. Dispatcher verified on all 20 responses (loopback fingerprint, 0 mismatches). 20/20 Kibana
-samples valid (200, verified dispatcher, 1 callback), 20/20 seam samples valid, 0 exceptions.
-Fresh-invocation timings: each sample uses a new HTTP request, WebSocket, auth and `LOADER.load`.
-They are not cold-isolate, warm-cache or scale-to-zero measurements.
-
-| Metric (ms) | p50 | p95 |
-|---|---|---|
-| Kibana end-to-end (client) | 11.1 | 14.6 |
-| Host total | 7.1 | 8.9 |
-| package read+verify | 0.4 | 0.5 |
-| WebSocket connect | 2 | 3 |
-| authenticate | 0 | 1 |
-| invoke (load + run + callback) | 4 | 5 |
-| ES callback | 1.6 | 2.0 |
-| Raw seam total (no Kibana/ES) | 4 | 6 |
-
-- Decision: `NO DECISION: local workerd p95 14.6 ms says nothing about the remote topology`;
-  remote acceptance `BLOCKED`; production `NOT EVALUATED`.
-- Calls per invocation: 1 callback.
-- Logical JSON bytes, not wire bytes: invoke request 1133, app result 49, callback request 48,
-  callback response 160.
-- CPU: **unmeasured** (no account telemetry). The configured cap is 50 CPU-ms per app Worker, so the
-  upper bound for 40 fresh Workers is 2000 CPU-ms, about $0.00004 at $0.02 per million CPU-ms.
-- Creation pricing (published, estimate only): $0.002 per fresh Dynamic Worker beyond 1,000 a month,
-  i.e. **~$2 per 1,000 fresh invocations before allowances**. This run would have been $0.08 before
-  allowances, had it been remote.
+Benchmark (`benchmark --samples 20 --local-workerd`, 2026-11-04, not rerun; the backend path is
+unchanged): Kibana end-to-end p50 11.1 ms / p95 14.6 ms, raw seam p50 4 / p95 6 ms. Fresh-invocation
+timings on loopback; not cold-isolate or remote measurements. Published creation pricing is about $2
+per 1,000 fresh invocations before allowances.

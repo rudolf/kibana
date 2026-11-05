@@ -51,15 +51,43 @@ describe('UI release manifests', () => {
     );
   });
 
-  it('S8: any index other than the synthetic literal is rejected at parse', async () => {
-    for (const index of ['other-index', '.security-7', 'logs-kibana.audit-default', 'kbn-*']) {
-      const manifest = uiManifest({
+  it('S8: only the synthetic literal plus kbn-apps-demo- names or patterns are grantable', async () => {
+    const withIndices = (indices: string[]) =>
+      uiManifest({
         permissions: {
-          indices: [index],
+          indices,
           dashboardIds: [(uiManifest().permissions as { dashboardIds: string[] }).dashboardIds[0]],
         },
       });
-      expect(await check(manifest)).toBe('manifest_invalid');
+    for (const index of [
+      'other-index',
+      '.security-7',
+      'logs-kibana.audit-default',
+      'kbn-*',
+      'kbn-apps-*',
+      'kbn-apps-other-secret',
+      'kbn-apps-demo-',
+      'kbn-apps-demo-*,kbn-apps-other-secret',
+      'kbn-apps-demo-a*b',
+      'kbn-apps-demo-logs-**',
+      'remote:kbn-apps-demo-logs-*',
+      'KBN-APPS-DEMO-X',
+    ]) {
+      expect(await check(withIndices(['kbn-apps-prototype-alerts', index]))).toBe(
+        'manifest_invalid'
+      );
+    }
+    // The backend literal must stay granted (it is the Worker's HostEs index); no duplicates.
+    expect(await check(withIndices(['kbn-apps-demo-logs-*']))).toBe('manifest_invalid');
+    expect(
+      await check(withIndices(['kbn-apps-prototype-alerts', 'kbn-apps-prototype-alerts']))
+    ).toBe('manifest_invalid');
+    for (const indices of [
+      ['kbn-apps-prototype-alerts'],
+      ['kbn-apps-prototype-alerts', 'kbn-apps-demo-*'],
+      ['kbn-apps-prototype-alerts', 'kbn-apps-demo-logs-a', 'kbn-apps-demo-logs-*'],
+    ]) {
+      expect(await check(withIndices(indices))).toBe('ok');
     }
   });
 
@@ -132,6 +160,8 @@ describe('projectWorkerManifest (Worker wire schema)', () => {
       ['digest', 'hostApi', 'id', 'permissions', 'routes', 'title', 'version'].sort()
     );
     expect(Object.keys(projected.permissions)).toEqual(['indices']);
+    // The demo patterns are a UI grant: the Worker keeps exactly its synthetic literal.
+    expect(projected.permissions.indices).toEqual(['kbn-apps-prototype-alerts']);
     expect(JSON.stringify(projected)).not.toMatch(/releaseDigest|dashboardIds|"ui"|scopeMapDigest/);
   });
 });

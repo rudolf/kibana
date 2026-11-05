@@ -30,7 +30,10 @@ describe('CapabilityRegistry (T11)', () => {
       new CapabilityRegistry().register({ ...base, input: '{index:*}' }, () => undefined)
     ).toThrow();
     expect(() =>
-      new CapabilityRegistry().register(BRIDGE_V1_CAPABILITIES[3], () => undefined)
+      new CapabilityRegistry().register(
+        BRIDGE_V1_CAPABILITIES.find(({ kind }) => kind === 'parent') as never,
+        () => undefined
+      )
     ).toThrow();
     const registry = new CapabilityRegistry().freeze();
     expect(() => registry.register(base, () => undefined)).toThrow('frozen');

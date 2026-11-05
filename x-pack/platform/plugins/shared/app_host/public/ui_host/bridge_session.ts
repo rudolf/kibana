@@ -31,7 +31,7 @@ export interface BridgeSession {
 }
 
 /**
- * Wires the bounded string-only transport, the four-method `AppBridge` and a capnweb `RpcSession`
+ * Wires the bounded string-only transport, the seven-method `AppBridge` and a capnweb `RpcSession`
  * on the parent's end of the bridge port.
  */
 export const startBridgeSession = ({

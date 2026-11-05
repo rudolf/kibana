@@ -406,7 +406,7 @@ probe.run.flood = async () => {
   return `posted 2000 x 1MiB in ${Date.now() - started}ms`;
 };
 probe.run.oversizedFrame = () => {
-  heldPort?.postMessage('x'.repeat(33 * 1024));
+  heldPort?.postMessage('x'.repeat(1024 * 1024 + 1));
   return heldPort ? 'sent' : 'no-port';
 };
 

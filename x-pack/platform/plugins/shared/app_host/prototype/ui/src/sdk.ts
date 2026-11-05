@@ -29,10 +29,34 @@ export interface DashboardPreview {
   title: string;
 }
 
+export interface DataViewListItem {
+  id: string;
+  name: string;
+  title: string;
+  timeFieldName: string | null;
+}
+export interface DataView extends DataViewListItem {
+  fields: Array<{
+    name: string;
+    type: string;
+    esTypes: string[];
+    aggregatable: boolean;
+    searchable: boolean;
+  }>;
+}
+export type EsqlValue = string | number | boolean | null | Array<string | number | boolean | null>;
+export interface EsqlResult {
+  columns: Array<{ name: string; type: string }>;
+  values: EsqlValue[][];
+}
+
 export interface Bridge {
   callAppRoute(request: { method: 'GET'; path: '/summary' }): Promise<Summary>;
   search(request: { index: string; size: number }): Promise<SearchResult>;
   getDashboardPreview(request: { id: string }): Promise<DashboardPreview>;
+  listDataViews(): Promise<DataViewListItem[]>;
+  getDataView(request: { id: string }): Promise<DataView>;
+  esql(request: { query: string }): Promise<EsqlResult>;
   getTheme(): Promise<Theme>;
 }
 

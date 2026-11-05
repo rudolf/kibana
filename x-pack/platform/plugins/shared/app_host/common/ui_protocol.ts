@@ -20,7 +20,13 @@ export const APP_FEATURE_ID = 'appHostAlertDigest';
 export const UI_DEEP_LINK_ID = INSTALLED_APP_ID;
 export const UI_DEEP_LINK_PATH = `/${INSTALLED_APP_ID}`;
 
-export const UI_SCOPES = ['app.summary', 'es.search', 'kibana.dashboard.read'] as const;
+export const UI_SCOPES = [
+  'app.summary',
+  'es.search',
+  'kibana.dashboard.read',
+  'kibana.dataViews.read',
+  'es.esql',
+] as const;
 export type UiScope = (typeof UI_SCOPES)[number];
 
 /** Public browser-loadable documents (iframe navigations only). */
@@ -51,9 +57,9 @@ export const UI_LIMITS = {
   uiBundleBytes: 512 * 1024,
   hostScriptBytes: 256 * 1024,
   frameHeightPx: 480,
-  /** Bounded string-only MessagePort transport. */
-  frameBytes: 32 * 1024,
-  receiveQueueBytes: 256 * 1024,
+  /** Bounded string-only MessagePort transport (structural memory bounds, not quotas). */
+  frameBytes: 1024 * 1024,
+  receiveQueueBytes: 4 * 1024 * 1024,
   rpcMaxDepth: 12,
   rpcMaxBigIntDigits: 64,
   liveRpcStubs: 128,
@@ -65,6 +71,14 @@ export const UI_LIMITS = {
   stateCacheMs: 2000,
   handleBytes: 1024,
   resultBytes: 16 * 1024,
+  /** Data view and ES|QL results: below one frame, leaving room for the capnweb envelope. */
+  largeResultBytes: 960 * 1024,
+  /** Native Data Views API response body read before projection (never parsed when larger). */
+  dataViewBodyBytes: 4 * 1024 * 1024,
+  dataViewIdLength: 128,
+  esqlQueryBytes: 4 * 1024,
+  esqlRows: 500,
+  esqlColumns: 256,
   dashboardResultBytes: 4 * 1024,
   dashboardTitleLength: 256,
   dashboardBodyBytes: 256 * 1024,
@@ -94,7 +108,10 @@ export const isBridgeErrorCode = (value: unknown): value is BridgeErrorCode =>
 export type UiOperation =
   | { readonly op: 'app.summary' }
   | { readonly op: 'es.search'; readonly params: { readonly index: string; readonly size: number } }
-  | { readonly op: 'kibana.dashboard.read'; readonly params: { readonly id: string } };
+  | { readonly op: 'kibana.dashboard.read'; readonly params: { readonly id: string } }
+  /** Without `id`: list the data views; with `id`: read one data view and its fields. */
+  | { readonly op: 'kibana.dataViews.read'; readonly params: { readonly id?: string } }
+  | { readonly op: 'es.esql'; readonly params: { readonly query: string } };
 
 export interface UiSummaryResult {
   readonly appId: string;
@@ -109,6 +126,33 @@ export interface UiSearchResult {
 export interface UiDashboardPreview {
   readonly id: string;
   readonly title: string;
+}
+export interface UiDataViewListItem {
+  readonly id: string;
+  readonly name: string;
+  readonly title: string;
+  readonly timeFieldName: string | null;
+}
+export interface UiDataViewField {
+  readonly name: string;
+  readonly type: string;
+  readonly esTypes: readonly string[];
+  readonly aggregatable: boolean;
+  readonly searchable: boolean;
+}
+export interface UiDataView extends UiDataViewListItem {
+  readonly fields: readonly UiDataViewField[];
+}
+/** An ES|QL cell: a JSON scalar or, for multi-valued fields, an array of scalars. */
+export type UiEsqlValue =
+  | string
+  | number
+  | boolean
+  | null
+  | ReadonlyArray<string | number | boolean | null>;
+export interface UiEsqlResult {
+  readonly columns: ReadonlyArray<{ readonly name: string; readonly type: string }>;
+  readonly values: ReadonlyArray<readonly UiEsqlValue[]>;
 }
 export interface UiTheme {
   readonly mode: 'light' | 'dark';
@@ -131,7 +175,16 @@ export interface CreateSessionResponse {
 }
 export type ExecuteRequest = { readonly handle: string } & UiOperation;
 export type ExecuteResponse =
-  | { readonly ok: true; readonly result: UiSummaryResult | UiSearchResult | UiDashboardPreview }
+  | {
+      readonly ok: true;
+      readonly result:
+        | UiSummaryResult
+        | UiSearchResult
+        | UiDashboardPreview
+        | { readonly dataViews: readonly UiDataViewListItem[] }
+        | UiDataView
+        | UiEsqlResult;
+    }
   | { readonly ok: false; readonly code: BridgeErrorCode };
 
 export interface UiAppMetadata {
@@ -154,6 +207,38 @@ export interface UiAppMetadata {
 export const LOCAL_DEMO_PUBLISHER = 'Local synthetic demo publisher';
 
 const HEX64 = /^[0-9a-f]{64}$/;
+/** Data view ids: no `/` and no leading dot, so a path segment can never be `.` or `..`. */
+const DATA_VIEW_ID = /^[A-Za-z0-9_][A-Za-z0-9_.:*-]*$/;
+
+export const isDataViewId = (value: unknown): value is string =>
+  typeof value === 'string' &&
+  value.length <= UI_LIMITS.dataViewIdLength &&
+  DATA_VIEW_ID.test(value);
+
+/** UTF-8 byte length (lone surrogates count as 3 bytes, like U+FFFD). */
+const utf8Length = (value: string): number => {
+  let bytes = 0;
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code < 0x80) bytes += 1;
+    else if (code < 0x800) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff && i + 1 < value.length) {
+      const next = value.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4;
+        i++;
+      } else bytes += 3;
+    } else bytes += 3;
+  }
+  return bytes;
+};
+
+/** ES|QL query input bound: a non-empty string of at most 4 KiB UTF-8. No command allowlist. */
+export const isEsqlQuery = (value: unknown): value is string =>
+  typeof value === 'string' &&
+  value.trim().length > 0 &&
+  value.length <= UI_LIMITS.esqlQueryBytes &&
+  utf8Length(value) <= UI_LIMITS.esqlQueryBytes;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export const isHex64 = (value: unknown): value is string =>
@@ -198,6 +283,19 @@ export const parseUiOperation = (value: unknown): UiOperation | undefined => {
       if (!hasExactKeys(params, ['id']) || !isUuid(params.id)) return undefined;
       return { op: 'kibana.dashboard.read', params: { id: params.id } };
     }
+    case 'kibana.dataViews.read': {
+      if (!hasExactKeys(value, ['op', 'params']) || !isPlainRecord(value.params)) return undefined;
+      const { params } = value;
+      if (hasExactKeys(params, [])) return { op: 'kibana.dataViews.read', params: {} };
+      if (!hasExactKeys(params, ['id']) || !isDataViewId(params.id)) return undefined;
+      return { op: 'kibana.dataViews.read', params: { id: params.id } };
+    }
+    case 'es.esql': {
+      if (!hasExactKeys(value, ['op', 'params']) || !isPlainRecord(value.params)) return undefined;
+      const { params } = value;
+      if (!hasExactKeys(params, ['query']) || !isEsqlQuery(params.query)) return undefined;
+      return { op: 'es.esql', params: { query: params.query } };
+    }
     default:
       return undefined;
   }
@@ -227,6 +325,16 @@ export const parseSearchArgs = (value: unknown): { index: string; size: number }
 export const parseDashboardArgs = (value: unknown): { id: string } | undefined =>
   isPlainRecord(value) && hasExactKeys(value, ['id']) && isUuid(value.id)
     ? { id: value.id }
+    : undefined;
+
+export const parseGetDataViewArgs = (value: unknown): { id: string } | undefined =>
+  isPlainRecord(value) && hasExactKeys(value, ['id']) && isDataViewId(value.id)
+    ? { id: value.id }
+    : undefined;
+
+export const parseEsqlArgs = (value: unknown): { query: string } | undefined =>
+  isPlainRecord(value) && hasExactKeys(value, ['query']) && isEsqlQuery(value.query)
+    ? { query: value.query }
     : undefined;
 
 export const parseExecuteResponse = (
@@ -289,4 +397,85 @@ export const parseDashboardPreview = (
     return undefined;
   }
   return { id, title };
+};
+
+const boundedName = (value: unknown, max = 1024): value is string =>
+  typeof value === 'string' && value.length <= max;
+
+const parseListItem = (value: unknown): UiDataViewListItem | undefined => {
+  if (!isPlainRecord(value) || !hasExactKeys(value, ['id', 'name', 'title', 'timeFieldName'])) {
+    return undefined;
+  }
+  const { id, name, title, timeFieldName } = value;
+  if (!isDataViewId(id) || !boundedName(name) || !boundedName(title)) return undefined;
+  if (timeFieldName !== null && !boundedName(timeFieldName)) return undefined;
+  return { id, name, title, timeFieldName };
+};
+
+export const parseDataViewList = (
+  value: Record<string, unknown>
+): UiDataViewListItem[] | undefined => {
+  if (!hasExactKeys(value, ['dataViews']) || !Array.isArray(value.dataViews)) return undefined;
+  const items: UiDataViewListItem[] = [];
+  for (const item of value.dataViews) {
+    const parsed = parseListItem(item);
+    if (!parsed) return undefined;
+    items.push(parsed);
+  }
+  return items;
+};
+
+export const parseDataView = (value: Record<string, unknown>): UiDataView | undefined => {
+  const { fields, ...rest } = value;
+  const base = parseListItem(rest);
+  if (!base || !Array.isArray(fields)) return undefined;
+  const parsed: UiDataViewField[] = [];
+  for (const field of fields) {
+    if (
+      !isPlainRecord(field) ||
+      !hasExactKeys(field, ['name', 'type', 'esTypes', 'aggregatable', 'searchable'])
+    ) {
+      return undefined;
+    }
+    const { name, type, esTypes, aggregatable, searchable } = field;
+    if (!boundedName(name) || !boundedName(type, 64)) return undefined;
+    if (!Array.isArray(esTypes) || !esTypes.every((esType) => boundedName(esType, 64))) {
+      return undefined;
+    }
+    if (typeof aggregatable !== 'boolean' || typeof searchable !== 'boolean') return undefined;
+    parsed.push({ name, type, esTypes: [...esTypes], aggregatable, searchable });
+  }
+  return { ...base, fields: parsed };
+};
+
+const isScalar = (value: unknown): value is string | number | boolean | null =>
+  value === null ||
+  typeof value === 'string' ||
+  typeof value === 'boolean' ||
+  (typeof value === 'number' && Number.isFinite(value));
+
+export const parseEsqlResult = (value: Record<string, unknown>): UiEsqlResult | undefined => {
+  if (!hasExactKeys(value, ['columns', 'values'])) return undefined;
+  const { columns, values } = value;
+  if (!Array.isArray(columns) || columns.length > UI_LIMITS.esqlColumns) return undefined;
+  if (!Array.isArray(values) || values.length > UI_LIMITS.esqlRows) return undefined;
+  const parsedColumns: Array<{ name: string; type: string }> = [];
+  for (const column of columns) {
+    if (!isPlainRecord(column) || !hasExactKeys(column, ['name', 'type'])) return undefined;
+    const { name, type } = column;
+    if (!boundedName(name) || !boundedName(type, 64)) return undefined;
+    parsedColumns.push({ name, type });
+  }
+  const rows: UiEsqlValue[][] = [];
+  for (const row of values) {
+    if (!Array.isArray(row) || row.length !== parsedColumns.length) return undefined;
+    const cells: UiEsqlValue[] = [];
+    for (const cell of row) {
+      if (isScalar(cell)) cells.push(cell);
+      else if (Array.isArray(cell) && cell.every(isScalar)) cells.push([...cell]);
+      else return undefined;
+    }
+    rows.push(cells);
+  }
+  return { columns: parsedColumns, values: rows };
 };

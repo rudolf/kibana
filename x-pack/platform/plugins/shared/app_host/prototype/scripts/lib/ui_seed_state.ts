@@ -13,6 +13,26 @@ import { LOCAL_DIR } from './secrets';
 export const HOSTILE_RULE = `<img src=x onerror="parent.document.body.textContent='PWN'">`;
 export const DASHBOARD_TITLE = 'Synthetic <b>dashboard</b> <img src=x onerror=alert(1)>';
 
+/** Mini Discover synthetic data (ui:seed). */
+export const DEMO = {
+  /** Granted through the release's `kbn-apps-demo-logs-*` pattern. */
+  indices: ['kbn-apps-demo-logs-a', 'kbn-apps-demo-logs-b'],
+  docsPerIndex: 240,
+  /** Outside the grant and outside the `kbn-apps-demo-` prefix. */
+  secretIndex: 'kbn-apps-other-secret',
+  secretMarker: 'SECRET-ROW',
+  secretDocs: 5,
+  dataViewId: 'kbn-apps-demo-logs',
+  dataViewTitle: 'kbn-apps-demo-logs-*',
+  secretDataViewId: 'kbn-apps-other-secret',
+  /** Attacker-style `message` values on the newest documents of logs-a; must render as text. */
+  hostileMessages: [
+    '<img src=x onerror="parent.document.body.textContent=\'PWN\'">',
+    '<script>alert("discover")</script>',
+    '"><svg onload=alert(1)>',
+  ],
+} as const;
+
 export const UI_SEED_FILE = join(LOCAL_DIR, 'ui_seed.json');
 
 export interface UiSeedState {

@@ -12,15 +12,17 @@ describe('bridgeApi 1 contract', () => {
   it('is pinned: any semantic expansion or policy relaxation changes this digest', () => {
     // Updating this value requires a new contract identity, security review and renewed approvals.
     expect(SCOPE_MAP_DIGEST_V1).toMatchInlineSnapshot(
-      `"23880e2aacc868856f20bd93bac94098a9050223512d9b9a96681e413c5c2888"`
+      `"f46b850c3116e006552cab012d76df65e63ec4bea4814233f99e6c1282d10a4c"`
     );
   });
 
-  it('declares only the four bridge methods with all safety flags false', () => {
+  it('declares only the seven bridge methods with all safety flags false', () => {
     expect(BRIDGE_V1_CAPABILITIES.map(({ id, bridgeMethod }) => `${id}:${bridgeMethod}`)).toEqual([
       'app.summary:callAppRoute',
       'es.search:search',
       'kibana.dashboard.read:getDashboardPreview',
+      'kibana.dataViews.read:listDataViews,getDataView',
+      'es.esql:esql',
       'host.theme:getTheme',
     ]);
     for (const capability of BRIDGE_V1_CAPABILITIES) {

@@ -9,6 +9,9 @@ import { RpcTarget } from 'capnweb';
 import type {
   BridgeErrorCode,
   UiDashboardPreview,
+  UiDataView,
+  UiDataViewListItem,
+  UiEsqlResult,
   UiOperation,
   UiScope,
   UiSearchResult,
@@ -21,6 +24,11 @@ import {
   parseCallAppRouteArgs,
   parseDashboardArgs,
   parseDashboardPreview,
+  parseDataView,
+  parseDataViewList,
+  parseEsqlArgs,
+  parseEsqlResult,
+  parseGetDataViewArgs,
   parseSearchArgs,
   parseSearchResult,
   parseSummaryResult,
@@ -85,7 +93,7 @@ export const isValidTheme = (theme: UiTheme): boolean => {
 };
 
 /**
- * The only object exposed to the guest: exactly four public methods, all state private, plain-data
+ * The only object exposed to the guest: exactly seven public methods, all state private, plain-data
  * arguments only (functions, stubs, thenables and extra fields are rejected) and never an awaited
  * guest value. The server repeats every check and runs operations as the app session key; this
  * class is not the security boundary for server operations.
@@ -142,6 +150,38 @@ export class AppBridge extends RpcTarget {
       'kibana.dashboard.read',
       { op: 'kibana.dashboard.read', params: { id: input.id } },
       parseDashboardPreview
+    );
+  }
+
+  listDataViews(...args: unknown[]): Promise<UiDataViewListItem[]> {
+    if (args.length !== 0) return this.#invalid('listDataViews');
+    return this.#run(
+      'listDataViews',
+      'kibana.dataViews.read',
+      { op: 'kibana.dataViews.read', params: {} },
+      parseDataViewList
+    );
+  }
+
+  getDataView(...args: unknown[]): Promise<UiDataView> {
+    const input = args.length === 1 ? parseGetDataViewArgs(args[0]) : undefined;
+    if (!input) return this.#invalid('getDataView');
+    return this.#run(
+      'getDataView',
+      'kibana.dataViews.read',
+      { op: 'kibana.dataViews.read', params: { id: input.id } },
+      parseDataView
+    );
+  }
+
+  esql(...args: unknown[]): Promise<UiEsqlResult> {
+    const input = args.length === 1 ? parseEsqlArgs(args[0]) : undefined;
+    if (!input) return this.#invalid('esql');
+    return this.#run(
+      'esql',
+      'es.esql',
+      { op: 'es.esql', params: { query: input.query } },
+      parseEsqlResult
     );
   }
 

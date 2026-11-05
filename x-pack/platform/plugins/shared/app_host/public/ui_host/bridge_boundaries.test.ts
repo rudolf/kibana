@@ -97,25 +97,27 @@ const nested = (levels: number): unknown => {
 };
 
 describe('transport byte and queue boundaries (T9)', () => {
-  it('frame: exactly 32,768 UTF-8 bytes accepted, 32,769 terminates', () => {
+  it('frame: exactly 1 MiB (1,048,576 UTF-8 bytes) accepted, one byte more terminates', () => {
+    expect(UI_LIMITS.frameBytes).toBe(1024 * 1024);
     const at = fakeTransport();
     at.port.deliver('x'.repeat(UI_LIMITS.frameBytes));
     expect(at.reasons).toEqual([]);
     const past = fakeTransport();
     past.port.deliver('x'.repeat(UI_LIMITS.frameBytes + 1));
     expect(past.reasons).toEqual(['frame_too_large']);
-    // Multibyte: 10,922 x U+6F22 + 2 ASCII = 32,768 bytes; one more ASCII byte is over.
+    // Multibyte: 349,525 x U+6F22 (3 bytes) + 1 ASCII = 1,048,576 bytes; one more ASCII byte is over.
     const multiAt = fakeTransport();
-    multiAt.port.deliver(`${'\u6f22'.repeat(10_922)}xx`);
+    multiAt.port.deliver(`${'\u6f22'.repeat(349_525)}x`);
     expect(multiAt.reasons).toEqual([]);
     const multiPast = fakeTransport();
-    multiPast.port.deliver(`${'\u6f22'.repeat(10_922)}xxx`);
+    multiPast.port.deliver(`${'\u6f22'.repeat(349_525)}xx`);
     expect(multiPast.reasons).toEqual(['frame_too_large']);
   });
 
-  it('queue: exactly 256 KiB queued accepted, one more byte overflows', () => {
+  it('queue: exactly 4 MiB queued accepted, one more byte overflows', () => {
+    expect(UI_LIMITS.receiveQueueBytes).toBe(4 * 1024 * 1024);
     const { port, reasons } = fakeTransport();
-    for (let i = 0; i < 8; i++) port.deliver('q'.repeat(32 * 1024));
+    for (let i = 0; i < 4; i++) port.deliver('q'.repeat(UI_LIMITS.frameBytes));
     expect(reasons).toEqual([]);
     port.deliver('q');
     expect(reasons).toEqual(['queue_overflow']);

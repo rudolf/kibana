@@ -152,7 +152,7 @@ const setup = ({ state = () => approved, es, self, summary, now, skipInputSchema
     grantKey,
     asKey,
     invalidateKey,
-    dashboardPathname: (id) => `/api/dashboards/${id}`,
+    selfPathname: (path) => path,
     ...overrides,
   });
   const audit = () => logger.info.mock.calls.map(([, meta]) => meta as Record<string, any>);
@@ -230,11 +230,16 @@ describe('BridgeService app session (K3/K4/K6)', () => {
       role_descriptors: {
         app: {
           cluster: [],
-          indices: [{ names: ['kbn-apps-prototype-alerts'], privileges: ['read'] }],
+          indices: [
+            {
+              names: ['kbn-apps-prototype-alerts', 'kbn-apps-demo-logs-*'],
+              privileges: ['read', 'view_index_metadata'],
+            },
+          ],
           applications: [
             {
               application: 'kibana-.kibana',
-              privileges: ['feature_dashboard_v2.read'],
+              privileges: ['feature_dashboard_v2.read', 'feature_indexPatterns.read'],
               resources: ['space:default'],
             },
           ],
@@ -244,7 +249,7 @@ describe('BridgeService app session (K3/K4/K6)', () => {
     });
   });
 
-  it('grants no Kibana application privilege without the kibana.dashboard.read scope', async () => {
+  it('grants no Kibana application privilege without the Dashboard and Data Views scopes', async () => {
     const noDashboard = uiManifest({
       ui: { ...(manifest.ui as object), scopes: ['app.summary', 'es.search'] },
     }) as never as ApprovedManifest;
@@ -941,5 +946,293 @@ describe('BridgeService handlers reach only their own services (T11, behavioural
       asResponse: true,
       rawResponse: true,
     });
+  });
+});
+
+describe('BridgeService Mini Discover: data views and ES|QL as the key (D1–D3)', () => {
+  const LIST = { op: 'kibana.dataViews.read', params: {} };
+  const GET = { op: 'kibana.dataViews.read', params: { id: 'kbn-apps-demo-logs' } };
+  const ESQL = (query = 'FROM kbn-apps-demo-logs-* | LIMIT 2') => ({
+    op: 'es.esql',
+    params: { query },
+  });
+  const esqlClient = (impl: () => Promise<unknown>) => ({ esql: { query: jest.fn(impl) } });
+  const responseError = (statusCode: number) =>
+    new errors.ResponseError({
+      statusCode,
+      body: { error: { reason: CANARY } },
+      headers: {},
+      warnings: null,
+      meta: {} as never,
+    });
+  const resultOf = (response: { body: unknown }) => (response.body as { result?: unknown }).result;
+  const reasons = (audit: () => Array<Record<string, any>>) =>
+    audit()
+      .filter((record) => record.app?.capability !== 'session.create')
+      .map((record) => record.event?.reason);
+
+  it('es.esql runs the app query with the key-scoped client and projects {columns, values}', async () => {
+    const es = esqlClient(async () => ({
+      took: 3,
+      is_partial: false,
+      columns: [
+        { name: '@timestamp', type: 'date' },
+        { name: 'message', type: 'text' },
+      ],
+      values: [
+        ['2026-11-05T10:00:00.000Z', '<img src=x onerror=alert(1)>'],
+        ['2026-11-05T09:00:00.000Z', ['a', 'b']],
+      ],
+    }));
+    const { service, caller, mint, asKey } = setup({ es });
+    const response = await service.execute(caller(), await mint(), ESQL());
+    expect(resultOf(response)).toStrictEqual({
+      columns: [
+        { name: '@timestamp', type: 'date' },
+        { name: 'message', type: 'text' },
+      ],
+      values: [
+        ['2026-11-05T10:00:00.000Z', '<img src=x onerror=alert(1)>'],
+        ['2026-11-05T09:00:00.000Z', ['a', 'b']],
+      ],
+    });
+    expect(asKey).toHaveBeenCalledTimes(1);
+    const [[params, options]] = es.esql.query.mock.calls as unknown as Array<
+      [unknown, Record<string, unknown>]
+    >;
+    expect(params).toStrictEqual({ query: 'FROM kbn-apps-demo-logs-* | LIMIT 2' });
+    expect(options).toMatchObject({ maxRetries: 0, requestTimeout: 5000 });
+    expect(options.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it('es.esql: ES 401/403 → native_denied, ES 400 (unknown or unauthorized index) → native_rejected; no ES text leaks', async () => {
+    for (const [status, reason] of [
+      [403, 'native_denied'],
+      [401, 'native_denied'],
+      [400, 'native_rejected'],
+      [500, 'native_failed'],
+    ] as const) {
+      const { service, caller, mint, audit } = setup({
+        es: esqlClient(async () => {
+          throw responseError(status);
+        }),
+      });
+      const response = await service.execute(caller(), await mint(), ESQL());
+      expect(code(response)).toBe(status === 500 ? 'app_unavailable' : 'app_denied');
+      expect(JSON.stringify(response)).not.toContain('CANARY');
+      expect(reasons(audit)).toEqual([reason]);
+    }
+  });
+
+  it('es.esql bounds: 4 KiB query, 500 rows and 960 KiB result; no command allowlist', async () => {
+    const rows = (count: number, cell = 'x') =>
+      esqlClient(async () => ({
+        columns: [{ name: 'm', type: 'keyword' }],
+        values: Array.from({ length: count }, () => [cell]),
+      }));
+    const base = 'FROM kbn-apps-demo-logs-* // ';
+    const sized = (bytes: number) => `${base}${'x'.repeat(bytes - base.length)}`;
+    const at = setup({ es: rows(1) });
+    expect(code(await at.service.execute(at.caller(), await at.mint(), ESQL(sized(4096))))).toBe(
+      'ok'
+    );
+    // Multibyte counts UTF-8 bytes: 1,366 x U+00E9 (2 bytes) = 2,732 code units but 4,097 bytes with base.
+    const over = setup({ es: rows(1) });
+    const handle = await over.mint();
+    expect(code(await over.service.execute(over.caller(), handle, ESQL(sized(4097))))).toBe(
+      'bridge_invalid_request'
+    );
+    expect(
+      code(
+        await over.service.execute(
+          over.caller(),
+          handle,
+          ESQL(`${base}${'\u00e9'.repeat((4097 - base.length + 1) / 2)}`)
+        )
+      )
+    ).toBe('bridge_invalid_request');
+    expect(over.asKey).not.toHaveBeenCalled();
+    for (const [es, expected] of [
+      [rows(500), 'ok'],
+      [rows(501), 'app_unavailable'],
+      [rows(1, 'y'.repeat(960 * 1024)), 'app_unavailable'],
+    ] as const) {
+      const s = setup({ es });
+      expect(code(await s.service.execute(s.caller(), await s.mint(), ESQL()))).toBe(expected);
+    }
+    // Commands are not filtered by Kibana: ENRICH reaches ES, which refuses it (empty cluster).
+    const enrich = setup({
+      es: esqlClient(async () => {
+        throw responseError(403);
+      }),
+    });
+    expect(
+      code(
+        await enrich.service.execute(
+          enrich.caller(),
+          await enrich.mint(),
+          ESQL('FROM kbn-apps-demo-logs-* | ENRICH p')
+        )
+      )
+    ).toBe('app_denied');
+  });
+
+  it('kibana.dataViews.read lists and reads data views through the self client, projected', async () => {
+    const self: HttpSelfScopedClient = {
+      fetch: jest.fn(async (path: string) => ({
+        fetchOptions: {} as never,
+        request: { url: `http://localhost:5601${path}` } as Request,
+        response: fakeResponse(
+          200,
+          JSON.stringify(
+            path === '/api/data_views'
+              ? {
+                  data_view: [
+                    {
+                      id: 'kbn-apps-demo-logs',
+                      title: 'kbn-apps-demo-logs-*',
+                      name: 'Demo logs',
+                      timeFieldName: '@timestamp',
+                      namespaces: ['default'],
+                      typeMeta: {},
+                    },
+                    { id: 'no-name', title: 'other' },
+                    { id: 'bad/id', title: 'skipped' },
+                  ],
+                }
+              : {
+                  data_view: {
+                    id: 'kbn-apps-demo-logs',
+                    title: 'kbn-apps-demo-logs-*',
+                    name: 'Demo logs',
+                    timeFieldName: '@timestamp',
+                    sourceFilters: [],
+                    fields: {
+                      message: {
+                        name: 'message',
+                        type: 'string',
+                        esTypes: ['text'],
+                        aggregatable: false,
+                        searchable: true,
+                        count: 0,
+                        format: { id: 'string' },
+                      },
+                      '@timestamp': {
+                        name: '@timestamp',
+                        type: 'date',
+                        esTypes: ['date'],
+                        aggregatable: true,
+                        searchable: true,
+                      },
+                    },
+                  },
+                }
+          )
+        ),
+      })) as never,
+    };
+    const { service, caller, mint } = setup({ self });
+    const handle = await mint();
+    expect(resultOf(await service.execute(caller(), handle, LIST))).toStrictEqual({
+      dataViews: [
+        {
+          id: 'kbn-apps-demo-logs',
+          name: 'Demo logs',
+          title: 'kbn-apps-demo-logs-*',
+          timeFieldName: '@timestamp',
+        },
+        { id: 'no-name', name: 'other', title: 'other', timeFieldName: null },
+      ],
+    });
+    expect(resultOf(await service.execute(caller(), handle, GET))).toStrictEqual({
+      id: 'kbn-apps-demo-logs',
+      name: 'Demo logs',
+      title: 'kbn-apps-demo-logs-*',
+      timeFieldName: '@timestamp',
+      fields: [
+        {
+          name: '@timestamp',
+          type: 'date',
+          esTypes: ['date'],
+          aggregatable: true,
+          searchable: true,
+        },
+        {
+          name: 'message',
+          type: 'string',
+          esTypes: ['text'],
+          aggregatable: false,
+          searchable: true,
+        },
+      ],
+    });
+    const calls = (self.fetch as jest.Mock).mock.calls.map(([path, options]) => {
+      const { signal, ...rest } = options;
+      return [path, rest, signal instanceof AbortSignal];
+    });
+    const pinned = {
+      target: 'local',
+      method: 'GET',
+      access: 'public',
+      version: '2023-10-31',
+      timeout: 5000,
+      asResponse: true,
+      rawResponse: true,
+    };
+    expect(calls).toStrictEqual([
+      ['/api/data_views', pinned, true],
+      ['/api/data_views/data_view/kbn-apps-demo-logs', pinned, true],
+    ]);
+  });
+
+  it('kibana.dataViews.read: native 400/403/404 → app_denied, other id or redirect fails closed, bad ids never reach Kibana', async () => {
+    for (const [self, expected, reason] of [
+      [makeSelf(403, { message: CANARY }), 'app_denied', 'native_denied'],
+      [makeSelf(404, { message: CANARY }), 'app_denied', 'native_denied'],
+      [
+        makeSelf(400, { message: 'Unable to bulk_get index-pattern' }),
+        'app_denied',
+        'native_rejected',
+      ],
+      [makeSelf(200, { data_view: { id: 'other', title: 't' } }), 'app_denied', 'native_denied'],
+      [
+        makeSelf(
+          200,
+          { data_view: { id: 'kbn-apps-demo-logs', title: 't' } },
+          'http://localhost:5601/login'
+        ),
+        'app_unavailable',
+        'native_failed',
+      ],
+    ] as const) {
+      const { service, caller, mint, audit } = setup({ self });
+      const response = await service.execute(caller(), await mint(), GET);
+      expect(code(response)).toBe(expected);
+      expect(JSON.stringify(response)).not.toContain('CANARY');
+      expect(reasons(audit)).toEqual([reason]);
+    }
+    const { service, caller, mint, selfClient } = setup();
+    const handle = await mint();
+    for (const id of ['..', '.', 'a/b', '', 'x'.repeat(129), 7]) {
+      expect(
+        code(
+          await service.execute(caller(), handle, { op: 'kibana.dataViews.read', params: { id } })
+        )
+      ).toBe('bridge_invalid_request');
+    }
+    expect(selfClient.fetch).not.toHaveBeenCalled();
+  });
+
+  it('scopes: a release without kibana.dataViews.read or es.esql refuses them before any I/O', async () => {
+    const narrow = uiManifest({
+      ui: { ...(manifest.ui as object), scopes: ['app.summary', 'es.search'] },
+    }) as never as ApprovedManifest;
+    const { service, caller, asKey, audit } = setup({ state: () => asApproved(narrow) });
+    const created = await service.createSession(caller(), 'alert-digest', narrow.releaseDigest);
+    const handle = (created.body as { handle: string }).handle;
+    expect(code(await service.execute(caller(), handle, LIST))).toBe('app_denied');
+    expect(code(await service.execute(caller(), handle, ESQL()))).toBe('app_denied');
+    expect(asKey).not.toHaveBeenCalled();
+    expect(reasons(audit)).toEqual(['scope_not_granted', 'scope_not_granted']);
   });
 });

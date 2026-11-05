@@ -6,11 +6,19 @@
  */
 
 import { UI_LIMITS } from '../../common/ui_protocol';
-import type { UiAppManifest } from '../package/manifest_schema';
+
+/** The approved-manifest fields the key is derived from (structural, so tooling can reuse it). */
+export interface AppKeyManifest {
+  readonly id: string;
+  readonly releaseDigest: string;
+  readonly permissions: { readonly indices: readonly string[] };
+  readonly ui: { readonly scopes: readonly string[] };
+}
 
 /** Kibana's ES application name for the default `kibana.index` (prototype: not configurable). */
 export const KIBANA_APPLICATION = 'kibana-.kibana';
 export const DASHBOARD_READ_PRIVILEGE = 'feature_dashboard_v2.read';
+export const DATA_VIEWS_READ_PRIVILEGE = 'feature_indexPatterns.read';
 
 /** Restricted API key request; shaped like the security service's `CreateRestAPIKeyParams`. */
 export interface AppKeyRequest {
@@ -36,13 +44,19 @@ export const appKeyName = (appId: string, releaseDigest: string): string =>
   `app:${appId}@${releaseDigest}`;
 
 /**
- * Derives the key's role descriptor from the approved manifest only: read on the granted indices,
- * Dashboard read in the session's space only with the `kibana.dashboard.read` scope, and nothing
- * else (no cluster privileges, no remote indices, no `run_as`). Elasticsearch intersects it with
+ * Derives the key's role descriptor from the approved manifest only: `read` and
+ * `view_index_metadata` on the granted indices and patterns, Dashboard read (`kibana.dashboard.read`)
+ * and Data Views read (`kibana.dataViews.read`) in the session's space only with their scopes, and
+ * nothing else (no cluster privileges, so no ES|QL `ENRICH` or inference; no remote indices; no
+ * `run_as`). Elasticsearch intersects it with
  * the viewer's own privileges (`limited_by`), so the key can never exceed viewer ∩ app.
  */
-export const appKeyRequest = (manifest: UiAppManifest, spaceId: string): AppKeyRequest => {
+export const appKeyRequest = (manifest: AppKeyManifest, spaceId: string): AppKeyRequest => {
   const { id, releaseDigest, permissions, ui } = manifest;
+  const kibanaPrivileges = [
+    ...(ui.scopes.includes('kibana.dashboard.read') ? [DASHBOARD_READ_PRIVILEGE] : []),
+    ...(ui.scopes.includes('kibana.dataViews.read') ? [DATA_VIEWS_READ_PRIVILEGE] : []),
+  ];
   return {
     name: appKeyName(id, releaseDigest),
     expiration: `${UI_LIMITS.sessionTtlMs / 1000}s`,
@@ -52,17 +66,18 @@ export const appKeyRequest = (manifest: UiAppManifest, spaceId: string): AppKeyR
         cluster: [],
         indices:
           permissions.indices.length > 0
-            ? [{ names: [...permissions.indices], privileges: ['read'] }]
+            ? [{ names: [...permissions.indices], privileges: ['read', 'view_index_metadata'] }]
             : [],
-        applications: ui.scopes.includes('kibana.dashboard.read')
-          ? [
-              {
-                application: KIBANA_APPLICATION,
-                privileges: [DASHBOARD_READ_PRIVILEGE],
-                resources: [`space:${spaceId}`],
-              },
-            ]
-          : [],
+        applications:
+          kibanaPrivileges.length > 0
+            ? [
+                {
+                  application: KIBANA_APPLICATION,
+                  privileges: kibanaPrivileges,
+                  resources: [`space:${spaceId}`],
+                },
+              ]
+            : [],
         run_as: [],
       },
     },

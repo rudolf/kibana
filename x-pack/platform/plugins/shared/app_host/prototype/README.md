@@ -16,9 +16,9 @@ the remote steps.
 | `kibana:config` | Write the git-ignored Kibana config `.local/kibana.app_host.yml` (0600, incl. the generated `.local/handle_key`) and `.local/kibana.app_host.k1.yml` (dev-only K1 input-schema bypass, add as a second `-c`) |
 | `seed` | Synthetic index (high/high/low, no aliases) and reader/no-index/no-feature roles and users |
 | `release` | Build the sample app; write `<sha256>.js` first, then atomically replace `manifest.json`. `--with-ui` also builds the UI IIFE and the UI envelope; `--approve-local-synthetic` runs the checked superuser approval and writes `.local/operator/consent.json` (0600) |
-| `ui:seed` | UI cut seed on top of `seed`: hostile `medium` record, a viewer-only index `kbn-apps-prototype-viewer-only` (K1), granted + ungranted synthetic dashboards, empty space `app-host-empty`, viewer matrix (`.local/ui_users.json`, never printed) |
+| `ui:seed` | UI cut seed on top of `seed`: hostile `medium` record, a viewer-only index `kbn-apps-prototype-viewer-only` (K1), granted + ungranted synthetic dashboards, empty space `app-host-empty`, Mini Discover data (`kbn-apps-demo-logs-a`/`-b`: 240 docs each over 24 h with `@timestamp`, `log.level`, `service.name`, `message`, three attacker-style messages; `kbn-apps-other-secret`: 5 docs outside the grant; data views `kbn-apps-demo-logs` and `kbn-apps-other-secret`), viewer matrix (`.local/ui_users.json`, never printed): viewer with demo/secret index read and the data view feature, no-index, no-dashboard, no-data-views, global-only, superuser |
 | `ui:operator` | Operator `disable` / `enable` / `status` / `reset` of the approval file (never reachable through the bridge). `disable` replaces the approval generation and `reset` deletes the record, so the next approval writes a new one (old handles are refused for good), then invalidate the app's session keys by name as `kibana_system` (`KIBANA_SYSTEM_AUTH`, local default `kibana_system:changeme`); a failed or partial invalidation is reported and exits 1 |
-| `ui:security` | K1–K6 (app session key) and the surviving T-suites, Playwright/API harness in Chromium/Firefox/WebKit; JSON report in `.local/ui_security-*.json`. `--suites t4tls --tls DIR` runs the SameSite=None HTTPS cookie fixture against Kibana started with `kibana:config -- --tls DIR` (see below) |
+| `ui:security` | K1–K6 (app session key), D1–D5 (`--suites discover`, Mini Discover; screenshots `.local/discover-<engine>.png`) and the T-suites, Playwright/API harness in Chromium/Firefox/WebKit; JSON report in `.local/ui_security-*.json`. `--suites t4tls --tls DIR` runs the SameSite=None HTTPS cookie fixture against Kibana started with `kibana:config -- --tls DIR` (see below) |
 | `acceptance` | Kibana-level M2/M3 assertions (authz, ES denial, package failures, limits, deadline, ...) |
 | `ui-check` | Page check of `/app/appHost` v1 → v2 via Refresh (uses the Kibana workspace's Playwright) |
 | `benchmark` | Fresh-invocation latency sample through Kibana (and optionally the raw seam) |
@@ -109,9 +109,10 @@ The total stays under 200 fresh invocations (~87). Cleanup (also needs approval)
   separate diagnostic probe (`probe*.ts`).
 - `shared/` wire protocol validation and the bounded WebSocket transport, used by the dispatcher and Node tools.
 - `app/src/` sample app: plain `Summary` class plus a native `WorkerEntrypoint` adapter (`App`).
-- `ui/src/` sample app UI (one classic IIFE: `main.ts` plus the small guest SDK `sdk.ts`); `ui/fixtures/hostile.ts`
+- `ui/src/` sample app UI (one classic IIFE: `main.ts`, the Mini Discover tile `discover.ts` and the small
+  guest SDK `sdk.ts`); `ui/fixtures/hostile.ts`
   is the deliberately hostile UI used by T1/T3–T6.
-- `scripts/lib/ui_suites/` the `ui:security` suites (`k_session.ts`: K1–K6); `scripts/lib/approval.ts` the
+- `scripts/lib/ui_suites/` the `ui:security` suites (`k_session.ts`: K1–K6; `d_discover.ts`: D1–D5); `scripts/lib/approval.ts` the
   local approval tool; `scripts/lib/app_keys.ts` operator-side key invalidation by name.
   `ui/fixtures/channels.ts` holds the T4 channel probes, shared by the hostile frame and by an ordinary
   control page (`ui/fixtures/channel_control.ts`) so that every claimed block has a working control.

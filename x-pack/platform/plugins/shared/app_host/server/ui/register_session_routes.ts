@@ -101,8 +101,7 @@ export const registerSessionRoutes = ({
           selfClient: start.http.selfClient.asScoped(kibanaRequestFactory({ headers })),
         };
       },
-      dashboardPathname: (id) =>
-        `${basePath.serverBasePath}/api/dashboards/${encodeURIComponent(id)}`,
+      selfPathname: (path) => `${basePath.serverBasePath}${path}`,
     };
   };
 
@@ -134,7 +133,8 @@ export const registerSessionRoutes = ({
     {
       path: UI_EXECUTE_PATH,
       security: { authz: { requiredPrivileges: [...APP_UI_PRIVILEGES] } },
-      options: { access: 'internal', body: { maxBytes: 4096 } },
+      // Room for the handle plus a 4 KiB ES|QL query (JSON-escaped).
+      options: { access: 'internal', body: { maxBytes: 16 * 1024 } },
       validate: {
         // The operation is parsed strictly by the closed union; config-schema only bounds it.
         body: schema.object({
