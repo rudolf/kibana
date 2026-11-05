@@ -24,25 +24,36 @@ export interface SearchResult {
   total: number;
   records: Array<{ severity: string; rule: string }>;
 }
-export interface DashboardPreview {
+/** `GET /api/dashboards/{id}` response, unchanged (typed only as far as this sample reads it). */
+export interface DashboardResponse {
   id: string;
-  title: string;
+  data: { title: string };
 }
 
-export interface DataViewListItem {
-  id: string;
-  name: string;
-  title: string;
-  timeFieldName: string | null;
+/** `GET /api/data_views` response, unchanged. */
+export interface DataViewListResponse {
+  data_view: Array<{ id: string; name?: string; title: string; timeFieldName?: string }>;
 }
-export interface DataView extends DataViewListItem {
-  fields: Array<{
-    name: string;
-    type: string;
-    esTypes: string[];
-    aggregatable: boolean;
-    searchable: boolean;
-  }>;
+export interface DataViewField {
+  name: string;
+  type: string;
+  esTypes?: string[];
+  aggregatable?: boolean;
+  searchable?: boolean;
+  runtimeField?: { type: string };
+  format?: { id: string; params?: Record<string, unknown> };
+}
+/** `GET /api/data_views/data_view/{id}` response, unchanged. */
+export interface DataViewResponse {
+  data_view: {
+    id: string;
+    name?: string;
+    title: string;
+    timeFieldName?: string;
+    fields: Record<string, DataViewField>;
+    runtimeFieldMap?: Record<string, { type: string }>;
+    fieldFormats?: Record<string, { id: string; params?: Record<string, unknown> }>;
+  };
 }
 export type EsqlValue = string | number | boolean | null | Array<string | number | boolean | null>;
 export interface EsqlResult {
@@ -53,9 +64,9 @@ export interface EsqlResult {
 export interface Bridge {
   callAppRoute(request: { method: 'GET'; path: '/summary' }): Promise<Summary>;
   search(request: { index: string; size: number }): Promise<SearchResult>;
-  getDashboardPreview(request: { id: string }): Promise<DashboardPreview>;
-  listDataViews(): Promise<DataViewListItem[]>;
-  getDataView(request: { id: string }): Promise<DataView>;
+  getDashboardPreview(request: { id: string }): Promise<DashboardResponse>;
+  listDataViews(): Promise<DataViewListResponse>;
+  getDataView(request: { id: string }): Promise<DataViewResponse>;
   esql(request: { query: string }): Promise<EsqlResult>;
   getTheme(): Promise<Theme>;
 }

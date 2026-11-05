@@ -26,9 +26,13 @@ import { i18n } from '@kbn/i18n';
 import { KbnDangerCallout, KbnWarningCallout } from '@kbn/ui-callout';
 import type { UiAppMetadata, UiTheme } from '../../common/ui_protocol';
 import { INSTALLED_APP_ID } from '../../common';
-import { UI_LIMITS, uiMetadataPath } from '../../common/ui_protocol';
-import { FrameHost, type FrameHostEndReason } from '../ui_host/frame_host';
-import type { BridgeExecutor } from '../ui_host/bridge_root';
+import {
+  UI_EXECUTE_PATH,
+  UI_LIMITS,
+  UI_SESSION_PATH,
+  uiMetadataPath,
+} from '../../common/ui_protocol';
+import { FrameHost, type BridgeWorkerLike, type FrameHostEndReason } from '../ui_host/frame_host';
 
 /** §1 required consent copy, shown in host chrome outside the frame. */
 export const CONSENT_COPY = i18n.translate('xpack.appHost.ui.consentCopy', {
@@ -40,31 +44,29 @@ export const LOCAL_PROCESSOR_COPY = i18n.translate('xpack.appHost.ui.localProces
     'This local demo runs its app server on local Wrangler. Cloudflare is a separate, not-yet-approved remote processor.',
 });
 
-export interface AppSession {
-  readonly executor: BridgeExecutor;
-}
-
-/** Mints the parent-held app session for an approved release; undefined while not wired (U1). */
-export type SessionFactory = (metadata: UiAppMetadata) => Promise<AppSession | undefined>;
-
 interface PageProps {
   readonly http: HttpStart;
-  readonly createSession?: SessionFactory;
+  /** Starts one dedicated bridge Worker per mounted frame. */
+  readonly createWorker: () => BridgeWorkerLike;
 }
 
 type FrameState =
   | { readonly status: 'none' }
   | { readonly status: 'loading' }
   | { readonly status: 'bound' }
-  | {
-      readonly status: 'ended';
-      readonly reason: FrameHostEndReason | 'session_failed';
-      readonly detail?: string;
-    };
+  | { readonly status: 'ended'; readonly reason: FrameHostEndReason; readonly detail?: string };
+
+/** Server rejections that end the frame and re-read the metadata (S10). */
+const RECHECK_REASONS: readonly FrameHostEndReason[] = [
+  'disabled',
+  'stale',
+  'expired',
+  'session_failed',
+];
 
 const fingerprint = (digest: string): string => digest.slice(0, 16);
 
-export const AppUiPage = ({ http, createSession }: PageProps) => {
+export const AppUiPage = ({ http, createWorker }: PageProps) => {
   const { euiTheme, colorMode } = useEuiTheme();
   const [metadata, setMetadata] = useState<UiAppMetadata | undefined>();
   const [loadError, setLoadError] = useState<string | undefined>();
@@ -75,9 +77,6 @@ export const AppUiPage = ({ http, createSession }: PageProps) => {
   const hostRef = useRef<FrameHost | undefined>();
   const themeRef = useRef<UiTheme>();
   const metadataRef = useRef<UiAppMetadata | undefined>();
-  // Bumped by every teardown (Disable, unmount, release change, disable/unapproval). An async mount
-  // only proceeds if its generation is still current after the session request settles.
-  const generationRef = useRef(0);
 
   themeRef.current = {
     mode: colorMode === 'DARK' ? 'dark' : 'light',
@@ -91,7 +90,6 @@ export const AppUiPage = ({ http, createSession }: PageProps) => {
   };
 
   const unmountFrame = useCallback((reason: FrameHostEndReason) => {
-    generationRef.current += 1;
     const host = hostRef.current;
     hostRef.current = undefined;
     host?.end(reason);
@@ -123,81 +121,49 @@ export const AppUiPage = ({ http, createSession }: PageProps) => {
   }, [http, unmountFrame]);
 
   // No polling: metadata is read on load and after a server rejection that ends the frame. The
-  // server rejects the next call authoritatively; unmount or navigation just drops the handle.
+  // server rejects the next call authoritatively; unmount or navigation terminates the Worker.
   useEffect(() => {
     refreshMetadata();
     return () => unmountFrame('unmounted');
   }, [refreshMetadata, unmountFrame]);
 
+  // The Worker mints the session; the frame mounts only after it reports success. Any teardown
+  // (Disable, unmount, release change) terminates the Worker, so a session still being minted
+  // never mounts or binds a frame.
   const mountFrame = useCallback(
-    async (current: UiAppMetadata) => {
+    (current: UiAppMetadata) => {
       const container = containerRef.current;
       if (!container || hostRef.current) return;
-      const generation = generationRef.current;
       setFrame({ status: 'loading' });
-      let session: AppSession | undefined;
-      try {
-        session = createSession ? await createSession(current) : undefined;
-      } catch {
-        if (generation === generationRef.current) {
-          setFrame({ status: 'ended', reason: 'session_failed' });
-          refreshMetadata();
-        }
-        return;
-      }
-      // P1: consent was withdrawn, the page unmounted or the release changed while the session was
-      // being minted. A stale session never mounts or binds a frame; its handle is dropped.
-      const latest = metadataRef.current;
-      if (
-        generation !== generationRef.current ||
-        hostRef.current ||
-        !containerRef.current?.isConnected ||
-        !latest ||
-        latest.releaseDigest !== current.releaseDigest ||
-        !latest.approved ||
-        !latest.enabled
-      ) {
-        return;
-      }
-      // Server rejection on the next call is authoritative: lifecycle codes tear the frame down and
-      // re-read the metadata once (a new release needs a new consent prompt, S10).
-      const terminal: Partial<Record<string, FrameHostEndReason>> = {
-        app_disabled: 'disabled',
-        app_stale: 'stale',
-        app_expired: 'expired',
-      };
-      const executor: BridgeExecutor | undefined = session
-        ? async (operation, signal) => {
-            const outcome = await session.executor(operation, signal);
-            const reason = outcome.ok ? undefined : terminal[outcome.code];
-            if (reason) {
-              setTimeout(() => {
-                host.end(reason);
-                refreshMetadata();
-              }, 0);
-            }
-            return outcome;
-          }
-        : undefined;
       const host: FrameHost = new FrameHost({
         container,
         guardianUrl: http.basePath.prepend(current.guardianPath),
         kibanaOrigin: window.location.origin,
-        grant: { scopes: current.scopes, dashboardIds: current.dashboardIds },
-        theme: () => themeRef.current as UiTheme,
-        executor,
+        createWorker,
+        workerInit: {
+          appId: current.appId,
+          releaseDigest: current.releaseDigest,
+          theme: themeRef.current as UiTheme,
+          sessionUrl: http.basePath.prepend(UI_SESSION_PATH),
+          executeUrl: http.basePath.prepend(UI_EXECUTE_PATH),
+        },
         onBound: () => setFrame({ status: 'bound' }),
         onEnded: (reason, detail) => {
-          if (hostRef.current === host) hostRef.current = undefined;
+          // Ended by the frame itself (not by the page's own unmount, Disable or metadata check).
+          const selfEnded = hostRef.current === host;
+          if (selfEnded) hostRef.current = undefined;
           // A new explicit click is required after any teardown.
           setConsentedDigest(undefined);
           setFrame({ status: 'ended', reason, detail });
+          // A server rejection is authoritative: re-read the metadata once, so a different release
+          // unmounts the old frame before its consent prompt appears (S10).
+          if (selfEnded && RECHECK_REASONS.includes(reason)) refreshMetadata();
         },
       });
       hostRef.current = host;
       host.start();
     },
-    [createSession, http.basePath, refreshMetadata]
+    [createWorker, http.basePath, refreshMetadata]
   );
 
   const usable = metadata?.approved && metadata.enabled;

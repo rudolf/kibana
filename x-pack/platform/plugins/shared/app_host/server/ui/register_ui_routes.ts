@@ -12,6 +12,8 @@ import { UI_SECURITY_PROFILE } from '../../common/ui_contract';
 import type { UiAppMetadata } from '../../common/ui_protocol';
 import {
   API_PRIVILEGE_APP_ALERT_DIGEST,
+  BRIDGE_WORKER_ASSET_FILE,
+  CAPNWEB_ASSET_FILE,
   CHILD_BOOTSTRAP_ASSET_FILE,
   GUARDIAN_ASSET_FILE,
   LOCAL_DEMO_PUBLISHER,
@@ -23,8 +25,18 @@ import {
 import { VerifiedAssetCache } from './asset_cache';
 import { readUiReleaseState, type UiReleaseState } from './consent';
 import { renderFrameDocument, renderGuardianDocument } from './documents';
-import { CHILD_BOOTSTRAP_SCRIPT, GUARDIAN_SCRIPT } from './host_scripts';
-import { childPolicy, guardianPolicy, type SurfaceDecisions } from './security_headers';
+import {
+  BRIDGE_WORKER_SCRIPT,
+  CHILD_BOOTSTRAP_SCRIPT,
+  GUARDIAN_SCRIPT,
+  capnwebWorkerScript,
+} from './host_scripts';
+import {
+  childPolicy,
+  guardianPolicy,
+  workerPolicy,
+  type SurfaceDecisions,
+} from './security_headers';
 import { isDefaultSpace, type UiUrls } from './ui_context';
 
 export const APP_UI_PRIVILEGES = [API_PRIVILEGE_READ, API_PRIVILEGE_APP_ALERT_DIGEST] as const;
@@ -46,6 +58,14 @@ const JS_HEADERS = {
 } as const;
 
 const hasQuery = (request: KibanaRequest): boolean => request.url.search !== '';
+
+/** Fixed host-owned scripts, served by name. */
+const HOST_SCRIPTS: ReadonlyMap<string, () => string> = new Map([
+  [GUARDIAN_ASSET_FILE, () => GUARDIAN_SCRIPT],
+  [CHILD_BOOTSTRAP_ASSET_FILE, () => CHILD_BOOTSTRAP_SCRIPT],
+  [BRIDGE_WORKER_ASSET_FILE, () => BRIDGE_WORKER_SCRIPT],
+  [CAPNWEB_ASSET_FILE, capnwebWorkerScript],
+]);
 
 export const registerUiRoutes = ({
   router,
@@ -124,12 +144,14 @@ export const registerUiRoutes = ({
       const { file } = request.params;
       if (hasQuery(request) || !isDefaultSpace(basePath, request)) return response.notFound();
       const asset = { kind: 'asset', policy: UI_SECURITY_PROFILE.assetCsp } as const;
-      if (file === GUARDIAN_ASSET_FILE || file === CHILD_BOOTSTRAP_ASSET_FILE) {
-        decisions.set(request, asset);
-        return response.ok({
-          body: file === GUARDIAN_ASSET_FILE ? GUARDIAN_SCRIPT : CHILD_BOOTSTRAP_SCRIPT,
-          headers: JS_HEADERS,
-        });
+      const hostScript = HOST_SCRIPTS.get(file);
+      if (hostScript) {
+        // The bridge Worker's own policy governs what it may import and call.
+        decisions.set(
+          request,
+          file === BRIDGE_WORKER_ASSET_FILE ? { kind: 'worker', policy: workerPolicy(urls) } : asset
+        );
+        return response.ok({ body: hostScript(), headers: JS_HEADERS });
       }
       const match = /^([0-9a-f]{64})\.js$/.exec(file);
       if (!match) return response.notFound();

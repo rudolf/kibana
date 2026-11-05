@@ -4,7 +4,8 @@ Prototype plugin that runs one operator-installed backend app bundle in a fresh 
 Worker. It gives the app a request-scoped, read-only Elasticsearch capability for the current user,
 and renders the app's result on a static host page. With an operator approval file it also hosts the
 app's own UI in a guardian-wrapped, opaque-origin iframe with a typed bridge whose calls run as a
-restricted, short-lived Elasticsearch API key (the synthetic, local-only UI cut below). The sample
+restricted, short-lived Elasticsearch API key (the synthetic, local-only UI cut below). The bridge runs
+in a dedicated Web Worker per app frame, off the Kibana UI thread. The sample
 app's UI includes a **Mini Discover** tile that lists and reads Kibana data views and runs ES|QL, all as
 that key. It is **disabled by default**, is not production code, and does not offer an SDK, install API,
 saved objects or tasks. App-authored browser code never runs in Kibana's origin.
@@ -57,32 +58,49 @@ U1 — browser shell (no data capability):
 - Documents `GET /api/app_host/ui/{appId}/{releaseDigest}/{guardian|frame}`: both privileges, approved and
   enabled release only, default space only, `Sec-Fetch-Dest: iframe` only (else 403 JSON), no query
   string, fixed generated HTML with server-derived values in a JSON data block.
-- Assets `GET /api/app_host/ui_assets/{file}`: the two fixed host scripts (`host-guardian.js`,
-  `host-child.js`) and the approved UI bundle `<uiDigest>.js` (≤512 KiB; its verified bytes are cached by
-  digest and re-hashed only when the approved digest or the file's inode/size/mtime changes, F3). Public, `application/javascript`, `Content-Disposition: attachment`, `nosniff`, response
-  sandbox. Anything else (unknown, unapproved, disabled, tampered) is **404**, never 401/403 (S6).
+- Assets `GET /api/app_host/ui_assets/{file}`: the fixed host scripts (`host-guardian.js`,
+  `host-child.js`, the bridge Worker `host-bridge-worker.js` and `host-capnweb.js`, capnweb's installed
+  CommonJS build wrapped to define `self.capnweb` for the Worker's `importScripts`) and the approved UI
+  bundle `<uiDigest>.js` (≤512 KiB; its verified bytes are cached by digest and re-hashed only when the
+  approved digest or the file's inode/size/mtime changes, F3). Public, `application/javascript`,
+  `Content-Disposition: attachment`, `nosniff`; response sandbox on all but the Worker script, which gets
+  the Worker policy instead. Anything else (unknown, unapproved, disabled, tampered) is **404**, never
+  401/403 (S6).
 - A post-Core `onPreResponse` hook composes the final-wire headers on every App Host path (`/api/app_host/`,
   `/internal/app_host/`, `/api/apps/`), including 4xx/5xx: Core's enforcing policy rebuilt from
   `http.csp.header` minus `report-uri`/`report-to`/`'report-sample'` (S1), then the strict surface policy
-  (guardian, child, asset or JSON), an empty `Content-Security-Policy-Report-Only`, and post-Core
+  (guardian, child, Worker, asset or JSON), an empty `Content-Security-Policy-Report-Only`, and post-Core
   `Referrer-Policy: no-referrer`, a deny-all `Permissions-Policy`, `X-DNS-Prefetch-Control: off`,
   `Cache-Control: no-store` and `nosniff` (S2). Other Kibana routes are untouched.
-- Handshake: the parent creates one RPC `MessageChannel` and one control channel, posts them to the
+- Handshake: the parent creates one RPC `MessageChannel`, transfers one end to its bridge Worker and,
+  once the Worker reports a minted session, posts the other end and one control channel to the
   guardian (exact Kibana origin). The guardian accepts exactly two handshake messages, checking
   `event.source`/origin before reading data (S4): the parent's init and the child's echo of a one-time
   challenge it sends on the child's first load. It then transfers the RPC port once and removes its
   listeners. Any later child or guardian load revokes; nothing is rebound. The host child bootstrap
   clears `window.name`, answers the challenge, then loads only the verified UI bundle. Lifecycle notices
   use the control port; the parent has no window `message` listener.
-- Parent RPC: capnweb `RpcSession` over a bounded string-only port transport (1 MiB UTF-8 per frame,
-  4 MiB / 1,024-frame queue, `messageerror` terminates; depth 12, BigInt 64, 8 invalid calls
-  terminate). There is no streaming: one result travels in one frame, so large results are capped
-  below the frame size (960 KiB). These are structural memory bounds, not usage quotas; there are no rate limits. The cap of 128 live capnweb imports + exports is checked by the
-  transport each time capnweb asks for the next frame and after every send, so protocol-only growth
-  (retained pushes, guest-exported stubs, unknown-method pipelines) terminates the session too
-  (`live_stubs`), not only bridge-method entry. Depth and BigInt breaches terminate with
-  `depth_exceeded` / `bigint_too_large`. Errors sent to the guest carry no stack in any engine (an own
-  empty `stack` shadows Firefox's inherited accessor). No global message dispatcher.
+- **Bridge Worker** (`server/ui/host_scripts.ts`, served as `host-bridge-worker.js`): one dedicated
+  Worker per app frame, owned by the parent page, which Kibana's CSP already permits (`worker-src
+  'self'`). Its response policy is Core's plus `default-src 'none'; script-src <host-capnweb.js>;
+  connect-src <session URL> <execute URL>`, so it can import only capnweb and call only those two
+  routes. It takes exactly one init message (`{appId, releaseDigest, theme, sessionUrl, executeUrl}`
+  and its port), mints the app session, then runs the capnweb `RpcSession` and the typed methods
+  (below), calling `/internal/app_host/ui/execute` with `kbn-xsrf` and `x-elastic-internal-origin:
+  Kibana` (internal routes are not versioned; the URLs carry the base path). The handle exists only in
+  the Worker and in the request bodies it sends. The parent keeps lifecycle only: consent, Disable,
+  mount and unmount, and `worker.terminate()` on teardown, on a server rejection (`app_disabled`,
+  `app_stale`, `app_expired`, a failed mint) and on a Worker error. Worker → parent messages are
+  `{t: 'ready'}` and `{t: 'end', reason}` only.
+- The Worker's one bound is its receive queue: bytes of guest frames waiting for capnweb (2 bytes per
+  UTF-16 code unit), 8 MiB. Overflow, a non-string frame or `messageerror` ends the session; the parent
+  terminates the Worker and removes the frame. capnweb's own deserialization defaults apply (depth 256,
+  BigInt 16,384 digits, 32 Mi code units per message). There is no frame cap, stub cap or
+  invalid-call counter, and no rate limits. Errors sent to the guest carry only a fixed code and no
+  stack (an own empty `stack` shadows Firefox's inherited accessor). No global message dispatcher.
+- A CPU-busy loop in the app frame itself still blocks the Kibana main thread in all three tested
+  engines (same-site frames share the renderer thread; see `prototype/RESULTS.md`). Separate-site
+  hosting would fix that; the Worker does not.
 
 U2 — delegation and consent:
 
@@ -110,7 +128,8 @@ U2 — delegation and consent:
 - Fixed per-app privilege `read_app_alert_digest` (feature `appHostAlertDigest`), required **with**
   `read_app_host` for metadata, documents, sessions, execution and the native summary.
 - **App session = restricted API key** (spec `kibana-apps-key-session-spec.md`). When the viewer clicks
-  **Allow this version**, the parent calls `POST /internal/app_host/ui/session` `{appId, releaseDigest}`
+  **Allow this version**, the parent starts the bridge Worker, which calls `POST
+  /internal/app_host/ui/session` `{appId, releaseDigest}`
   (authenticated, both privileges, Kibana XSRF, exact configured `Origin`, default space, no run_as; the
   release must be enabled and approved). The server mints one key with the security service's
   `grantAsInternalUser` from the viewer's own credentials: name `app:{appId}@{releaseDigest}`, metadata
@@ -129,30 +148,32 @@ U2 — delegation and consent:
   space, principal, generation, exp}` with AAD `app|release|space|principal|generation`
   (`server/ui/session_handle.ts`). It is
   stateless: nothing is stored and any node with the same key can open it. The raw API key never
-  leaves the Kibana server process (not to parent JS, the frame, the port, the Worker, logs or audit).
-- `POST /internal/app_host/ui/execute` `{handle, op, params}` (same route checks, body ≤ 16 KiB). The server opens
+  leaves the Kibana server process (not to the page, the bridge Worker, the frame, the port, the
+  backend Worker, logs or audit).
+- `POST /internal/app_host/ui/execute` `{handle, op, params}` (same route checks, Kibana's default body
+  limit). The server opens
   the handle (tampered, another principal or space → `app_denied`; expired → `app_expired`), reads
   enablement, approval and generation (a cached read ≤ 2 s may only accept; refusals use a fresh read;
   disabled → `app_disabled`, release or generation changed → `app_stale`),
   validates the closed operation union, scope, the exact synthetic index and size, the declared
-  dashboard id, the data view id syntax and the ES|QL query size **as input validation only**, then runs
-  the operation **as the key**:
+  dashboard id, the data view id syntax and a non-empty ES|QL query **as input validation only**, then
+  runs the operation **as the key**:
   - `es.search` via `elasticsearch.client.asScoped({headers: {authorization: 'ApiKey …'}})`;
   - `kibana.dashboard.read` via the local `selfClient` on a fake request carrying the same header
-    (`GET /api/dashboards/{id}` version `2023-10-31`; fails closed on redirects, non-200, bodies over
-    256 KiB and `body.id !== grantedId`, S5);
-  - `kibana.dataViews.read` the same way: `GET /api/data_views` → `{dataViews: [{id, name, title,
-    timeFieldName}]}`, `GET /api/data_views/data_view/{id}` → `{id, name, title, timeFieldName,
-    fields: [{name, type, esTypes, aggregatable, searchable}]}` (`server/ui/data_views.ts`; redirect,
-    non-200 and bodies over 4 MiB fail closed, the returned id must equal the requested one). Data
-    view ids are `[A-Za-z0-9_][A-Za-z0-9_.:*-]*`, ≤ 128 characters;
-  - `es.esql` via `esql.query` on the key-scoped ES client (`server/ui/esql.ts`): any query of at most
-    4 KiB UTF-8, no command allowlist, `maxRetries: 0`, request timeout and response read bounded
-    (5 s, 4 MiB); the projected `{columns: [{name, type}], values}` is refused (`app_unavailable`) above
-    500 rows;
-  - `app.summary` → Worker → `HostEs` callbacks with the same key-scoped client.
+    (`GET /api/dashboards/{id}` version `2023-10-31`): the Dashboard API response unchanged; fails
+    closed on redirects (the final URL must equal the fixed path), non-200 and `body.id !== grantedId`
+    (S5);
+  - `kibana.dataViews.read` the same way: `GET /api/data_views` and `GET
+    /api/data_views/data_view/{id}`, the Data Views API responses unchanged (runtime fields and field
+    formats included; `server/ui/data_views.ts`; redirects and non-200 fail closed). Data view ids are
+    `[A-Za-z0-9_][A-Za-z0-9_.:*-]*`, ≤ 128 characters;
+  - `es.esql` via `esql.query` on the key-scoped ES client (`server/ui/esql.ts`): any non-empty query,
+    no command allowlist, `maxRetries: 0`, 5 s request timeout; the response's `columns` and `values`
+    as Elasticsearch sent them. Row limits are Elasticsearch's (the query's `LIMIT` and the cluster's
+    ES|QL limits);
+  - `app.summary` → backend Worker → `HostEs` callbacks with the same key-scoped client.
 
-  Results are capped at 16 KiB (960 KiB for data views and ES|QL). 5 s deadline. Native refusals map
+  No result size caps. 5 s deadline. Native refusals map
   to `app_denied`, with the audit reason `native_denied` for a 401/403/404 and `native_rejected` for a
   400: ES|QL reports an index the key may not read exactly like a missing one (`400 Unknown index`), and
   the Data Views API reports an unauthorized saved-object read as `400 Unable to bulk_get
@@ -170,7 +191,7 @@ U2 — delegation and consent:
   key minted less than one `.security` refresh earlier; the generation makes that key's handle useless.
   Restoring the exact approved release while the app stays enabled (no disable, uninstall or new
   approval in between) keeps the generation, so unexpired handles for it work again. Unmount or
-  navigation just drops the handle in the parent; no server call.
+  navigation terminates the bridge Worker and with it the handle; no server call.
 - There are no rate limits, budgets, operation counters or in-flight caps on the UI path. Abuse
   is handled by audit plus disable; ES-native protections (search timeouts,
   `search.max_buckets`, circuit breakers) cover node safety.
@@ -178,15 +199,18 @@ U2 — delegation and consent:
   egress-side-effect and reference-accepting capabilities. The never-delegable list is enforced by *not
   granting* it in the key's role descriptor plus the typed surface. Minting the session key is a
   host-internal broker on consent, never an app capability.
-- Parent bridge: exactly `callAppRoute({method:'GET', path:'/summary'})`, `search({index, size})`,
-  `getDashboardPreview({id})`, `listDataViews()`, `getDataView({id})`, `esql({query})`, `getTheme()`;
-  plain-data arguments only; results are forwarded only in their exact projected shapes; the handle stays in the parent's
-  closure and travels only in the execute JSON body. No metadata polling: the page reads metadata on
-  load and once more after a server rejection that ends the frame (`app_disabled`, `app_stale`,
-  `app_expired`), so a different release unmounts the old frame before its consent prompt appears (S10).
-  An expired handle is re-minted once per call, only inside the session created by this page's consent.
-  A session that is still being minted when consent is withdrawn (Disable), the page unmounts or the
-  release changes never mounts or binds a frame (generation check).
+- Bridge methods (in the Worker): exactly `callAppRoute({method:'GET', path:'/summary'})`,
+  `search({index, size})`, `getDashboardPreview({id})`, `listDataViews()`, `getDataView({id})`,
+  `esql({query})`, `getTheme()`. The Worker checks arity and plain-data arguments (JSON values only:
+  functions, stubs, thenables and class instances are refused) and that `callAppRoute` names `GET
+  /summary`, then forwards `{op, params}`; the server validates everything else. Results are forwarded
+  as the server returned them; the handle travels only in the execute JSON body. No metadata polling:
+  the page reads metadata on load and once more after a server rejection that ends the frame
+  (`app_disabled`, `app_stale`, `app_expired`, a failed mint), so a different release unmounts the old
+  frame before its consent prompt appears (S10). An expired handle is re-minted once per call, only
+  inside the Worker started by this page's consent. The frame mounts only after the Worker reports a
+  minted session; withdrawing consent (Disable), unmounting or a release change terminates the Worker
+  first, so a session still being minted never mounts or binds a frame.
 - **K1 fault injection (dev-only).** `xpack.app_host.testOnlySkipInputSchema: true` skips the scope,
   index-literal and dashboard-id input checks so that Elasticsearch and Kibana must deny on their own. The
   setting exists only in dev mode (`--dev`); any value outside dev mode fails config validation. It is
@@ -205,15 +229,15 @@ U3 — adversarial demo and attribution:
   none in legacy mode) (F7).
 
 Mini Discover (sample UI, `prototype/ui/src/discover.ts`): plain DOM in the same classic IIFE, no EUI. A
-data view picker filled from `listDataViews()`; on selection `getDataView({id})` lists the fields and
-prefills an editable ES|QL box with `FROM <title> | SORT <timeField> DESC | LIMIT 50`; **Run** renders a
+data view picker filled from `listDataViews()` (`data_view[]`); on selection `getDataView({id})` lists
+the fields of the returned `data_view` (runtime fields marked) and prefills an editable ES|QL box with `FROM <title> | SORT <timeField> DESC | LIMIT 50`; **Run** renders a
 results table and a second query, `FROM <title> | STATS c = COUNT(*) BY b = BUCKET(<timeField>, 1 hour) |
 SORT b`, renders a bar chart of DOM elements. Every value is set with `textContent`; errors show their
 uniform code. What the app can read is decided natively: index patterns by ES through the key (a data
 view on an index outside the grant is listed, because Kibana privileges are per saved-object type, but
 any query against its index is refused by ES), data views by Kibana's saved-object authorization for the
 key. Note that `feature_dashboard_v2.read` also grants `index-pattern` read, so a release that keeps
-`kibana.dashboard.read` but drops `kibana.dataViews.read` is refused data views only by the bridge's
+`kibana.dashboard.read` but drops `kibana.dataViews.read` is refused data views only by the server's
 scope check, not by Kibana.
 
 Backend (Node ↔ dispatcher) capnweb sessions use `maxMessageSize: 256 KiB`, `maxDepth: 32` and `maxBigIntDigits: 64`, plus a

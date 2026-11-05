@@ -226,8 +226,7 @@ const bridgeProbes = async () => {
   await call('summary', () => bridge.callAppRoute({ method: 'GET', path: '/summary' }));
   await call('search', () => bridge.search({ index: 'kbn-apps-prototype-alerts', size: 100 }));
   await call('dashboard', () => bridge.getDashboardPreview({ id: __DASHBOARD_ID__ }));
-  // A few out-of-grant attempts in the auto-run; the full corpus is `run.bridgeCase(name)` (too many
-  // invalid calls terminate the session by design).
+  // A few out-of-grant attempts in the auto-run; the full corpus is `run.bridgeCase(name)`.
   await call('otherIndex', () => raw.search({ index: '.security-7', size: 1 }));
   await call('ungrantedDashboard', () =>
     raw.getDashboardPreview({ id: '00000000-0000-4000-8000-000000000000' })
@@ -405,9 +404,44 @@ probe.run.flood = async () => {
   }
   return `posted 2000 x 1MiB in ${Date.now() - started}ms`;
 };
-probe.run.oversizedFrame = () => {
-  heldPort?.postMessage('x'.repeat(1024 * 1024 + 1));
+// W1: one frame larger than the bridge Worker's receive queue (5 Mi code units = 10 MiB).
+probe.run.overflow = () => {
+  heldPort?.postMessage('x'.repeat(5 * 1024 * 1024));
   return heldPort ? 'sent' : 'no-port';
+};
+// W1: sustained bridge load for `ms`: bursts of 8 large (256 KiB argument, refused by the Worker)
+// and 8 small calls, awaited per burst; the Worker parses and answers every one.
+probe.run.spam = async (ms) => {
+  const raw = heldBridge as Record<string, (...args: unknown[]) => Promise<unknown>> | undefined;
+  if (!raw) return 'no-bridge';
+  const big = 'x'.repeat(256 * 1024);
+  const end = Date.now() + Number(ms);
+  let calls = 0;
+  let refused = 0;
+  let themes = 0;
+  while (Date.now() < end) {
+    const burst: Array<Promise<unknown>> = [];
+    for (let i = 0; i < 8; i++) {
+      burst.push(raw.getTheme(big).catch((error) => errorCode(error)));
+      burst.push(raw.getTheme());
+    }
+    calls += burst.length;
+    for (const result of await Promise.all(burst)) {
+      if (result === 'bridge_invalid_request') refused += 1;
+      else if ((result as { mode?: string } | undefined)?.mode) themes += 1;
+    }
+  }
+  return `calls=${calls} refused=${refused} themes=${themes}`;
+};
+// Honest limitation probe: a CPU-busy loop in the frame itself, started after the harness returns.
+probe.run.busySoon = (ms) => {
+  setTimeout(() => {
+    const end = performance.now() + Number(ms);
+    while (performance.now() < end) {
+      // busy
+    }
+  }, 50);
+  return 'scheduled';
 };
 
 // Click-activated probes (real user activation via the harness's frame.click()).

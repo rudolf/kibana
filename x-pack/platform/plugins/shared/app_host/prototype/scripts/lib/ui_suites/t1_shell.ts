@@ -67,6 +67,12 @@ export const guardianPolicyFor = (ctx: SuiteContext, releaseDigest: string) =>
     .replace('{childDocument}', `${ctx.kibana}/api/app_host/ui/alert-digest/${releaseDigest}/frame`)
     .replace('{origin}', ctx.kibana);
 
+export const workerPolicyFor = (ctx: SuiteContext) =>
+  UI_SECURITY_PROFILE.workerCsp
+    .replace('{capnwebScript}', `${ctx.kibana}/api/app_host/ui_assets/host-capnweb.js`)
+    .replace('{sessionUrl}', `${ctx.kibana}/internal/app_host/ui/session`)
+    .replace('{executeUrl}', `${ctx.kibana}/internal/app_host/ui/execute`);
+
 export const childPolicyFor = (ctx: SuiteContext, uiDigest: string) =>
   UI_SECURITY_PROFILE.childCsp
     .replace('{bootstrapScript}', `${ctx.kibana}/api/app_host/ui_assets/host-child.js`)
@@ -200,17 +206,20 @@ export const runT1Http = async (ctx: SuiteContext) => {
     );
   }
 
-  for (const [name, file] of [
-    ['guardian asset', 'host-guardian.js'],
-    ['child bootstrap asset', 'host-child.js'],
-    ['ui asset', `${manifest.ui.digest}.js`],
+  for (const [name, file, policy] of [
+    ['guardian asset', 'host-guardian.js', UI_SECURITY_PROFILE.assetCsp],
+    ['child bootstrap asset', 'host-child.js', UI_SECURITY_PROFILE.assetCsp],
+    ['capnweb asset', 'host-capnweb.js', UI_SECURITY_PROFILE.assetCsp],
+    ['bridge Worker asset', 'host-bridge-worker.js', workerPolicyFor(ctx)],
+    ['ui asset', `${manifest.ui.digest}.js`, UI_SECURITY_PROFILE.assetCsp],
   ] as const) {
     const response = await kfetch(ctx, `/api/app_host/ui_assets/${file}`);
     if (name === 'ui asset') headerDumps.asset = dump(response);
-    const problems = appSurfaceProblems(response, UI_SECURITY_PROFILE.assetCsp);
+    if (name === 'bridge Worker asset') headerDumps.worker = dump(response);
+    const problems = appSurfaceProblems(response, policy);
     report.expect(
       T,
-      `${name}: JS + attachment + nosniff + sandbox (unauthenticated)`,
+      `${name}: JS + attachment + nosniff + its surface policy (unauthenticated)`,
       engine,
       response.status === 200 &&
         /^application\/javascript/.test(response.headers['content-type'] ?? '') &&

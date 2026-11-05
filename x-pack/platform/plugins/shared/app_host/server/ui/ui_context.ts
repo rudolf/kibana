@@ -7,8 +7,11 @@
 
 import type { IBasePath, KibanaRequest } from '@kbn/core/server';
 import {
+  CAPNWEB_ASSET_FILE,
   CHILD_BOOTSTRAP_ASSET_FILE,
   GUARDIAN_ASSET_FILE,
+  UI_EXECUTE_PATH,
+  UI_SESSION_PATH,
   uiAssetPath,
   uiDocumentPath,
 } from '../../common/ui_protocol';
@@ -22,6 +25,9 @@ export class UiUrls implements UiPolicyUrls {
   readonly origin: string;
   readonly guardianScript: string;
   readonly bootstrapScript: string;
+  readonly capnwebScript: string;
+  readonly sessionUrl: string;
+  readonly executeUrl: string;
   readonly #base: string;
 
   constructor(publicBaseUrl: string) {
@@ -33,6 +39,9 @@ export class UiUrls implements UiPolicyUrls {
     this.#base = `${url.origin}${url.pathname.replace(/\/$/, '')}`;
     this.guardianScript = this.absolute(uiAssetPath(GUARDIAN_ASSET_FILE));
     this.bootstrapScript = this.absolute(uiAssetPath(CHILD_BOOTSTRAP_ASSET_FILE));
+    this.capnwebScript = this.absolute(uiAssetPath(CAPNWEB_ASSET_FILE));
+    this.sessionUrl = this.absolute(UI_SESSION_PATH);
+    this.executeUrl = this.absolute(UI_EXECUTE_PATH);
   }
 
   absolute(path: string): string {

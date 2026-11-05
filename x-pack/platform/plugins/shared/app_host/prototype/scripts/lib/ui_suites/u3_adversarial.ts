@@ -57,15 +57,38 @@ export const runIn = (child: Frame, name: string, marker: string): Promise<unkno
     ] as const)
     .catch((error) => `evaluate-ended:${String(error).slice(0, 60)}`);
 
-/** Records every window/port postMessage payload (all frames) for the secret-canary check. */
+/**
+ * Records, in every frame, each window, port and Worker message payload sent, every message received
+ * on a port through `onmessage` (the guest's end of the bridge) and every message the page receives
+ * from a Worker, for the secret-canary checks. Payloads are recorded whole.
+ */
 export const POST_RECORDER = `(() => {
   const seen = [];
   Object.defineProperty(window, '__posted', { value: seen });
-  const record = (value) => { try { seen.push(typeof value === 'string' ? value.slice(0, 4096) : JSON.stringify(value)); } catch (e) { seen.push('[unserializable]'); } };
+  const record = (value) => { try { seen.push(typeof value === 'string' ? value : JSON.stringify(value)); } catch (e) { seen.push('[unserializable]'); } };
   const windowPost = Window.prototype.postMessage;
   Window.prototype.postMessage = function (message, ...rest) { record(message); return windowPost.call(this, message, ...rest); };
   const portPost = MessagePort.prototype.postMessage;
   MessagePort.prototype.postMessage = function (message, ...rest) { record(message); return portPost.call(this, message, ...rest); };
+  const onmessage = Object.getOwnPropertyDescriptor(MessagePort.prototype, 'onmessage');
+  Object.defineProperty(MessagePort.prototype, 'onmessage', {
+    configurable: true,
+    get: onmessage.get,
+    set(handler) {
+      onmessage.set.call(this, typeof handler === 'function' ? function (event) { record(event.data); return handler.call(this, event); } : handler);
+    },
+  });
+  if (typeof Worker === 'function') {
+    const workerPost = Worker.prototype.postMessage;
+    Worker.prototype.postMessage = function (message, ...rest) { record(message); return workerPost.call(this, message, ...rest); };
+    const NativeWorker = Worker;
+    window.Worker = function (...args) {
+      const worker = new NativeWorker(...args);
+      worker.addEventListener('message', (event) => record(event.data));
+      return worker;
+    };
+    window.Worker.prototype = NativeWorker.prototype;
+  }
 })();`;
 
 /** Disable via the trusted chrome (the parent drops its handle) before reloading a page. */
@@ -166,7 +189,7 @@ export const runT3 = async (ctx: SuiteContext) => {
           T,
           'compromised UI: out-of-grant and non-delegable attempts denied with their exact codes',
           engine,
-          b.otherIndex === 'err:bridge_invalid_request' &&
+          b.otherIndex === 'err:app_denied' &&
             b.ungrantedDashboard === 'err:app_denied' &&
             b.unknownMethod === 'err:app_unavailable',
           {
@@ -208,17 +231,21 @@ export const runT3 = async (ctx: SuiteContext) => {
           ),
           { capabilities: permitted.map((r) => r.app?.capability) }
         );
-        // The hostile run's out-of-grant attempts (other index, ungranted dashboard, unknown method)
-        // are refused by the parent and never reach the server: no failure records, while the
-        // permitted reads above (positive control) are recorded.
+        // The hostile run's out-of-grant reads (other index, ungranted dashboard) are refused by the
+        // server before any I/O and audited as such; the unknown method never leaves the bridge
+        // Worker. The permitted reads above are recorded too.
         const serverFailures = mine.filter(
           (r) => r.event?.outcome === 'failure' && r.app?.via === 'bridge'
         );
         report.expect(
           T,
-          'local-only parent rejections are not server audit events (permitted reads are)',
+          'out-of-grant reads are refused by the server and audited (resource_not_granted, app attributed); the unknown method never reaches it',
           engine,
-          permitted.length >= 3 && serverFailures.length === 0,
+          permitted.length >= 3 &&
+            serverFailures.length === 2 &&
+            serverFailures.every(
+              (r) => r.event?.reason === 'resource_not_granted' && r.app?.id === 'alert-digest'
+            ),
           {
             permitted: permitted.length,
             serverFailures: serverFailures.map((r) => r.event?.reason),
@@ -232,37 +259,27 @@ export const runT3 = async (ctx: SuiteContext) => {
   }
 };
 
-/** Expected public code for each named abuse case (asserted exactly). */
-const ABUSE_EXPECTED: Record<string, string> = {
-  otherRoute: 'err:bridge_invalid_request',
-  traversal: 'err:bridge_invalid_request',
-  encodedPath: 'err:bridge_invalid_request',
-  queryTrick: 'err:bridge_invalid_request',
-  postMethod: 'err:bridge_invalid_request',
-  otherIndex: 'err:bridge_invalid_request',
-  auditIndex: 'err:bridge_invalid_request',
-  wildcard: 'err:bridge_invalid_request',
-  extraField: 'err:bridge_invalid_request',
-  functionArg: 'err:bridge_invalid_request',
-  thenableArg: 'err:bridge_invalid_request',
-  ungrantedDashboard: 'err:app_denied',
-  unknownMethod: 'err:app_unavailable',
+/**
+ * Expected public code for each named abuse case (asserted exactly), and whether the bridge Worker
+ * forwards it to Kibana. The Worker refuses non-plain-data arguments, wrong arity and any
+ * `callAppRoute` other than `GET /summary` itself; the server validates every forwarded operation
+ * strictly (closed union, exact keys, granted index and dashboard) before any I/O.
+ */
+const ABUSE_EXPECTED: Record<string, { code: string; server: boolean }> = {
+  otherRoute: { code: 'err:bridge_invalid_request', server: false },
+  traversal: { code: 'err:bridge_invalid_request', server: false },
+  encodedPath: { code: 'err:bridge_invalid_request', server: false },
+  queryTrick: { code: 'err:bridge_invalid_request', server: false },
+  postMethod: { code: 'err:bridge_invalid_request', server: false },
+  otherIndex: { code: 'err:app_denied', server: true },
+  auditIndex: { code: 'err:app_denied', server: true },
+  wildcard: { code: 'err:app_denied', server: true },
+  extraField: { code: 'err:bridge_invalid_request', server: true },
+  functionArg: { code: 'err:bridge_invalid_request', server: false },
+  thenableArg: { code: 'err:bridge_invalid_request', server: false },
+  ungrantedDashboard: { code: 'err:app_denied', server: true },
+  unknownMethod: { code: 'err:app_unavailable', server: false },
 };
-// The hostile auto-run already makes 1 invalid call (other index), so at most 6 more per frame (the
-// 8th invalid call terminates by design). Each batch ends with a positive control proving the
-// session was still open, so no case is "passed" by a dead session.
-const ABUSE_BATCHES: string[][] = [
-  ['otherRoute', 'traversal', 'encodedPath', 'queryTrick', 'postMethod', 'otherIndex'],
-  [
-    'auditIndex',
-    'wildcard',
-    'extraField',
-    'functionArg',
-    'thenableArg',
-    'ungrantedDashboard',
-    'unknownMethod',
-  ],
-];
 const RAW_NAMES = ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'valueOf'];
 
 const runBridgeCorpus = async (ctx: SuiteContext, engine: string) => {
@@ -274,85 +291,57 @@ const runBridgeCorpus = async (ctx: SuiteContext, engine: string) => {
     s.page.on('request', (request) => {
       if (/\/internal\/app_host\/ui\/execute$/.test(request.url())) executes.push(request.url());
     });
-    for (const [index, batch] of ABUSE_BATCHES.entries()) {
-      if (index > 0) {
-        await disableFrame(s.page);
-        await s.page.reload();
-      }
-      const child = await openBound(s.page, ctx);
-      await waitProbe(child);
-      const executesBefore = executes.length;
-      for (const name of batch) {
-        const result = String(await runIn(child, 'bridgeCase', name));
-        report.expect(
-          T,
-          `bridge abuse: ${name} → ${ABUSE_EXPECTED[name]}`,
-          engine,
-          result === ABUSE_EXPECTED[name],
-          { result }
-        );
-      }
-      const alive = String(await runIn(child, 'bridgeCase', 'alive'));
-      report.expect(
-        T,
-        `bridge abuse batch ${
-          index + 1
-        }: no server call; session still open afterwards (positive control)`,
-        engine,
-        executes.length === executesBefore &&
-          alive.startsWith('ok:') &&
-          (await frameStatus(s.page)) === 'bound',
-        { executes: executes.length - executesBefore, alive: alive.slice(0, 40) }
-      );
-      if (index === ABUSE_BATCHES.length - 1) {
-        // Raw protocol frames naming Object/prototype members: each rejected with a fixed code.
-        const result = await runIn(child, 'rawProtocolNames', '');
-        const pairs = Array.isArray(result) ? (result as Array<[string, string]>) : [];
-        for (const name of RAW_NAMES) {
-          const found = pairs.find(([key]) => key === name);
-          const reply =
-            typeof found?.[1] === 'string'
-              ? found[1]
-              : `missing (${typeof result === 'string' ? result.slice(0, 60) : 'no result'})`;
-          report.expect(
-            T,
-            `bridge abuse (raw frame): ${name} → reject app_unavailable, no stack`,
-            engine,
-            reply.startsWith('["reject"') &&
-              reply.includes('app_unavailable') &&
-              // V8 (`at fn (file:1:2)`) and Firefox/WebKit (`fn@url:1:2`) stack formats.
-              !/\sat\s|\.ts:|@https?:|\.js:\d/.test(reply),
-            { reply, frame: await frameStatus(s.page) }
-          );
-        }
-        report.expect(
-          T,
-          'bridge abuse (raw frames): no server call',
-          engine,
-          executes.length === executesBefore
-        );
-      }
-    }
-    // Intentional termination: the 8th invalid call ends the session.
-    await disableFrame(s.page);
-    await s.page.reload();
     const child = await openBound(s.page, ctx);
     await waitProbe(child);
-    // 1 invalid call in the auto-run + 6 here = 7 tolerated; the next one is the 8th.
-    const results: string[] = [];
-    for (let i = 0; i < 6; i++)
-      results.push(String(await runIn(child, 'bridgeCase', 'otherRoute')));
-    const statusBefore = await frameStatus(s.page);
-    results.push(String(await runIn(child, 'bridgeCase', 'otherRoute')));
-    await waitForStatus(s.page, /ended: protocol_error/, 10_000).catch(() => undefined);
+    for (const [name, expected] of Object.entries(ABUSE_EXPECTED)) {
+      const before = executes.length;
+      const result = String(await runIn(child, 'bridgeCase', name));
+      await sleep(100);
+      const forwarded = executes.length > before;
+      report.expect(
+        T,
+        `bridge abuse: ${name} → ${expected.code} (${
+          expected.server ? 'refused by the server' : 'refused in the bridge Worker'
+        })`,
+        engine,
+        result === expected.code && forwarded === expected.server,
+        { result, forwarded }
+      );
+    }
+    const alive = String(await runIn(child, 'bridgeCase', 'alive'));
     report.expect(
       T,
-      'bridge abuse: 7 invalid calls tolerated (1 auto-run + 6), the 8th terminates the session (repeated_invalid_calls)',
+      'bridge abuse: the session is still open afterwards (positive control)',
       engine,
-      statusBefore === 'bound' &&
-        results.slice(0, 6).every((r) => r === 'err:bridge_invalid_request') &&
-        /ended: protocol_error \(repeated_invalid_calls\)/.test(await frameStatus(s.page)),
-      { statusBefore, statusAfter: await frameStatus(s.page), eighth: results[6]?.slice(0, 60) }
+      alive.startsWith('ok:') && (await frameStatus(s.page)) === 'bound',
+      { alive: alive.slice(0, 40) }
+    );
+    // Raw protocol frames naming Object/prototype members: each rejected with a fixed code.
+    const executesBefore = executes.length;
+    const result = await runIn(child, 'rawProtocolNames', '');
+    const pairs = Array.isArray(result) ? (result as Array<[string, string]>) : [];
+    for (const name of RAW_NAMES) {
+      const found = pairs.find(([key]) => key === name);
+      const reply =
+        typeof found?.[1] === 'string'
+          ? found[1]
+          : `missing (${typeof result === 'string' ? result.slice(0, 60) : 'no result'})`;
+      report.expect(
+        T,
+        `bridge abuse (raw frame): ${name} → reject app_unavailable, no stack`,
+        engine,
+        reply.startsWith('["reject"') &&
+          reply.includes('app_unavailable') &&
+          // V8 (`at fn (file:1:2)`) and Firefox/WebKit (`fn@url:1:2`) stack formats.
+          !/\sat\s|\.ts:|@https?:|\.js:\d/.test(reply),
+        { reply, frame: await frameStatus(s.page) }
+      );
+    }
+    report.expect(
+      T,
+      'bridge abuse (raw frames): no server call',
+      engine,
+      executes.length === executesBefore
     );
   } finally {
     await s.close();
@@ -360,8 +349,8 @@ const runBridgeCorpus = async (ctx: SuiteContext, engine: string) => {
 };
 
 // ---------------------------------------------------------------- T8
-/** Handles minted by the page (the parent's session POST responses), for server-side checks. */
-const handlesFromResponses = (page: Page) => {
+/** Handles minted for the page (the bridge Worker's session POST responses), for server-side checks. */
+export const handlesFromResponses = (page: Page) => {
   const handles: string[] = [];
   page.on('response', async (response) => {
     if (
@@ -378,7 +367,7 @@ const handlesFromResponses = (page: Page) => {
 };
 
 /** Replayable forms of each handle: the full handle and its encrypted segment. */
-const handleNeedles = (handles: readonly string[]): string[] =>
+export const handleNeedles = (handles: readonly string[]): string[] =>
   handles.flatMap((handle) => [handle, handle.split('.')[2]]);
 
 /** Longer than the server's 2 s enablement/approval cache. */
@@ -584,11 +573,7 @@ export const runT8 = async (ctx: SuiteContext) => {
   await jestEvidence(
     ctx,
     T,
-    [
-      'server/ui/bridge_service.test.ts',
-      'public/components/app_ui_page.test.tsx',
-      'public/ui_host/session_client.test.ts',
-    ],
+    ['server/ui/bridge_service.test.ts', 'public/components/app_ui_page.test.tsx'],
     [
       [
         'disable / release change refused on the next call after the 2 s state cache',
@@ -599,20 +584,17 @@ export const runT8 = async (ctx: SuiteContext) => {
         'K3: tampered, other-principal, other-space and expired handles are refused',
       ],
       [
-        'session resolving after Disable never mounts',
-        'a session that resolves after Disable never mounts a frame',
+        'Disable while the session is being minted terminates the Worker; no frame mounts',
+        'Disable before the session is minted terminates the Worker and never mounts a frame',
+      ],
+      ['unmount terminates the Worker', 'unmount terminates the Worker'],
+      [
+        'positive control: the Worker reports a minted session and exactly one frame mounts',
+        'starts one Worker on consent with lifecycle data only, then mounts one frame when it is ready',
       ],
       [
-        'session resolving after unmount never mounts',
-        'a session that resolves after unmount never mounts a frame',
-      ],
-      [
-        'positive control: a current session mounts exactly one frame',
-        'positive control: a session that resolves while consent is current mounts exactly one frame',
-      ],
-      [
-        'no metadata polling, no mint before consent',
-        'mints nothing before consent and never polls the metadata',
+        'no metadata polling, no Worker before consent',
+        'starts nothing before consent and never polls the metadata',
       ],
     ]
   );
@@ -816,33 +798,3 @@ export const runT10 = async (ctx: SuiteContext) => {
 };
 
 export { pollFrame };
-
-// ---------------------------------------------------------------- T9 (browser smoke)
-/** A real oversized frame from hostile app code terminates the parent session at the boundary. */
-export const runT9Browser = async (ctx: SuiteContext) => {
-  const { report, users } = ctx;
-  await ensureHostile(ctx);
-  for (const engine of ctx.engines) {
-    await report.guard('T9', 'browser', engine, async () => {
-      const s = await session(ctx, engine, users.viewer);
-      try {
-        const child = await openBound(s.page, ctx);
-        await waitProbe(child);
-        await runIn(child, 'oversizedFrame', '');
-        await waitForStatus(s.page, /ended: protocol_error/, 10_000).catch(() => undefined);
-        report.expect(
-          'T9',
-          '1 MiB + 1 byte frame from the real app frame → parent terminates (frame_too_large)',
-          engine,
-          /ended: protocol_error \(frame_too_large\)/.test(await frameStatus(s.page)),
-          await frameStatus(s.page)
-        );
-      } finally {
-        await s.close();
-      }
-    });
-  }
-  report.add('T9', 'unbounded UI CPU loop', 'all', 'NOT_VERIFIED', {
-    note: 'Not run. An iframe is not a CPU quota; a hostile UI can still busy-loop its renderer (tab DoS residual).',
-  });
-};

@@ -454,8 +454,8 @@ export class BridgeService {
     if (state.consent.generation !== session.generation) {
       return deny('app_stale', 'stale_generation');
     }
-    // 3. Input schema only (closed union, scope, exact index and dashboard id; data view ids and
-    // ES|QL queries are only bounded). Not authorization: the key's role descriptor and the
+    // 3. Input schema only (closed union, scope, exact index and dashboard id; data view id syntax,
+    // non-empty ES|QL query). Not authorization: the key's role descriptor and the
     // viewer's own privileges are enforced natively.
     const operation = parseUiOperation(rawOperation);
     if (!operation) return deny('bridge_invalid_request', 'invalid_operation');
@@ -503,13 +503,6 @@ export class BridgeService {
         timedOut,
       ]);
       if (!outcome.ok) return deny(outcome.code, outcome.reason);
-      const maxBytes =
-        operation.op === 'kibana.dataViews.read' || operation.op === 'es.esql'
-          ? UI_LIMITS.largeResultBytes
-          : UI_LIMITS.resultBytes;
-      if (Buffer.byteLength(JSON.stringify(outcome.result)) > maxBytes) {
-        return deny('app_unavailable', 'invalid_result');
-      }
       this.#record(sessionApp, caller, operation.op, 'success', 'ok', correlationId);
       return { status: 200, body: { ok: true, result: outcome.result } };
     } finally {

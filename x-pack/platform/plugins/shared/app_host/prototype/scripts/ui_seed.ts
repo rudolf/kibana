@@ -143,17 +143,31 @@ if ((demoBulk.body as { errors?: boolean }).errors) throw new Error('demo bulk h
 
 // 1d. Data views (default space): one inside the grant, one on the secret index. The second is
 // visible to the app through listDataViews (saved-object privileges are per type), but ES refuses
-// any query against its index for the app key.
-for (const [id, title, name] of [
-  [DEMO.dataViewId, DEMO.dataViewTitle, 'Demo logs'],
-  [DEMO.secretDataViewId, DEMO.secretIndex, 'Other secret'],
+// any query against its index for the app key. The demo view carries one runtime field with a
+// field format, which getDataView returns unchanged.
+for (const [id, title, name, extra] of [
+  [
+    DEMO.dataViewId,
+    DEMO.dataViewTitle,
+    'Demo logs',
+    {
+      runtimeFieldMap: {
+        [DEMO.runtimeField]: {
+          type: 'long',
+          script: { source: "emit(doc['@timestamp'].value.getHour())" },
+        },
+      },
+      fieldFormats: { [DEMO.runtimeField]: { id: 'number', params: { pattern: '00' } } },
+    },
+  ],
+  [DEMO.secretDataViewId, DEMO.secretIndex, 'Other secret', {}],
 ] as const) {
   check(
     `data view ${id}`,
     (
       await kb('/api/data_views/data_view', 'POST', {
         override: true,
-        data_view: { id, title, name, timeFieldName: '@timestamp' },
+        data_view: { id, title, name, timeFieldName: '@timestamp', ...extra },
       })
     ).status,
     [200]

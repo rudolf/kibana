@@ -44,6 +44,19 @@ const LIST = { op: 'kibana.dataViews.read', params: {} };
 const getView = (id: string) => ({ op: 'kibana.dataViews.read', params: { id } });
 const esql = (query: string) => ({ op: 'es.esql', params: { query } });
 
+interface DataViewList {
+  data_view: Array<{ id: string; name?: string; title: string }>;
+}
+interface DataViewGet {
+  data_view: {
+    fields: Record<
+      string,
+      { runtimeField?: { type: string }; format?: { id: string } } & Record<string, unknown>
+    >;
+    runtimeFieldMap?: Record<string, { type: string }>;
+    fieldFormats?: Record<string, { id: string }>;
+  } & Record<string, unknown>;
+}
 interface EsqlJson {
   columns: Array<{ name: string; type: string }>;
   values: unknown[][];
@@ -124,48 +137,57 @@ export const runD1 = async (ctx: SuiteContext) => {
   );
 
   const held = await mint(ctx, users.viewer);
-  const list = await call<{ dataViews: Array<Record<string, unknown>> }>(ctx, held, LIST);
-  const demoView = list.result?.dataViews.find((view) => view.id === DEMO.dataViewId);
+  // Pass-through: the bridge returns the Data Views API responses unchanged, so they must equal
+  // the same API read directly by the viewer (the key is viewer ∩ app; both may read the view).
+  const kibanaGet = async (path: string) =>
+    (
+      await http(`${ctx.kibana}${path}`, {
+        auth: `${users.viewer.username}:${users.viewer.password}`,
+        headers: { 'elastic-api-version': '2023-10-31' },
+      })
+    ).body as Record<string, any>;
+  const list = await call<DataViewList>(ctx, held, LIST);
+  const directList = await kibanaGet('/api/data_views');
+  const demoView = list.result?.data_view.find((view) => view.id === DEMO.dataViewId);
   report.expect(
     T,
-    'listDataViews as the key: the demo data view, projected to {id,name,title,timeFieldName}',
+    "listDataViews as the key: the Data Views API response unchanged (equal to the viewer's direct read), demo view listed",
     HTTP,
     list.code === 'ok' &&
-      JSON.stringify(demoView) ===
-        JSON.stringify({
-          id: DEMO.dataViewId,
-          name: 'Demo logs',
-          title: DEMO.dataViewTitle,
-          timeFieldName: '@timestamp',
-        }),
-    { code: list.code, dataViews: list.result?.dataViews.map((view) => view.id) }
+      demoView?.name === 'Demo logs' &&
+      JSON.stringify(list.result) === JSON.stringify(directList),
+    {
+      code: list.code,
+      keys: Object.keys(list.result ?? {}),
+      dataViews: list.result?.data_view.map((v) => v.id),
+    }
   );
-  const view = await call<{ fields: Array<Record<string, unknown>> } & Record<string, unknown>>(
-    ctx,
-    held,
-    getView(DEMO.dataViewId)
-  );
-  const fieldNames = (view.result?.fields ?? []).map((field) => field.name);
-  const level = view.result?.fields.find((field) => field.name === 'log.level');
+  const view = await call<DataViewGet>(ctx, held, getView(DEMO.dataViewId));
+  const directView = await kibanaGet(`/api/data_views/data_view/${DEMO.dataViewId}`);
+  const spec = view.result?.data_view;
+  const fieldNames = Object.keys(spec?.fields ?? {});
+  const runtime = spec?.fields?.[DEMO.runtimeField];
   report.expect(
     T,
-    'getDataView as the key: exact keys and the demo fields (field caps run as the key)',
+    `getDataView as the key: the Data Views API response unchanged, including the runtime field ${DEMO.runtimeField} and its field format (field caps run as the key)`,
     HTTP,
     view.code === 'ok' &&
-      JSON.stringify(Object.keys(view.result ?? {})) ===
-        JSON.stringify(['id', 'name', 'title', 'timeFieldName', 'fields']) &&
+      JSON.stringify(view.result) === JSON.stringify(directView) &&
       ['@timestamp', 'log.level', 'message', 'service.name'].every((name) =>
         fieldNames.includes(name)
       ) &&
-      JSON.stringify(level) ===
-        JSON.stringify({
-          name: 'log.level',
-          type: 'string',
-          esTypes: ['keyword'],
-          aggregatable: true,
-          searchable: true,
-        }),
-    { code: view.code, fields: fieldNames, level }
+      spec?.runtimeFieldMap?.[DEMO.runtimeField]?.type === 'long' &&
+      spec?.fieldFormats?.[DEMO.runtimeField]?.id === 'number' &&
+      runtime?.runtimeField?.type === 'long' &&
+      runtime?.format?.id === 'number',
+    {
+      code: view.code,
+      keys: Object.keys(spec ?? {}),
+      fields: fieldNames.length,
+      runtimeFieldMap: spec?.runtimeFieldMap,
+      fieldFormats: spec?.fieldFormats,
+      runtimeFieldSpec: runtime,
+    }
   );
   const rows = await call<EsqlJson>(ctx, held, esql(ROWS_QUERY));
   const truth = await adminEsql(ctx, ROWS_QUERY);
@@ -195,42 +217,14 @@ export const runD1 = async (ctx: SuiteContext) => {
       total === DOCS,
     { code: histogram.code, buckets: histogram.result?.values.length, total }
   );
-  // Structural bounds: 4 KiB query, 500 rows. ES-native refusal of cluster-level commands.
-  const padded = (bytes: number) => {
-    const base = `FROM ${DEMO.dataViewTitle} | LIMIT 1 // `;
-    return `${base}${'x'.repeat(bytes - base.length)}`;
-  };
-  const atLimit = await call(ctx, held, esql(padded(4096)));
-  const overLimit = await call(ctx, held, esql(padded(4097)));
-  const tooMany = await call(ctx, held, esql(`FROM ${DEMO.dataViewTitle} | LIMIT 501`));
+  // No command allowlist: ES refuses cluster-level commands for the key (empty cluster).
   const enrich = await call(ctx, held, esql(`FROM ${DEMO.dataViewTitle} | ENRICH any_policy`));
   report.expect(
     T,
-    'bounds: a 4,096-byte query runs, 4,097 bytes → bridge_invalid_request; LIMIT 501 with 480 matching docs runs; ENRICH refused by ES (empty cluster)',
+    'ENRICH refused by ES (empty cluster)',
     HTTP,
-    atLimit.code === 'ok' &&
-      overLimit.code === 'bridge_invalid_request' &&
-      tooMany.code === 'ok' &&
-      enrich.code === 'app_denied' &&
-      enrich.reason === 'native_denied',
-    {
-      atLimit: atLimit.code,
-      overLimit: overLimit.code,
-      limit501: tooMany.code,
-      enrich: [enrich.code, enrich.reason],
-    }
-  );
-  const rowCap = await call(
-    ctx,
-    held,
-    esql(`FROM ${DEMO.dataViewTitle} | EVAL n = [1, 2] | MV_EXPAND n | LIMIT 501`)
-  );
-  report.expect(
-    T,
-    'row cap: 501 rows → app_unavailable (no partial result)',
-    HTTP,
-    rowCap.code === 'app_unavailable' && rowCap.reason === 'invalid_result',
-    { code: rowCap.code, reason: rowCap.reason }
+    enrich.code === 'app_denied' && enrich.reason === 'native_denied',
+    { enrich: [enrich.code, enrich.reason] }
   );
 
   // Browser: the tile in each engine, with a screenshot.
@@ -259,6 +253,7 @@ export const runD1 = async (ctx: SuiteContext) => {
             buckets: Number(tile.getAttribute('data-buckets')),
             bucketTotal: Number(tile.getAttribute('data-bucket-total')),
             fields: Number(tile.getAttribute('data-fields')),
+            runtimeFields: Number(tile.getAttribute('data-runtime-fields')),
             query: (document.getElementById('esql-query') as HTMLTextAreaElement).value,
             tableText: table?.textContent ?? '',
             markup: table?.querySelectorAll('img,script,svg,iframe,object').length ?? -1,
@@ -269,13 +264,14 @@ export const runD1 = async (ctx: SuiteContext) => {
         const pwned = await s.page.evaluate(() => document.body.textContent === 'PWN');
         report.expect(
           T,
-          'tile: data view picked, fields listed, prefilled query, 50 rows and the hourly chart; attacker strings rendered as text only',
+          'tile: data view picked, fields (incl. the runtime field) listed, prefilled query, 50 rows and the hourly chart; attacker strings rendered as text only',
           engine,
           state.rows === 50 &&
             state.buckets === histogramBuckets &&
             state.bars === histogramBuckets &&
             state.bucketTotal === DOCS &&
             (state.fields ?? 0) >= 4 &&
+            state.runtimeFields === 1 &&
             state.query === ROWS_QUERY &&
             DEMO.hostileMessages.every((message) => state.tableText?.includes(message)) &&
             state.markup === 0 &&
@@ -296,24 +292,19 @@ export const runD1 = async (ctx: SuiteContext) => {
           child,
           () => document.getElementById('discover')?.getAttribute('data-rows') ?? undefined
         );
-        // Large results cross the bridge in one frame (~900 KB of a 1 MiB frame);
-        // past the 960 KiB result cap the host refuses with the uniform code.
-        const large = async (repeat: number) => {
-          await child
-            .locator('#esql-query')
-            .fill(
-              `FROM ${DEMO.dataViewTitle} | EVAL n = [1, 2] | MV_EXPAND n | EVAL pad = REPEAT("x", ${repeat}) | KEEP pad | LIMIT 500`
-            );
-          await child.locator('#esql-run').click();
-          return pollFrame(child, () => {
-            const tile = document.getElementById('discover');
-            const rowCount = tile?.getAttribute('data-rows');
-            const error = tile?.getAttribute('data-error');
-            return rowCount || error ? { rows: rowCount, error } : undefined;
-          });
-        };
-        const largeOk = await large(1800);
-        const largeOver = await large(2000);
+        // A large result (1,000 rows, ~2 MB) crosses the bridge; no host row or byte cap.
+        await child
+          .locator('#esql-query')
+          .fill(
+            `FROM ${DEMO.dataViewTitle} | EVAL n = [1, 2, 3] | MV_EXPAND n | EVAL pad = REPEAT("x", 2000) | KEEP pad | LIMIT 1000`
+          );
+        await child.locator('#esql-run').click();
+        const large = await pollFrame(child, () => {
+          const tile = document.getElementById('discover');
+          const rowCount = tile?.getAttribute('data-rows');
+          const error = tile?.getAttribute('data-error');
+          return rowCount || error ? { rows: rowCount, error } : undefined;
+        });
         await child.locator('#esql-query').fill(`FROM ${DEMO.secretIndex} | LIMIT 5`);
         await child.locator('#esql-run').click();
         const denied = await pollFrame(
@@ -328,15 +319,14 @@ export const runD1 = async (ctx: SuiteContext) => {
           .innerText();
         report.expect(
           T,
-          'Run: an edited query returns 10 rows; a ~900 KB / 500-row result renders; over 960 KiB and FROM the secret index show uniform codes; the session stays bound',
+          'Run: an edited query returns 10 rows; a ~2 MB / 1,000-row result renders; FROM the secret index shows a uniform code; the session stays bound',
           engine,
           edited === '10' &&
-            largeOk.rows === '500' &&
-            largeOver.error === 'app_unavailable' &&
+            large.rows === '1000' &&
             denied === 'app_denied' &&
             status === 'esql: error app_denied' &&
             frameStatus === 'bound',
-          { edited, largeOk, largeOver, denied, status, frameStatus, screenshot: shot }
+          { edited, large, denied, status, frameStatus, screenshot: shot }
         );
       } finally {
         await s.close();
@@ -374,20 +364,21 @@ export const runD2 = async (ctx: SuiteContext) => {
   );
   for (const user of [users.viewer, users.superuser]) {
     const held = await mint(ctx, user);
-    const list = await call<{ dataViews: Array<{ id: string }> }>(ctx, held, LIST);
+    const list = await call<DataViewList>(ctx, held, LIST);
     report.expect(
       T,
       `${user.username}: the secret data view is visible through listDataViews (saved-object privileges are per type)`,
       HTTP,
       list.code === 'ok' &&
-        (list.result?.dataViews ?? []).some(({ id }) => id === DEMO.secretDataViewId),
-      { code: list.code, dataViews: list.result?.dataViews.map(({ id }) => id) }
+        (list.result?.data_view ?? []).some(({ id }) => id === DEMO.secretDataViewId),
+      { code: list.code, dataViews: list.result?.data_view.map(({ id }) => id) }
     );
     const secretView = await call(ctx, held, getView(DEMO.secretDataViewId));
     report.add(T, `${user.username}: getDataView on the secret data view`, HTTP, 'DIAGNOSTIC', {
       code: secretView.code,
       reason: secretView.reason,
-      fields: (secretView.result as { fields?: unknown[] } | undefined)?.fields?.length,
+      fields: Object.keys((secretView.result as DataViewGet | undefined)?.data_view.fields ?? {})
+        .length,
       containsSecret: secretView.text.includes(DEMO.secretMarker),
     });
     const only = await call<EsqlJson>(ctx, held, esql(`FROM ${DEMO.secretIndex} | LIMIT 10`));
@@ -450,7 +441,7 @@ export const runD3 = async (ctx: SuiteContext) => {
     { code: noIndexEsql.code, reason: noIndexEsql.reason }
   );
   const noViews = await mint(ctx, users.noDataViews);
-  const noViewsList = await call<{ dataViews: unknown[] }>(ctx, noViews, LIST);
+  const noViewsList = await call<DataViewList>(ctx, noViews, LIST);
   const noViewsGet = await call(ctx, noViews, getView(DEMO.dataViewId));
   const noViewsEsql = await call<EsqlJson>(ctx, noViews, esql(ROWS_QUERY));
   report.expect(
@@ -458,12 +449,12 @@ export const runD3 = async (ctx: SuiteContext) => {
     'viewer without the data view feature: Kibana returns no data views (saved-object find filters the type) and refuses getDataView natively (400 "Unable to bulk_get index-pattern"); ES|QL still works',
     HTTP,
     noViewsList.code === 'ok' &&
-      noViewsList.result?.dataViews.length === 0 &&
+      noViewsList.result?.data_view.length === 0 &&
       noViewsGet.code === 'app_denied' &&
       noViewsGet.reason === 'native_rejected' &&
       noViewsEsql.code === 'ok',
     {
-      list: [noViewsList.code, noViewsList.result?.dataViews.length],
+      list: [noViewsList.code, noViewsList.result?.data_view.length],
       get: [noViewsGet.code, noViewsGet.reason],
       esql: noViewsEsql.code,
     }

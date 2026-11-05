@@ -18,13 +18,16 @@ export const APP_SURFACE_PREFIXES = [
 export const isAppSurface = (pathname: string): boolean =>
   APP_SURFACE_PREFIXES.some((prefix) => pathname.startsWith(prefix));
 
-export type SurfaceKind = 'guardian' | 'frame' | 'asset' | 'json';
+export type SurfaceKind = 'guardian' | 'frame' | 'worker' | 'asset' | 'json';
 
 export interface UiPolicyUrls {
   /** Configured Kibana origin, never derived from Host/Origin request headers. */
   readonly origin: string;
   readonly guardianScript: string;
   readonly bootstrapScript: string;
+  readonly capnwebScript: string;
+  readonly sessionUrl: string;
+  readonly executeUrl: string;
 }
 
 const REPORTING_DIRECTIVES = new Set(['report-uri', 'report-to']);
@@ -74,6 +77,14 @@ export const childPolicy = (urls: UiPolicyUrls, uiScript: string): string =>
     origin: urls.origin,
     bootstrapScript: urls.bootstrapScript,
     uiScript,
+  });
+
+/** The bridge Worker may import only capnweb and call only the session and execute routes. */
+export const workerPolicy = (urls: UiPolicyUrls): string =>
+  fill(UI_SECURITY_PROFILE.workerCsp, {
+    capnwebScript: urls.capnwebScript,
+    sessionUrl: urls.sessionUrl,
+    executeUrl: urls.executeUrl,
   });
 
 export interface SurfaceDecision {

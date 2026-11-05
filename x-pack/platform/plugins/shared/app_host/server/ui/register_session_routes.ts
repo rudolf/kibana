@@ -133,8 +133,7 @@ export const registerSessionRoutes = ({
     {
       path: UI_EXECUTE_PATH,
       security: { authz: { requiredPrivileges: [...APP_UI_PRIVILEGES] } },
-      // Room for the handle plus a 4 KiB ES|QL query (JSON-escaped).
-      options: { access: 'internal', body: { maxBytes: 16 * 1024 } },
+      options: { access: 'internal' },
       validate: {
         // The operation is parsed strictly by the closed union; config-schema only bounds it.
         body: schema.object({

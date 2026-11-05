@@ -91,7 +91,7 @@ const run = async () => {
   }
   try {
     const result = await bridge.getDashboardPreview({ id: __DASHBOARD_ID__ });
-    dashboard.textContent = result.title;
+    dashboard.textContent = result.data.title;
   } catch (error) {
     dashboard.textContent = `error ${errorCode(error)}`;
   }

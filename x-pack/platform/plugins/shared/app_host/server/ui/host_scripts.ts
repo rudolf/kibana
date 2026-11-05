@@ -9,7 +9,13 @@
 // content and never interpolate request data: each reads server-derived values from a JSON data
 // block in its own generated document. Kept as small ES2017 strings so the exact bytes are fixed.
 
-import { UI_HANDSHAKE_PROTOCOL } from '../../common/ui_protocol';
+import { readFileSync } from 'node:fs';
+import {
+  BRIDGE_ERROR_CODES,
+  CAPNWEB_ASSET_FILE,
+  UI_HANDSHAKE_PROTOCOL,
+  UI_LIMITS,
+} from '../../common/ui_protocol';
 
 /**
  * Guardian (same-origin, unsandboxed, trusted). Accepts exactly two handshake messages, checking
@@ -169,3 +175,240 @@ export const CHILD_BOOTSTRAP_SCRIPT = `(function () {
   window.addEventListener('message', onMessage);
 })();
 `;
+
+/**
+ * Dedicated bridge Worker (trusted, same-origin, one per app frame; the parent terminates it on
+ * teardown). It takes exactly one init message from its owner with its end of the bridge
+ * MessageChannel, mints the app session, then serves the guest's capnweb session off the Kibana UI
+ * thread. The session handle exists only in this Worker and in the request bodies it sends; the
+ * parent receives lifecycle notices only. Seven typed methods, plain-data arguments only; the
+ * server validates every operation strictly and runs it as the app session key. The Worker's only
+ * bound is its receive queue: bytes of guest frames waiting for capnweb (2 bytes per UTF-16 code
+ * unit); overflow ends the session.
+ */
+export const BRIDGE_WORKER_SCRIPT = `(function () {
+  'use strict';
+  importScripts(${JSON.stringify(CAPNWEB_ASSET_FILE)});
+  var capnweb = self.capnweb;
+  var CODES = ${JSON.stringify(BRIDGE_ERROR_CODES)};
+  var MAX_QUEUED_BYTES = ${UI_LIMITS.receiveQueueBytes};
+  var MAX_HANDLE_LENGTH = ${UI_LIMITS.handleBytes};
+  var TERMINAL = ['app_disabled', 'app_stale', 'app_expired'];
+  var HEADERS = {
+    'content-type': 'application/json',
+    'kbn-xsrf': 'app-host-bridge',
+    'x-elastic-internal-origin': 'Kibana'
+  };
+  var notify = function (notice) { self.postMessage(notice); };
+
+  // Stackless, fixed public code only (capnweb serializes any truthy stack; Firefox inherits one).
+  var bridgeError = function (code) {
+    var error = new Error(CODES.indexOf(code) >= 0 ? code : 'app_unavailable');
+    Object.defineProperty(error, 'stack', {
+      value: '', configurable: true, writable: true, enumerable: false
+    });
+    return error;
+  };
+
+  // JSON values only: functions, stubs, thenables, class instances and non-finite numbers fail.
+  var isPlainData = function (value) {
+    if (value === null || typeof value === 'string' || typeof value === 'boolean') return true;
+    if (typeof value === 'number') return isFinite(value);
+    if (typeof value !== 'object') return false;
+    if (Array.isArray(value)) return value.every(isPlainData);
+    var proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) return false;
+    return Object.keys(value).every(function (key) { return isPlainData(value[key]); });
+  };
+  var isObject = function (value) {
+    return typeof value === 'object' && value !== null && !Array.isArray(value) &&
+      isPlainData(value);
+  };
+
+  class Transport {
+    constructor(port, onEnd) {
+      this.port = port;
+      this.onEnd = onEnd;
+      this.queue = [];
+      this.bytes = 0;
+      this.waiter = null;
+      this.error = null;
+      port.onmessage = (event) => this.onMessage(event.data);
+      port.onmessageerror = () => this.end('messageerror');
+    }
+    send(message) {
+      if (this.error) throw this.error;
+      this.port.postMessage(message);
+    }
+    receive() {
+      if (this.error) return Promise.reject(this.error);
+      return new Promise((resolve, reject) => {
+        this.waiter = { resolve: resolve, reject: reject };
+        this.pump();
+      });
+    }
+    abort() { this.end('aborted'); }
+    pump() {
+      if (this.error || !this.waiter || this.queue.length === 0) return;
+      var next = this.queue.shift();
+      this.bytes -= next.length * 2;
+      var waiter = this.waiter;
+      this.waiter = null;
+      waiter.resolve(next);
+    }
+    onMessage(data) {
+      if (this.error) return;
+      if (typeof data !== 'string') { this.end('non_string_frame'); return; }
+      this.bytes += data.length * 2;
+      if (this.bytes > MAX_QUEUED_BYTES) { this.end('queue_overflow'); return; }
+      this.queue.push(data);
+      this.pump();
+    }
+    end(reason) {
+      if (this.error) return;
+      this.error = new Error('bridge_protocol_error:' + reason);
+      this.port.onmessage = null;
+      this.port.onmessageerror = null;
+      try { this.port.close(); } catch (error) { /* closed */ }
+      this.queue = [];
+      this.bytes = 0;
+      var waiter = this.waiter;
+      this.waiter = null;
+      if (waiter) waiter.reject(this.error);
+      this.onEnd(reason);
+    }
+  }
+
+  var start = async function (init, port) {
+    var post = async function (url, body) {
+      var response = await fetch(url, {
+        method: 'POST', credentials: 'same-origin', headers: HEADERS, body: JSON.stringify(body)
+      });
+      var json;
+      try { json = await response.json(); } catch (error) { json = undefined; }
+      return { status: response.status, json: json };
+    };
+    var mint = async function () {
+      try {
+        var reply = await post(init.sessionUrl, {
+          appId: init.appId, releaseDigest: init.releaseDigest
+        });
+        var handle = reply.json && reply.json.handle;
+        return reply.status === 200 && typeof handle === 'string' && handle.length > 0 &&
+          handle.length <= MAX_HANDLE_LENGTH ? handle : undefined;
+      } catch (error) {
+        return undefined;
+      }
+    };
+    var run = async function (handle, operation) {
+      try {
+        var reply = await post(init.executeUrl, Object.assign({ handle: handle }, operation));
+        var json = reply.json;
+        if (reply.status === 200 && json && json.ok === true &&
+            typeof json.result === 'object' && json.result !== null) {
+          return { ok: true, result: json.result };
+        }
+        var code = json && json.attributes && json.attributes.code;
+        return { ok: false, code: CODES.indexOf(code) >= 0 ? code : 'app_unavailable' };
+      } catch (error) {
+        return { ok: false, code: 'app_unavailable' };
+      }
+    };
+
+    var handle = await mint();
+    if (!handle) { notify({ t: 'end', reason: 'session_failed' }); return; }
+    var ended = false;
+    var end = function (reason) {
+      if (ended) return;
+      ended = true;
+      notify({ t: 'end', reason: reason });
+    };
+    // An expired handle is re-minted once per call. A lifecycle refusal ends the session after
+    // capnweb has sent it to the guest; the parent then terminates this Worker.
+    var execute = async function (operation) {
+      var outcome = await run(handle, operation);
+      if (!outcome.ok && outcome.code === 'app_expired') {
+        var next = await mint();
+        if (next) { handle = next; outcome = await run(next, operation); }
+      }
+      if (outcome.ok) return outcome.result;
+      if (TERMINAL.indexOf(outcome.code) >= 0) setTimeout(end, 0, outcome.code);
+      throw bridgeError(outcome.code);
+    };
+    var request = function (args, arity, valid) {
+      if (args.length !== arity || (arity === 1 && !isObject(args[0])) || !valid(args[0])) {
+        throw bridgeError('bridge_invalid_request');
+      }
+    };
+    var any = function () { return true; };
+    var hasId = function (value) { return typeof value.id === 'string'; };
+
+    // The only object the guest can call: exactly these methods, no state of its own.
+    class AppBridge extends capnweb.RpcTarget {
+      async callAppRoute() {
+        request(arguments, 1, function (value) {
+          return Object.keys(value).length === 2 && value.method === 'GET' &&
+            value.path === '/summary';
+        });
+        return execute({ op: 'app.summary' });
+      }
+      async search(params) {
+        request(arguments, 1, any);
+        return execute({ op: 'es.search', params: params });
+      }
+      async getDashboardPreview(params) {
+        request(arguments, 1, hasId);
+        return execute({ op: 'kibana.dashboard.read', params: params });
+      }
+      async listDataViews() {
+        request(arguments, 0, any);
+        return execute({ op: 'kibana.dataViews.read', params: {} });
+      }
+      async getDataView(params) {
+        request(arguments, 1, hasId);
+        return execute({ op: 'kibana.dataViews.read', params: params });
+      }
+      async esql(params) {
+        request(arguments, 1, any);
+        return execute({ op: 'es.esql', params: params });
+      }
+      async getTheme() {
+        request(arguments, 0, any);
+        return JSON.parse(JSON.stringify(init.theme));
+      }
+    }
+
+    var transport = new Transport(port, end);
+    new capnweb.RpcSession(transport, new AppBridge(), {
+      onSendError: function (error) { return bridgeError(error && error.message); }
+    });
+    notify({ t: 'ready' });
+  };
+
+  self.onmessage = function (event) {
+    // Exactly one init message from the owning page; anything later is ignored.
+    self.onmessage = null;
+    var data = event.data;
+    var port = event.ports && event.ports[0];
+    if (!data || data.t !== 'init' || !port) { notify({ t: 'end', reason: 'session_failed' }); return; }
+    start(data, port);
+  };
+})();
+`;
+
+let capnwebScript: string | undefined;
+
+/**
+ * capnweb's CommonJS build (no imports, no globals) wrapped as a classic script that defines
+ * `self.capnweb` for the bridge Worker's `importScripts`. Read once from the installed package.
+ */
+export const capnwebWorkerScript = (): string => {
+  if (capnwebScript === undefined) {
+    const source = readFileSync(require.resolve('capnweb'), 'utf8').replace(
+      /\n\/\/# sourceMappingURL=.*$/,
+      ''
+    );
+    capnwebScript = `(function (exports) {\n${source}\n})(self.capnweb = {});\n`;
+  }
+  return capnwebScript;
+};

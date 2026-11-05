@@ -51,41 +51,18 @@ const esHits = (hits: Array<{ _index: string; _source: unknown }>) => ({
 });
 
 /** Minimal fetch-Response stand-in (the jsdom test environment has no WHATWG streams). */
-const fakeResponse = (status: number, text: string, declareLength = true) => {
-  const bytes = new Uint8Array(Buffer.from(text));
-  let sent = false;
-  return {
-    status,
-    redirected: false,
-    headers: new Map(declareLength ? [['content-length', String(bytes.byteLength)]] : []),
-    body: {
-      getReader: () => ({
-        read: async () => {
-          if (sent) return { done: true, value: undefined };
-          sent = true;
-          return { done: false, value: bytes };
-        },
-        cancel: async () => undefined,
-      }),
-      cancel: async () => undefined,
-    },
-  };
-};
+const fakeResponse = (status: number, text: string) => ({
+  status,
+  redirected: false,
+  json: async () => JSON.parse(text),
+  body: { cancel: async () => undefined },
+});
 
-const makeSelf = (
-  status: number,
-  body: unknown,
-  url?: string,
-  declareLength = true
-): HttpSelfScopedClient => ({
+const makeSelf = (status: number, body: unknown, url?: string): HttpSelfScopedClient => ({
   fetch: jest.fn(async (path: string) => ({
     fetchOptions: {} as never,
     request: { url: url ?? `http://localhost:5601${path}` } as Request,
-    response: fakeResponse(
-      status,
-      typeof body === 'string' ? body : JSON.stringify(body),
-      declareLength
-    ),
+    response: fakeResponse(status, typeof body === 'string' ? body : JSON.stringify(body)),
   })) as never,
 });
 
@@ -482,9 +459,10 @@ describe('BridgeService execute as the key (K1/K2/T8/T11/T13)', () => {
       ok: true,
       result: { total: 1, records: [{ severity: 'high', rule: 'r' }] },
     });
+    // The Dashboard API response, unchanged.
     expect((await service.execute(caller(), handle, DASHBOARD)).body).toEqual({
       ok: true,
-      result: { id: DASHBOARD_ID, title: 'T' },
+      result: { id: DASHBOARD_ID, data: { title: 'T' } },
     });
   });
 
@@ -670,7 +648,7 @@ describe('BridgeService execute as the key (K1/K2/T8/T11/T13)', () => {
     }
   });
 
-  it('S5: alias match, redirect and oversized bodies fail closed', async () => {
+  it('S5: alias match and redirects fail closed', async () => {
     const cases: Array<[HttpSelfScopedClient, string]> = [
       [
         makeSelf(200, {
@@ -684,19 +662,6 @@ describe('BridgeService execute as the key (K1/K2/T8/T11/T13)', () => {
           200,
           { id: DASHBOARD_ID, data: { title: 'T' } },
           'http://localhost:5601/api/dashboards/elsewhere'
-        ),
-        'app_unavailable',
-      ],
-      [
-        makeSelf(200, `{"id":"${DASHBOARD_ID}","data":{"title":"${'x'.repeat(300 * 1024)}"}}`),
-        'app_unavailable',
-      ],
-      [
-        makeSelf(
-          200,
-          `{"id":"${DASHBOARD_ID}","data":{"title":"${'x'.repeat(300 * 1024)}"}}`,
-          undefined,
-          false
         ),
         'app_unavailable',
       ],
@@ -742,25 +707,6 @@ describe('BridgeService execute as the key (K1/K2/T8/T11/T13)', () => {
     now += 2_000;
     expect(code(await service.execute(caller(), handle, SUMMARY))).toBe('app_stale');
     expect(asKey).toHaveBeenCalledTimes(2);
-  });
-
-  it('result size: exactly 16 KiB returned, one byte more refused', async () => {
-    const body = (labelLength: number) => ({
-      appId: 'alert-digest',
-      version: '2.0.0',
-      label: 'x'.repeat(labelLength),
-      counts: { high: 1, low: 1 },
-    });
-    const overhead = Buffer.byteLength(JSON.stringify(body(0)));
-    for (const [length, expected] of [
-      [16 * 1024 - overhead, 'ok'],
-      [16 * 1024 - overhead + 1, 'app_unavailable'],
-    ] as const) {
-      const { service, caller, mint } = setup({
-        summary: async () => ({ status: 'ok', body: body(length) }),
-      });
-      expect(code(await service.execute(caller(), await mint(), SUMMARY))).toBe(expected);
-    }
   });
 
   describe('operation deadline (fake clock)', () => {
@@ -942,7 +888,7 @@ describe('BridgeService handlers reach only their own services (T11, behavioural
       method: 'GET',
       access: 'public',
       version: '2023-10-31',
-      timeout: 2000,
+      timeout: 5000,
       asResponse: true,
       rawResponse: true,
     });
@@ -971,7 +917,7 @@ describe('BridgeService Mini Discover: data views and ES|QL as the key (D1–D3)
       .filter((record) => record.app?.capability !== 'session.create')
       .map((record) => record.event?.reason);
 
-  it('es.esql runs the app query with the key-scoped client and projects {columns, values}', async () => {
+  it('es.esql runs the app query with the key-scoped client and returns {columns, values}', async () => {
     const es = esqlClient(async () => ({
       took: 3,
       is_partial: false,
@@ -1024,43 +970,7 @@ describe('BridgeService Mini Discover: data views and ES|QL as the key (D1–D3)
     }
   });
 
-  it('es.esql bounds: 4 KiB query, 500 rows and 960 KiB result; no command allowlist', async () => {
-    const rows = (count: number, cell = 'x') =>
-      esqlClient(async () => ({
-        columns: [{ name: 'm', type: 'keyword' }],
-        values: Array.from({ length: count }, () => [cell]),
-      }));
-    const base = 'FROM kbn-apps-demo-logs-* // ';
-    const sized = (bytes: number) => `${base}${'x'.repeat(bytes - base.length)}`;
-    const at = setup({ es: rows(1) });
-    expect(code(await at.service.execute(at.caller(), await at.mint(), ESQL(sized(4096))))).toBe(
-      'ok'
-    );
-    // Multibyte counts UTF-8 bytes: 1,366 x U+00E9 (2 bytes) = 2,732 code units but 4,097 bytes with base.
-    const over = setup({ es: rows(1) });
-    const handle = await over.mint();
-    expect(code(await over.service.execute(over.caller(), handle, ESQL(sized(4097))))).toBe(
-      'bridge_invalid_request'
-    );
-    expect(
-      code(
-        await over.service.execute(
-          over.caller(),
-          handle,
-          ESQL(`${base}${'\u00e9'.repeat((4097 - base.length + 1) / 2)}`)
-        )
-      )
-    ).toBe('bridge_invalid_request');
-    expect(over.asKey).not.toHaveBeenCalled();
-    for (const [es, expected] of [
-      [rows(500), 'ok'],
-      [rows(501), 'app_unavailable'],
-      [rows(1, 'y'.repeat(960 * 1024)), 'app_unavailable'],
-    ] as const) {
-      const s = setup({ es });
-      expect(code(await s.service.execute(s.caller(), await s.mint(), ESQL()))).toBe(expected);
-    }
-    // Commands are not filtered by Kibana: ENRICH reaches ES, which refuses it (empty cluster).
+  it('es.esql has no command allowlist: ENRICH reaches ES, which refuses it (empty cluster)', async () => {
     const enrich = setup({
       es: esqlClient(async () => {
         throw responseError(403);
@@ -1075,97 +985,62 @@ describe('BridgeService Mini Discover: data views and ES|QL as the key (D1–D3)
         )
       )
     ).toBe('app_denied');
+    expect(enrich.esClient.esql.query).toHaveBeenCalledTimes(1);
   });
 
-  it('kibana.dataViews.read lists and reads data views through the self client, projected', async () => {
+  it('kibana.dataViews.read returns the Data Views API responses unchanged, including runtime fields and formats', async () => {
+    const LIST_BODY = {
+      data_view: [
+        {
+          id: 'kbn-apps-demo-logs',
+          title: 'kbn-apps-demo-logs-*',
+          name: 'Demo logs',
+          timeFieldName: '@timestamp',
+          namespaces: ['default'],
+          typeMeta: {},
+        },
+        { id: 'bad/id', title: 'not addressable, still listed' },
+      ],
+    };
+    const GET_BODY = {
+      data_view: {
+        id: 'kbn-apps-demo-logs',
+        title: 'kbn-apps-demo-logs-*',
+        name: 'Demo logs',
+        timeFieldName: '@timestamp',
+        sourceFilters: [],
+        runtimeFieldMap: {
+          'event.hour': {
+            type: 'long',
+            script: { source: "emit(doc['@timestamp'].value.getHour())" },
+          },
+        },
+        fieldFormats: { 'event.hour': { id: 'number', params: { pattern: '00' } } },
+        fields: {
+          message: { name: 'message', type: 'string', esTypes: ['text'], count: 0 },
+          'event.hour': {
+            name: 'event.hour',
+            type: 'number',
+            runtimeField: { type: 'long' },
+            format: { id: 'number', params: { pattern: '00' } },
+          },
+        },
+      },
+    };
     const self: HttpSelfScopedClient = {
       fetch: jest.fn(async (path: string) => ({
         fetchOptions: {} as never,
         request: { url: `http://localhost:5601${path}` } as Request,
         response: fakeResponse(
           200,
-          JSON.stringify(
-            path === '/api/data_views'
-              ? {
-                  data_view: [
-                    {
-                      id: 'kbn-apps-demo-logs',
-                      title: 'kbn-apps-demo-logs-*',
-                      name: 'Demo logs',
-                      timeFieldName: '@timestamp',
-                      namespaces: ['default'],
-                      typeMeta: {},
-                    },
-                    { id: 'no-name', title: 'other' },
-                    { id: 'bad/id', title: 'skipped' },
-                  ],
-                }
-              : {
-                  data_view: {
-                    id: 'kbn-apps-demo-logs',
-                    title: 'kbn-apps-demo-logs-*',
-                    name: 'Demo logs',
-                    timeFieldName: '@timestamp',
-                    sourceFilters: [],
-                    fields: {
-                      message: {
-                        name: 'message',
-                        type: 'string',
-                        esTypes: ['text'],
-                        aggregatable: false,
-                        searchable: true,
-                        count: 0,
-                        format: { id: 'string' },
-                      },
-                      '@timestamp': {
-                        name: '@timestamp',
-                        type: 'date',
-                        esTypes: ['date'],
-                        aggregatable: true,
-                        searchable: true,
-                      },
-                    },
-                  },
-                }
-          )
+          JSON.stringify(path === '/api/data_views' ? LIST_BODY : GET_BODY)
         ),
       })) as never,
     };
     const { service, caller, mint } = setup({ self });
     const handle = await mint();
-    expect(resultOf(await service.execute(caller(), handle, LIST))).toStrictEqual({
-      dataViews: [
-        {
-          id: 'kbn-apps-demo-logs',
-          name: 'Demo logs',
-          title: 'kbn-apps-demo-logs-*',
-          timeFieldName: '@timestamp',
-        },
-        { id: 'no-name', name: 'other', title: 'other', timeFieldName: null },
-      ],
-    });
-    expect(resultOf(await service.execute(caller(), handle, GET))).toStrictEqual({
-      id: 'kbn-apps-demo-logs',
-      name: 'Demo logs',
-      title: 'kbn-apps-demo-logs-*',
-      timeFieldName: '@timestamp',
-      fields: [
-        {
-          name: '@timestamp',
-          type: 'date',
-          esTypes: ['date'],
-          aggregatable: true,
-          searchable: true,
-        },
-        {
-          name: 'message',
-          type: 'string',
-          esTypes: ['text'],
-          aggregatable: false,
-          searchable: true,
-        },
-      ],
-    });
+    expect(resultOf(await service.execute(caller(), handle, LIST))).toStrictEqual(LIST_BODY);
+    expect(resultOf(await service.execute(caller(), handle, GET))).toStrictEqual(GET_BODY);
     const calls = (self.fetch as jest.Mock).mock.calls.map(([path, options]) => {
       const { signal, ...rest } = options;
       return [path, rest, signal instanceof AbortSignal];
@@ -1185,7 +1060,7 @@ describe('BridgeService Mini Discover: data views and ES|QL as the key (D1–D3)
     ]);
   });
 
-  it('kibana.dataViews.read: native 400/403/404 → app_denied, other id or redirect fails closed, bad ids never reach Kibana', async () => {
+  it('kibana.dataViews.read: native 400/403/404 → app_denied, a redirect fails closed, bad ids never reach Kibana', async () => {
     for (const [self, expected, reason] of [
       [makeSelf(403, { message: CANARY }), 'app_denied', 'native_denied'],
       [makeSelf(404, { message: CANARY }), 'app_denied', 'native_denied'],
@@ -1194,7 +1069,6 @@ describe('BridgeService Mini Discover: data views and ES|QL as the key (D1–D3)
         'app_denied',
         'native_rejected',
       ],
-      [makeSelf(200, { data_view: { id: 'other', title: 't' } }), 'app_denied', 'native_denied'],
       [
         makeSelf(
           200,

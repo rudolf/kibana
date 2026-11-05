@@ -5,19 +5,17 @@
  * 2.0.
  */
 
-import type { BridgeErrorCode, UiTheme } from '../../common/ui_protocol';
+import type { BridgeWorkerInit, BridgeWorkerNotice } from '../../common/ui_protocol';
 import { UI_HANDSHAKE_PROTOCOL, UI_LIMITS } from '../../common/ui_protocol';
 import { UI_SECURITY_PROFILE } from '../../common/ui_contract';
-import type { BridgeExecutor, BridgeGrant } from './bridge_root';
-import { BridgeLifecycle } from './bridge_root';
-import type { BoundedPortTransport } from './port_transport';
-import { startBridgeSession } from './bridge_session';
 
 export type FrameHostEndReason =
   | 'unmounted'
   | 'disabled'
   | 'stale'
   | 'expired'
+  | 'session_failed'
+  | 'worker_error'
   | 'handshake_timeout'
   | 'guardian_reloaded'
   | 'child_reloaded'
@@ -26,18 +24,25 @@ export type FrameHostEndReason =
   | 'messageerror'
   | 'protocol_error';
 
+/** The parts of a `Worker` the frame host uses (a test double needs only these). */
+export interface BridgeWorkerLike {
+  onmessage: ((event: MessageEvent<BridgeWorkerNotice>) => void) | null;
+  onerror: ((event: ErrorEvent) => void) | null;
+  onmessageerror: ((event: MessageEvent) => void) | null;
+  postMessage(message: BridgeWorkerInit, transfer: Transferable[]): void;
+  terminate(): void;
+}
+
 export interface FrameHostOptions {
   readonly container: HTMLElement;
   /** Basepath-prefixed guardian document path from server metadata. */
   readonly guardianUrl: string;
   /** This page's own origin; the guardian is same-origin. */
   readonly kibanaOrigin: string;
-  readonly grant: BridgeGrant;
-  readonly theme: () => UiTheme;
-  readonly executor: BridgeExecutor | undefined;
+  readonly createWorker: () => BridgeWorkerLike;
+  readonly workerInit: Omit<BridgeWorkerInit, 't'>;
   readonly onBound?: () => void;
   readonly onEnded: (reason: FrameHostEndReason, detail?: string) => void;
-  readonly onLocalRejection?: (method: string, code: BridgeErrorCode) => void;
   readonly handshakeTimeoutMs?: number;
 }
 
@@ -53,22 +58,25 @@ const randomChallenge = (): string => {
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 };
 
-const END_CODES: Partial<Record<FrameHostEndReason, BridgeErrorCode>> = {
-  disabled: 'app_disabled',
-  stale: 'app_stale',
-  expired: 'app_expired',
+const WORKER_END: Partial<Record<string, FrameHostEndReason>> = {
+  session_failed: 'session_failed',
+  app_disabled: 'disabled',
+  app_stale: 'stale',
+  app_expired: 'expired',
 };
 
 /**
- * Owns one guardian iframe, its one-time MessageChannel handshake and the bounded RPC session.
- * There is no global window `message` listener; guardian lifecycle notices arrive on a dedicated
- * control port. Any subsequent guardian or child load revokes; nothing is ever rebound.
+ * Owns one app frame's lifecycle: the bridge Worker (which mints the session and runs the RPC
+ * session off this thread), the guardian iframe and its one-time MessageChannel handshake. The
+ * page never sees the session handle or a bridge message. There is no global window `message`
+ * listener; guardian lifecycle notices arrive on a dedicated control port. Any later guardian or
+ * child load ends the frame; nothing is ever rebound. Ending terminates the Worker.
  */
 export class FrameHost {
   readonly #options: FrameHostOptions;
-  readonly #lifecycle = new BridgeLifecycle();
+  #worker: BridgeWorkerLike | undefined;
+  #guestPort: MessagePort | undefined;
   #iframe: HTMLIFrameElement | undefined;
-  #transport: BoundedPortTransport | undefined;
   #control: MessagePort | undefined;
   #timer: ReturnType<typeof setTimeout> | undefined;
   #ended = false;
@@ -82,8 +90,52 @@ export class FrameHost {
     return this.#bound;
   }
 
+  /** Starts the Worker; the frame is mounted only once the Worker reports a minted session. */
   start(): void {
-    const { container, guardianUrl } = this.#options;
+    const worker = this.#options.createWorker();
+    this.#worker = worker;
+    worker.onmessage = ({ data }) => this.#onWorker(data);
+    worker.onerror = () => this.end('worker_error');
+    worker.onmessageerror = () => this.end('messageerror');
+    const rpc = new MessageChannel();
+    this.#guestPort = rpc.port2;
+    worker.postMessage({ t: 'init', ...this.#options.workerInit }, [rpc.port1]);
+    this.#timer = setTimeout(() => {
+      if (!this.#bound) this.end('handshake_timeout');
+    }, this.#options.handshakeTimeoutMs ?? HANDSHAKE_TIMEOUT_MS);
+  }
+
+  /** Idempotent teardown: terminate the Worker, close ports and remove the frame. */
+  end(reason: FrameHostEndReason, detail?: string): void {
+    if (this.#ended) return;
+    this.#ended = true;
+    if (this.#timer) clearTimeout(this.#timer);
+    this.#worker?.terminate();
+    this.#worker = undefined;
+    this.#guestPort?.close();
+    this.#guestPort = undefined;
+    if (this.#control) {
+      this.#control.onmessage = null;
+      this.#control.close();
+    }
+    this.#iframe?.remove();
+    this.#iframe = undefined;
+    this.#options.onEnded(reason, detail);
+  }
+
+  #onWorker(notice: BridgeWorkerNotice): void {
+    if (this.#ended) return;
+    if (notice?.t === 'ready' && !this.#iframe) {
+      this.#mount();
+      return;
+    }
+    const reason = notice?.t === 'end' ? notice.reason : 'unexpected_notice';
+    const mapped = WORKER_END[reason];
+    if (mapped) this.end(mapped);
+    else this.end('protocol_error', reason);
+  }
+
+  #mount(): void {
     const iframe = document.createElement('iframe');
     // S3: fixed guardian attributes. No sandbox, allow or allowfullscreen; no-referrer.
     Object.entries(UI_SECURITY_PROFILE.guardianIframe.attributes).forEach(([name, value]) =>
@@ -101,44 +153,25 @@ export class FrameHost {
       if (loads === 1) this.#handshake(iframe);
       else this.end('guardian_reloaded');
     });
-    this.#timer = setTimeout(() => {
-      if (!this.#bound) this.end('handshake_timeout');
-    }, this.#options.handshakeTimeoutMs ?? HANDSHAKE_TIMEOUT_MS);
     this.#iframe = iframe;
-    iframe.src = guardianUrl;
-    container.appendChild(iframe);
-  }
-
-  /** Idempotent teardown: revoke the bridge, close ports and remove the frame. */
-  end(reason: FrameHostEndReason, detail?: string): void {
-    if (this.#ended) return;
-    this.#ended = true;
-    if (this.#timer) clearTimeout(this.#timer);
-    this.#lifecycle.revoke(END_CODES[reason] ?? 'app_disabled');
-    this.#transport?.terminate('closed');
-    if (this.#control) {
-      this.#control.onmessage = null;
-      this.#control.close();
-    }
-    this.#iframe?.remove();
-    this.#iframe = undefined;
-    this.#options.onEnded(reason, detail);
+    iframe.src = this.#options.guardianUrl;
+    this.#options.container.appendChild(iframe);
   }
 
   #handshake(iframe: HTMLIFrameElement): void {
     const target = iframe.contentWindow;
-    if (!target || this.#ended) return;
-    const rpc = new MessageChannel();
+    const guestPort = this.#guestPort;
+    if (!target || !guestPort || this.#ended) return;
+    this.#guestPort = undefined;
     const control = new MessageChannel();
     this.#control = control.port1;
     control.port1.onmessage = (event: MessageEvent) => this.#onControl(event.data);
     control.port1.onmessageerror = () => this.end('messageerror');
-    this.#startSession(rpc.port1);
     // The guardian is same-origin: target the exact Kibana origin, never '*'.
     target.postMessage(
       { t: 'init', p: UI_HANDSHAKE_PROTOCOL, c: randomChallenge() },
       this.#options.kibanaOrigin,
-      [rpc.port2, control.port2]
+      [guestPort, control.port2]
     );
   }
 
@@ -155,18 +188,5 @@ export class FrameHost {
     }
     const known: FrameHostEndReason[] = ['child_reloaded', 'bad_init', 'bad_ready', 'messageerror'];
     this.end(known.find((reason) => reason === type) ?? 'protocol_error');
-  }
-
-  #startSession(port: MessagePort): void {
-    const { transport } = startBridgeSession({
-      port,
-      grant: this.#options.grant,
-      theme: this.#options.theme,
-      executor: this.#options.executor,
-      lifecycle: this.#lifecycle,
-      onTerminate: (reason) => this.end('protocol_error', reason),
-      onLocalRejection: this.#options.onLocalRejection,
-    });
-    this.#transport = transport;
   }
 }

@@ -12,6 +12,7 @@ import {
   childPolicy,
   guardianPolicy,
   isAppSurface,
+  workerPolicy,
   registerSecurityHeadersHook,
   stripReporting,
   SurfaceDecisions,
@@ -24,6 +25,9 @@ const urls = {
   origin: 'http://localhost:5601',
   guardianScript: 'http://localhost:5601/api/app_host/ui_assets/host-guardian.js',
   bootstrapScript: 'http://localhost:5601/api/app_host/ui_assets/host-child.js',
+  capnwebScript: 'http://localhost:5601/api/app_host/ui_assets/host-capnweb.js',
+  sessionUrl: 'http://localhost:5601/internal/app_host/ui/session',
+  executeUrl: 'http://localhost:5601/internal/app_host/ui/execute',
 };
 
 describe('stripReporting', () => {
@@ -46,6 +50,12 @@ describe('surface policies', () => {
     expect(policy).toContain(`script-src ${urls.bootstrapScript} ${ui};`);
     expect(policy).not.toContain("'self'");
     expect(policy).toContain("connect-src 'none'");
+  });
+
+  it('the bridge Worker may import only capnweb and call only the session and execute routes', () => {
+    expect(workerPolicy(urls)).toBe(
+      `default-src 'none'; script-src ${urls.capnwebScript}; connect-src ${urls.sessionUrl} ${urls.executeUrl}`
+    );
   });
 
   it('refuses to interpolate a source that could inject directives', () => {

@@ -11,7 +11,8 @@ import { runT5, runT6 } from './t5_t6_browser';
 import { runT4, runT4Tls } from './t4_channels';
 import { runD } from './d_discover';
 import { runK, runK1, runK2, runK3, runK4, runK5, runK5Reset, runK6 } from './k_session';
-import { runT10, runT3, runT8, runT9Browser } from './u3_adversarial';
+import { runT10, runT3, runT8 } from './u3_adversarial';
+import { runW } from './w_worker';
 import { runT11, runT12, runT13, runT7 } from './u2_authority';
 
 // `k` runs K1–K6 (app session key); `k1` alone is meant for Kibana started with the dev-only
@@ -32,11 +33,12 @@ export const SUITES: Record<string, (ctx: SuiteContext) => Promise<void>> = {
   t1: runT1,
   t5: runT5,
   t6: runT6,
-  t9b: runT9Browser,
   t3: runT3,
   t4: runT4,
   t8: runT8,
   t10: runT10,
+  // W1/W2: the bridge Worker (main-thread responsiveness, queue overflow, handle confinement).
+  w: runW,
   // D1–D5: the Mini Discover tile (data views + ES|QL as the app session key).
   discover: runD,
   // Not in the default selection: needs Kibana over TLS with SameSite=None cookies (--tls).

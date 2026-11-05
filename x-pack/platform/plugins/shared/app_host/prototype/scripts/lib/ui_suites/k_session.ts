@@ -511,19 +511,23 @@ export const runK3 = async (ctx: SuiteContext) => {
   await jestEvidence(
     ctx,
     T,
-    ['server/ui/bridge_service.test.ts', 'public/ui_host/session_client.test.ts'],
+    [
+      'server/ui/bridge_service.test.ts',
+      'server/ui/bridge_worker.test.ts',
+      'public/components/app_ui_page.test.tsx',
+    ],
     [
       [
         'tampered/other-principal/other-space/expired handles (fake clock: app_expired)',
         'K3: tampered, other-principal, other-space and expired handles are refused',
       ],
       [
-        'expired handle: the parent re-mints once (consent given on this page) and retries',
-        'K3: an expired handle is re-minted once on this consented page, then the call is retried',
+        "expired handle: the bridge Worker (minted on this page's consent) re-mints once and retries",
+        'K3: an expired handle is re-minted once, then the call is retried',
       ],
       [
-        'expired handle after teardown: no re-mint',
-        'never re-mints after the frame was torn down (aborted signal)',
+        'after teardown nothing re-mints: the Worker is terminated',
+        'Disable before the session is minted terminates the Worker and never mounts a frame',
       ],
     ]
   );

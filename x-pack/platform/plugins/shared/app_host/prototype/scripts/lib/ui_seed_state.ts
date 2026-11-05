@@ -25,6 +25,8 @@ export const DEMO = {
   dataViewId: 'kbn-apps-demo-logs',
   dataViewTitle: 'kbn-apps-demo-logs-*',
   secretDataViewId: 'kbn-apps-other-secret',
+  /** One runtime field with a field format on the demo data view (getDataView pass-through). */
+  runtimeField: 'event.hour',
   /** Attacker-style `message` values on the newest documents of logs-a; must render as text. */
   hostileMessages: [
     '<img src=x onerror="parent.document.body.textContent=\'PWN\'">',

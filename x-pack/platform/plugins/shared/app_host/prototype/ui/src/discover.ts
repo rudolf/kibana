@@ -136,14 +136,29 @@ export const mountDiscover = (root: HTMLElement, bridge: Bridge): void => {
     fields.textContent = '';
     table.textContent = '';
     chart.textContent = '';
-    for (const name of ['data-fields', 'data-rows', 'data-buckets', 'data-error']) {
+    for (const name of [
+      'data-fields',
+      'data-runtime-fields',
+      'data-rows',
+      'data-buckets',
+      'data-error',
+    ]) {
       tile.removeAttribute(name);
     }
     if (!id) return;
     try {
-      const view = await bridge.getDataView({ id });
-      fields.textContent = view.fields.map(({ name, type }) => `${name} (${type})`).join(', ');
-      tile.setAttribute('data-fields', String(view.fields.length));
+      const { data_view: view } = await bridge.getDataView({ id });
+      const list = Object.values(view.fields).sort((a, b) => a.name.localeCompare(b.name));
+      fields.textContent = list
+        .map(
+          ({ name, type, runtimeField }) => `${name} (${type}${runtimeField ? ', runtime' : ''})`
+        )
+        .join(', ');
+      tile.setAttribute('data-fields', String(list.length));
+      tile.setAttribute(
+        'data-runtime-fields',
+        String(Object.keys(view.runtimeFieldMap ?? {}).length)
+      );
       const sort = view.timeFieldName ? ` | SORT ${ident(view.timeFieldName)} DESC` : '';
       query.value = `FROM ${view.title}${sort} | LIMIT 50`;
       await Promise.all([
@@ -157,11 +172,11 @@ export const mountDiscover = (root: HTMLElement, bridge: Bridge): void => {
   run.addEventListener('click', () => runQuery());
 
   bridge.listDataViews().then(
-    (views) => {
+    ({ data_view: views }) => {
       for (const view of views) {
         const option = el('option');
         option.value = view.id;
-        option.textContent = `${view.name} (${view.title})`;
+        option.textContent = `${view.name || view.title} (${view.title})`;
         picker.append(option);
       }
       tile.setAttribute('data-views', String(views.length));
