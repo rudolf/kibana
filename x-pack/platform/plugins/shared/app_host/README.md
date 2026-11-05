@@ -117,7 +117,9 @@ U2 — delegation and consent:
   `{app_host, app, release, space}`, expiration 1 h, `refresh=false`, and a role descriptor derived **only** from the
   approved manifest: `read` and `view_index_metadata` on `permissions.indices`, and on `space:default`
   `feature_dashboard_v2.read` with the `kibana.dashboard.read` scope and `feature_indexPatterns.read` with
-  the `kibana.dataViews.read` scope; empty `cluster` (so ES|QL `ENRICH` and inference are refused by ES),
+  the `kibana.dataViews.read` scope; empty `cluster` (so ES refuses ES|QL `ENRICH` and explicit inference commands such as `COMPLETION`/`RERANK`;
+  a semantic query on a granted index's `semantic_text` field still runs that field's operator-configured
+  inference endpoint, as it does for any reader of the index),
   no `run_as` (`server/ui/app_key.ts`). Elasticsearch caps the key at the viewer's privileges (`limited_by`), so
   every call is enforced natively as **viewer ∩ app**. After the grant returns, the server re-reads the
   state: if the app was disabled or the generation changed meanwhile (a disable, or a disable plus

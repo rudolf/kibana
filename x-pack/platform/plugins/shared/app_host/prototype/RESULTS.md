@@ -53,8 +53,11 @@ Limits of this cut:
 
 - One result per frame, no streaming. Data views and ES|QL results are capped at 960 KiB (JSON) and 500
   rows; over the cap the call fails (`app_unavailable`), it is never truncated.
-- No command allowlist: Kibana bounds the query size only. `ENRICH` and inference were not re-tested
-  beyond the `ENRICH` refusal above (empty `cluster`).
+- No command allowlist: Kibana bounds the query size only. With an empty `cluster`, ES refuses `ENRICH`
+  (tested above) and explicit inference commands (`COMPLETION`/`RERANK`, from the ES source; not tested).
+  A `MATCH` on a granted index's `semantic_text` field still runs that field's operator-configured
+  inference endpoint (not tested; no seeded semantic field). That is a property of reading the granted
+  index, not something the app key can widen.
 - A data view outside the grant is listed and its metadata (title, time field) is readable; only data is
   refused. Kibana privileges are per saved-object type and space.
 - Native refusals carry two audit reasons: `native_denied` (401/403/404) and `native_rejected` (400:
@@ -203,7 +206,8 @@ and `report-sample` (here pointing at the harness's synthetic local collector).
   the child can navigate itself to `<frame URL>?<data>`. The request reaches Kibana and its logs; S7
   answers 404 and the guardian revokes on the reload. All engines.
 - **Joint session history (KNOWN_LEAK)**: `history.back()` from the frame navigates the top page in
-  Firefox and WebKit (Chromium keeps it); the old handle is refused afterwards.
+  Firefox and WebKit (Chromium keeps it); the old frame is removed and no further execute call follows.
+  Navigation only drops the parent's handle reference; it does not revoke the key or change the generation.
 - **DNS prefetch, WebRTC/STUN, timing: NOT_VERIFIED** (no DNS or UDP observer).
 - **WebKit `load` on fragment navigation**: a same-document `#fragment` navigation fires the iframe's
   `load` event in WebKit, which the guardian treats as a reload and revokes (fail closed); hash-routing

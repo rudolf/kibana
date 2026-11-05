@@ -47,8 +47,9 @@ export const appKeyName = (appId: string, releaseDigest: string): string =>
  * Derives the key's role descriptor from the approved manifest only: `read` and
  * `view_index_metadata` on the granted indices and patterns, Dashboard read (`kibana.dashboard.read`)
  * and Data Views read (`kibana.dataViews.read`) in the session's space only with their scopes, and
- * nothing else (no cluster privileges, so no ES|QL `ENRICH` or inference; no remote indices; no
- * `run_as`). Elasticsearch intersects it with
+ * nothing else (no cluster privileges, so no ES|QL `ENRICH` and no explicit inference commands; no
+ * remote indices; no `run_as`). Searching a granted index's `semantic_text` field still runs that
+ * field's operator-configured inference endpoint, as it would for any reader of the index. Elasticsearch intersects it with
  * the viewer's own privileges (`limited_by`), so the key can never exceed viewer ∩ app.
  */
 export const appKeyRequest = (manifest: AppKeyManifest, spaceId: string): AppKeyRequest => {

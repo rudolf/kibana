@@ -28,7 +28,9 @@ const toCell = (value: unknown): UiEsqlValue | undefined => {
 /**
  * Runs an app-authored ES|QL query with the app session key's client. There is no command
  * allowlist: the key's role descriptor (granted index patterns, empty `cluster`) is what
- * Elasticsearch enforces, so `FROM` outside the grant, `ENRICH` and inference are refused natively.
+ * Elasticsearch enforces, so `FROM` outside the grant, `ENRICH` and explicit inference commands are refused
+ * natively. A `MATCH` on a granted index's `semantic_text` field still triggers that field's configured
+ * inference endpoint (ES runs it on an internal origin); that is part of reading the granted index.
  * Bounds are structural only: the query size (parsed earlier), the operation deadline, the response
  * size read from Elasticsearch, and the projected result (≤ 500 rows; bytes are checked by the caller).
  */
