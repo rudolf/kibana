@@ -9,6 +9,7 @@ import type { HttpStart } from '@kbn/core/public';
 import type { CreateLeaseResponse, UiAppMetadata } from '../../common/ui_protocol';
 import {
   UI_LEASES_PATH,
+  UI_LIMITS,
   isBridgeErrorCode,
   isLeaseId,
   parseExecuteResponse,
@@ -31,15 +32,23 @@ const errorOutcome = (error: unknown): ExecuteOutcome => {
 export const createLeaseFactory =
   (http: HttpStart): LeaseFactory =>
   async (metadata: UiAppMetadata) => {
+    // The server's TTL starts no earlier than this request, so a deadline measured from here on the
+    // parent's own clock fires at or before the server's expiry (clock skew cannot extend it).
+    const requestedAt = Date.now();
     const created = await http.post<CreateLeaseResponse>(UI_LEASES_PATH, {
       body: JSON.stringify({ appId: metadata.appId, releaseDigest: metadata.releaseDigest }),
     });
-    const { leaseId, secret } = created;
+    const { leaseId, secret, ttlMs } = created;
     if (!isLeaseId(leaseId) || typeof secret !== 'string' || secret.length !== 43) {
       throw new Error('app_unavailable');
     }
+    if (typeof ttlMs !== 'number' || !Number.isFinite(ttlMs) || ttlMs <= 0) {
+      throw new Error('app_unavailable');
+    }
+    const expiresAt = requestedAt + Math.min(ttlMs, UI_LIMITS.leaseTtlMs);
     let released = false;
     return {
+      expiresAt,
       executor: async (operation, signal) => {
         if (released) return { ok: false, code: 'app_disabled' };
         try {

@@ -11,7 +11,7 @@
 // Env: ES_AUTH (local admin user:pass; also the local superuser installer). Results are written to
 // .local/ui_security-<timestamp>.json; credentials and lease secrets are never printed.
 
-import { writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { rmSync } from 'node:fs';
 import { parseArgs } from './lib/args';
@@ -21,22 +21,31 @@ import { LOCAL_DIR } from './lib/secrets';
 import { readUiSeed } from './lib/ui_seed_state';
 import { Receiver, Report, readUiUsers } from './lib/ui_harness';
 import { PACKAGE_DIR, type SuiteContext } from './lib/ui_suites/context';
-import { SUITES } from './lib/ui_suites/registry';
+import { DEFAULT_SUITES, SUITES } from './lib/ui_suites/registry';
 import { headerDumps } from './lib/ui_suites/t1_shell';
 
-const args = parseArgs(process.argv.slice(2), ['kibana', 'engines', 'suites', 'es']);
+const args = parseArgs(process.argv.slice(2), ['kibana', 'engines', 'suites', 'es', 'tls']);
 const kibana = (args.kibana ?? process.env.KB_URL ?? 'http://localhost:5601').replace(/\/$/, '');
 const es = (args.es ?? process.env.ES_URL ?? 'http://localhost:9200').replace(/\/$/, '');
 const adminAuth = process.env.ES_AUTH;
 if (!adminAuth) throw new Error('ES_AUTH (local superuser user:pass) is required');
 const engines = (args.engines ?? 'chromium,firefox,webkit').split(',').filter(Boolean);
-const selected = (args.suites ?? Object.keys(SUITES).join(',')).split(',').filter(Boolean);
+const selected = (args.suites ?? DEFAULT_SUITES.join(',')).split(',').filter(Boolean);
 
+// --tls <dir>: the SameSite=None HTTPS fixture. <dir> holds the local self-signed key.pem/cert.pem
+// (git-ignored); receivers then use TLS too, so no result depends on mixed-content blocking. Run
+// with NODE_EXTRA_CA_CERTS=<dir>/cert.pem so Node trusts the same certificate.
+const tlsDir = args.tls;
+const tls = tlsDir
+  ? { key: readFileSync(join(tlsDir, 'key.pem')), cert: readFileSync(join(tlsDir, 'cert.pem')) }
+  : undefined;
 const report = new Report();
-const receiver = new Receiver(5698);
-const collector = new Receiver(5699);
+const receiver = new Receiver(5698, { tls });
+const collector = new Receiver(5699, { tls });
+const preconnect = new Receiver(5697, { tls });
 await receiver.start();
 await collector.start();
+await preconnect.start();
 const originalManifest = await readRawManifest(PACKAGE_DIR).catch(() => undefined);
 // Fresh operator state for this run: the previous approval history is uninstalled.
 rmSync(CONSENT_FILE, { force: true });
@@ -52,6 +61,8 @@ const ctx: SuiteContext = {
   report,
   receiver,
   collector,
+  preconnect,
+  tls: Boolean(tls),
   current: undefined,
   currentEntry: undefined,
   nextVersion: () => `1.${minor++}.0`,
@@ -68,6 +79,7 @@ try {
 } finally {
   await receiver.stop();
   await collector.stop();
+  await preconnect.stop();
   rmSync(CONSENT_FILE, { force: true });
   if (originalManifest !== undefined) await writeRawManifest(PACKAGE_DIR, originalManifest);
 }

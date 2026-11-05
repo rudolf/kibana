@@ -8,7 +8,8 @@
 import type { SuiteContext } from './context';
 import { runT1 } from './t1_shell';
 import { runT5, runT6 } from './t5_t6_browser';
-import { runT10, runT3, runT4, runT8, runT9Browser } from './u3_adversarial';
+import { runT4, runT4Tls } from './t4_channels';
+import { runT10, runT3, runT8, runT9Browser } from './u3_adversarial';
 import { runT11, runT12, runT13, runT14, runT2, runT7, runT9Server } from './u2_authority';
 
 // Order matters: T9 asserts the per-principal and global lease caps, so it runs before browser
@@ -29,4 +30,9 @@ export const SUITES: Record<string, (ctx: SuiteContext) => Promise<void>> = {
   t4: runT4,
   t8: runT8,
   t10: runT10,
+  // Not in the default selection: needs Kibana over TLS with SameSite=None cookies (--tls).
+  t4tls: runT4Tls,
 };
+
+/** Suites run when `--suites` is omitted. */
+export const DEFAULT_SUITES = Object.keys(SUITES).filter((name) => name !== 't4tls');

@@ -5,13 +5,13 @@
  * 2.0.
  */
 
-import { RpcSession } from 'capnweb';
 import type { BridgeErrorCode, UiTheme } from '../../common/ui_protocol';
 import { UI_HANDSHAKE_PROTOCOL, UI_LIMITS } from '../../common/ui_protocol';
 import { UI_SECURITY_PROFILE } from '../../common/ui_contract';
 import type { BridgeExecutor, BridgeGrant } from './bridge_root';
-import { AppBridge, BridgeLifecycle, sanitizeBridgeError } from './bridge_root';
-import { BoundedPortTransport } from './port_transport';
+import { BridgeLifecycle } from './bridge_root';
+import type { BoundedPortTransport } from './port_transport';
+import { startBridgeSession } from './bridge_session';
 
 export type FrameHostEndReason =
   | 'unmounted'
@@ -36,6 +36,8 @@ export interface FrameHostOptions {
   readonly grant: BridgeGrant;
   readonly theme: () => UiTheme;
   readonly executor: BridgeExecutor | undefined;
+  /** Parent-clock lease deadline: the frame and port are torn down then, even when idle. */
+  readonly leaseExpiresAt?: number;
   readonly onBound?: () => void;
   readonly onEnded: (reason: FrameHostEndReason, detail?: string) => void;
   readonly onLocalRejection?: (method: string, code: BridgeErrorCode) => void;
@@ -72,6 +74,7 @@ export class FrameHost {
   #transport: BoundedPortTransport | undefined;
   #control: MessagePort | undefined;
   #timer: ReturnType<typeof setTimeout> | undefined;
+  #expiryTimer: ReturnType<typeof setTimeout> | undefined;
   #ended = false;
   #bound = false;
 
@@ -105,6 +108,13 @@ export class FrameHost {
     this.#timer = setTimeout(() => {
       if (!this.#bound) this.end('handshake_timeout');
     }, this.#options.handshakeTimeoutMs ?? HANDSHAKE_TIMEOUT_MS);
+    const { leaseExpiresAt } = this.#options;
+    if (leaseExpiresAt !== undefined) {
+      this.#expiryTimer = setTimeout(
+        () => this.end('expired'),
+        Math.max(0, leaseExpiresAt - Date.now())
+      );
+    }
     this.#iframe = iframe;
     iframe.src = guardianUrl;
     container.appendChild(iframe);
@@ -115,6 +125,7 @@ export class FrameHost {
     if (this.#ended) return;
     this.#ended = true;
     if (this.#timer) clearTimeout(this.#timer);
+    if (this.#expiryTimer) clearTimeout(this.#expiryTimer);
     this.#lifecycle.revoke(END_CODES[reason] ?? 'app_disabled');
     this.#transport?.terminate('closed');
     if (this.#control) {
@@ -159,35 +170,15 @@ export class FrameHost {
   }
 
   #startSession(port: MessagePort): void {
-    const sessionRef: { current?: RpcSession } = {};
-    const transport = new BoundedPortTransport(port, (reason) =>
-      this.end('protocol_error', reason)
-    );
-    this.#transport = transport;
-    const bridge = new AppBridge(
-      this.#options.grant,
-      this.#options.theme,
-      this.#options.executor,
-      {
-        beforeCall: () => {
-          if (!sessionRef.current) return true;
-          const { imports, exports } = sessionRef.current.getStats();
-          if (imports + exports <= UI_LIMITS.liveRpcStubs) return true;
-          this.end('protocol_error', 'live_stubs');
-          return false;
-        },
-        terminate: (reason) => this.end('protocol_error', reason),
-        onLocalRejection: this.#options.onLocalRejection,
-      },
-      this.#lifecycle
-    );
-    sessionRef.current = new RpcSession(transport, bridge, {
-      limits: {
-        maxDepth: UI_LIMITS.rpcMaxDepth,
-        maxBigIntDigits: UI_LIMITS.rpcMaxBigIntDigits,
-        maxMessageSize: UI_LIMITS.frameBytes,
-      },
-      onSendError: sanitizeBridgeError,
+    const { transport } = startBridgeSession({
+      port,
+      grant: this.#options.grant,
+      theme: this.#options.theme,
+      executor: this.#options.executor,
+      lifecycle: this.#lifecycle,
+      onTerminate: (reason) => this.end('protocol_error', reason),
+      onLocalRejection: this.#options.onLocalRejection,
     });
+    this.#transport = transport;
   }
 }

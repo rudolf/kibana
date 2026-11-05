@@ -207,6 +207,51 @@ describe('BridgeService leases (T7/T14/S11)', () => {
     expect(code(await service.execute(caller(), leaseId, secret, op))).toBe('app_expired');
   });
 
+  describe('P1: lease expiry during a pending read (fake clock)', () => {
+    beforeEach(() => jest.useFakeTimers({ now: 1_000_000 }));
+    afterEach(() => jest.useRealTimers());
+
+    it('aborts the pending read at expiry and returns app_expired instead of data', async () => {
+      let finish: (() => void) | undefined;
+      let seen: AbortSignal | undefined;
+      const { service, caller, lease, runner } = setup({ now: () => Date.now() });
+      (runner.runSummary as jest.Mock).mockImplementation(
+        (_a: string, _e: unknown, signal: AbortSignal) => {
+          seen = signal;
+          return new Promise((resolve) => {
+            finish = () =>
+              resolve({
+                status: 'ok',
+                body: {
+                  appId: 'alert-digest',
+                  version: '2.0.0',
+                  label: 'L',
+                  counts: { high: 9, low: 9 },
+                },
+              });
+          });
+        }
+      );
+      const { leaseId, secret } = await lease();
+      // Start the read 1 ms before expiry, inside the 5 s operation deadline.
+      await jest.advanceTimersByTimeAsync(5 * 60 * 1000 - 1);
+      const pending = service.execute(caller(), leaseId, secret, { op: 'app.summary' });
+      await jest.advanceTimersByTimeAsync(0);
+      expect(seen?.aborted).toBe(false);
+      await jest.advanceTimersByTimeAsync(2);
+      const abortedAtExpiry = seen?.aborted;
+      finish?.();
+      const result = await pending;
+      expect(result.body).toEqual({ ok: false, code: 'app_expired' });
+      expect(JSON.stringify(result)).not.toContain('"high":9');
+      // Expiry is enforced by the server on its own, not only by a later request.
+      expect(abortedAtExpiry).toBe(true);
+      expect(
+        code(await service.execute(caller(), leaseId, secret, { op: 'app.summary' }))
+      ).not.toBe('ok');
+    });
+  });
+
   it('never logs the lease secret or id', async () => {
     const { service, caller, lease, logger } = setup();
     const { leaseId, secret } = await lease();
@@ -593,5 +638,248 @@ describe('BridgeService audit (T10/S9)', () => {
     expect(record.event).toEqual(
       expect.objectContaining({ outcome: 'failure', reason: 'unknown_lease' })
     );
+  });
+});
+
+describe('BridgeService second app identity (T7/T14)', () => {
+  const second = uiManifest({ id: 'second-app', title: 'Second app' }) as never as Extract<
+    UiReleaseState,
+    { status: 'approved' }
+  >['manifest'];
+  const asApproved = (m: typeof manifest): UiReleaseState => ({
+    status: 'approved',
+    manifest: m,
+    consent: {} as never,
+  });
+
+  it('a valid lease for one app is refused when the installed context is another app', async () => {
+    let state = asApproved(manifest);
+    const { service, caller, runner, esClient, selfClient } = setup({ state: () => state });
+    const first = (await service.createLease(caller(), 'alert-digest', manifest.releaseDigest))
+      .body as { leaseId: string; secret: string };
+    expect(
+      code(await service.execute(caller(), first.leaseId, first.secret, { op: 'app.summary' }))
+    ).toBe('ok');
+    // The installed context becomes a different app (even reusing the old digest value).
+    state = asApproved({ ...second, releaseDigest: manifest.releaseDigest });
+    expect(
+      code(await service.execute(caller(), first.leaseId, first.secret, { op: 'app.summary' }))
+    ).toBe('app_stale');
+    // Revoked: switching the context back does not revive it.
+    state = asApproved(manifest);
+    expect(
+      code(await service.execute(caller(), first.leaseId, first.secret, { op: 'app.summary' }))
+    ).toBe('app_denied');
+    // Leases for the second app, then the first app installed again: refused before any I/O.
+    (runner.runSummary as jest.Mock).mockClear();
+    esClient.mockClear();
+    selfClient.mockClear();
+    for (const operation of [
+      { op: 'app.summary' },
+      { op: 'es.search', params: { index: 'kbn-apps-prototype-alerts', size: 1 } },
+      { op: 'kibana.dashboard.read', params: { id: DASHBOARD_ID } },
+    ]) {
+      state = asApproved(second);
+      const other = (await service.createLease(caller(), 'second-app', second.releaseDigest))
+        .body as { leaseId: string; secret: string };
+      state = asApproved(manifest);
+      expect(code(await service.execute(caller(), other.leaseId, other.secret, operation))).toBe(
+        'app_stale'
+      );
+    }
+    expect(runner.runSummary).not.toHaveBeenCalled();
+    expect(esClient).not.toHaveBeenCalled();
+    expect(selfClient).not.toHaveBeenCalled();
+    // A lease request naming the other app while this one is installed is refused.
+    expect(code(await service.createLease(caller(), 'second-app', second.releaseDigest))).toBe(
+      'app_stale'
+    );
+  });
+
+  it('different app contexts of one user have independent operation buckets', async () => {
+    let state = asApproved(manifest);
+    const { service, caller } = setup({ state: () => state, now: () => 0 });
+    const a = (await service.createLease(caller(), 'alert-digest', manifest.releaseDigest))
+      .body as {
+      leaseId: string;
+      secret: string;
+    };
+    state = asApproved(second);
+    const b = (await service.createLease(caller(), 'second-app', second.releaseDigest)).body as {
+      leaseId: string;
+      secret: string;
+    };
+    state = asApproved(manifest);
+    const codesA: string[] = [];
+    for (let i = 0; i < 11; i++)
+      codesA.push(
+        code(await service.execute(caller(), a.leaseId, a.secret, { op: 'app.summary' }))
+      );
+    expect(codesA.slice(0, 10).every((c) => c === 'ok')).toBe(true);
+    expect(codesA[10]).toBe('app_rate_limited');
+    state = asApproved(second);
+    expect(code(await service.execute(caller(), b.leaseId, b.secret, { op: 'app.summary' }))).toBe(
+      'ok'
+    );
+  });
+});
+
+describe('BridgeService budget boundaries (T9)', () => {
+  it('operations per lease: 100 accepted, the 101st refused with lease_budget', async () => {
+    let now = 0;
+    const { service, caller, lease, audit } = setup({ now: () => now });
+    const { leaseId, secret } = await lease();
+    const codes: string[] = [];
+    for (let i = 0; i < 101; i++) {
+      now += 1000; // refill the shared bucket so only the per-lease budget applies
+      codes.push(code(await service.execute(caller(), leaseId, secret, { op: 'app.summary' })));
+    }
+    expect(codes.slice(0, 100).every((c) => c === 'ok')).toBe(true);
+    expect(codes[100]).toBe('app_rate_limited');
+    expect(audit().at(-1)?.event).toEqual(expect.objectContaining({ reason: 'lease_budget' }));
+  });
+
+  it('result size: exactly 16 KiB returned, one byte more refused', async () => {
+    const body = (labelLength: number) => ({
+      appId: 'alert-digest',
+      version: '2.0.0',
+      label: 'x'.repeat(labelLength),
+      counts: { high: 1, low: 1 },
+    });
+    const overhead = Buffer.byteLength(JSON.stringify(body(0)));
+    for (const [length, expected] of [
+      [16 * 1024 - overhead, 'ok'],
+      [16 * 1024 - overhead + 1, 'app_unavailable'],
+    ] as const) {
+      const { service, caller, lease } = setup({
+        summary: async () => ({ status: 'ok', body: body(length) }),
+      });
+      const { leaseId, secret } = await lease();
+      expect(code(await service.execute(caller(), leaseId, secret, { op: 'app.summary' }))).toBe(
+        expected
+      );
+    }
+  });
+
+  describe('operation deadline (fake clock)', () => {
+    beforeEach(() => jest.useFakeTimers({ now: 1_000_000 }));
+    afterEach(() => jest.useRealTimers());
+
+    it('aborts the handler at exactly 5 s and returns app_timeout; not before', async () => {
+      let seen: AbortSignal | undefined;
+      const { service, caller, lease, runner } = setup({ now: () => Date.now() });
+      (runner.runSummary as jest.Mock).mockImplementation(
+        (_a: string, _e: unknown, signal: AbortSignal) => {
+          seen = signal;
+          return new Promise(() => undefined);
+        }
+      );
+      const { leaseId, secret } = await lease();
+      let settled: unknown;
+      const pending = service
+        .execute(caller(), leaseId, secret, { op: 'app.summary' })
+        .then((result) => (settled = result));
+      await jest.advanceTimersByTimeAsync(4999);
+      expect(settled).toBeUndefined();
+      expect(seen?.aborted).toBe(false);
+      await jest.advanceTimersByTimeAsync(1);
+      await pending;
+      expect(seen?.aborted).toBe(true);
+      expect((settled as { body: unknown }).body).toEqual({ ok: false, code: 'app_timeout' });
+    });
+  });
+});
+
+describe('BridgeService handlers reach only their own services (T11, behavioural)', () => {
+  /** Records every property read and call on a client; only `allowed` members are callable. */
+  const recorder = (allowed: Record<string, (...args: unknown[]) => unknown>) => {
+    const touched: string[] = [];
+    const proxy = (path: string): unknown =>
+      new Proxy(function stub() {}, {
+        get: (_t, key) => {
+          const name = `${path}${path ? '.' : ''}${String(key)}`;
+          if (key === 'then') return undefined;
+          touched.push(name);
+          return allowed[name] ?? proxy(name);
+        },
+        apply: () => {
+          touched.push(`${path}()`);
+          throw new Error(`unexpected call ${path}`);
+        },
+      });
+    return { client: proxy(''), touched };
+  };
+
+  it('es.search uses only search(), dashboard read only fetch(GET /api/dashboards/{granted}), summary only the runner', async () => {
+    const es = recorder({
+      search: async () => ({
+        hits: {
+          total: { value: 1 },
+          hits: [{ _index: 'kbn-apps-prototype-alerts', _source: { severity: 'high', rule: 'r' } }],
+        },
+      }),
+    });
+    const fetches: Array<[string, Record<string, unknown>]> = [];
+    const self = recorder({
+      fetch: async (path: unknown, options: unknown) => {
+        fetches.push([path as string, options as Record<string, unknown>]);
+        return (makeSelf(200, { id: DASHBOARD_ID, data: { title: 'T' } }).fetch as jest.Mock)(path);
+      },
+    });
+    const { service, caller, lease, runner } = setup({
+      es: es.client,
+      self: self.client as HttpSelfScopedClient,
+    });
+    const { leaseId, secret } = await lease();
+    expect(
+      code(
+        await service.execute(caller(), leaseId, secret, {
+          op: 'es.search',
+          params: { index: 'kbn-apps-prototype-alerts', size: 1 },
+        })
+      )
+    ).toBe('ok');
+    expect(
+      code(
+        await service.execute(caller(), leaseId, secret, {
+          op: 'kibana.dashboard.read',
+          params: { id: DASHBOARD_ID },
+        })
+      )
+    ).toBe('ok');
+    expect(code(await service.execute(caller(), leaseId, secret, { op: 'app.summary' }))).toBe(
+      'ok'
+    );
+    // No security (API keys, grantAsInternalUser, run_as), transport, connector or inference access.
+    expect(es.touched).toEqual(['search']);
+    expect(self.touched).toEqual(['fetch']);
+    expect(fetches.map(([path, options]) => [path, options.method])).toEqual([
+      [`/api/dashboards/${DASHBOARD_ID}`, 'GET'],
+    ]);
+    expect(runner.runSummary).toHaveBeenCalledTimes(1);
+  });
+
+  it('F4: the dashboard self call uses exactly the pinned options', async () => {
+    const self = makeSelf(200, { id: DASHBOARD_ID, data: { title: 'T' } });
+    const { service, caller, lease } = setup({ self });
+    const { leaseId, secret } = await lease();
+    await service.execute(caller(), leaseId, secret, {
+      op: 'kibana.dashboard.read',
+      params: { id: DASHBOARD_ID },
+    });
+    const [[path, options]] = (self.fetch as jest.Mock).mock.calls;
+    expect(path).toBe(`/api/dashboards/${DASHBOARD_ID}`);
+    const { signal, ...rest } = options;
+    expect(signal).toBeInstanceOf(AbortSignal);
+    // Exact object: no prependBasePath override, no forwardRequestHeaders, no extra headers.
+    expect(rest).toStrictEqual({
+      target: 'local',
+      method: 'GET',
+      access: 'public',
+      version: '2023-10-31',
+      timeout: 2000,
+      asResponse: true,
+      rawResponse: true,
+    });
   });
 });

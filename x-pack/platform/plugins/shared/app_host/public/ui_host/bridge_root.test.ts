@@ -11,6 +11,7 @@ import type { UiOperation, UiTheme } from '../../common/ui_protocol';
 import {
   AppBridge,
   BridgeLifecycle,
+  bridgeError,
   sanitizeBridgeError,
   type ExecuteOutcome,
 } from './bridge_root';
@@ -129,6 +130,21 @@ describe('AppBridge', () => {
     expect(await codeOf(bridge.getTheme())).toBe('app_disabled');
   });
 
+  it('errors carry no stack even where stack is an inherited accessor (Firefox)', () => {
+    // Emulate an engine where `stack` is an accessor inherited from the prototype, not an own
+    // property: deleting an own `stack` would then expose the inherited one.
+    const firefoxLike = Object.create(Error.prototype, {
+      stack: {
+        configurable: true,
+        get: () => 'bridgeError@http://localhost:5601/bundles/app_host.js:1:2',
+      },
+    });
+    for (const error of [bridgeError('app_denied'), sanitizeBridgeError(new Error('x'))]) {
+      Object.setPrototypeOf(error, firefoxLike);
+      expect(error.stack).toBe('');
+    }
+  });
+
   it('never forwards non-schema results or raw error codes', async () => {
     const { bridge } = setup(async () => ({ ok: true, result: { ...SUMMARY, extra: '<b>' } }));
     expect(await codeOf(bridge.callAppRoute({ method: 'GET', path: '/summary' }))).toBe(
@@ -137,7 +153,7 @@ describe('AppBridge', () => {
     expect(sanitizeBridgeError(new Error('Forbidden: user x lacks .security')).message).toBe(
       'app_unavailable'
     );
-    expect(sanitizeBridgeError(new Error('app_denied')).stack).toBeUndefined();
+    expect(sanitizeBridgeError(new Error('app_denied')).stack).toBeFalsy();
   });
 });
 
@@ -248,13 +264,14 @@ describe('AppBridge over capnweb + bounded MessageChannel (T9)', () => {
     close();
   });
 
-  it('a message deeper than 12 levels aborts the session', async () => {
-    const { remote, ended, close } = connect();
+  it('a message deeper than 12 levels aborts the session with depth_exceeded', async () => {
+    const { remote, ended, calls, close } = connect();
     let deep: unknown = 'x';
     for (let i = 0; i < 20; i++) deep = { deep };
     expect(await codeOf(remote.search(deep))).not.toBe('ok');
     await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(ended.length).toBeGreaterThan(0);
+    expect(ended).toEqual(['depth_exceeded']);
+    expect(calls).toHaveLength(0);
     close();
   });
 });

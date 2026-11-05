@@ -5,7 +5,13 @@
  * 2.0.
  */
 
-import { createServer, type IncomingMessage, type Server } from 'node:http';
+import { createServer, type IncomingMessage, type RequestListener, type Server } from 'node:http';
+import { createServer as createTlsServer } from 'node:https';
+
+export interface TlsMaterial {
+  readonly key: Buffer;
+  readonly cert: Buffer;
+}
 
 /** Local receiver: counts hits per marker; used for egress and CSP-report observations. */
 export class Receiver {
@@ -13,18 +19,27 @@ export class Receiver {
   readonly port: number;
   /** TCP connections accepted (a preconnect opens one without sending any HTTP request). */
   connections = 0;
+  /** Fixed harness-owned documents (control pages, control bundles), keyed by exact path. */
+  readonly static = new Map<string, { readonly type: string; readonly body: string }>();
+  readonly #tls: TlsMaterial | undefined;
+  readonly #host: string;
   #server: Server | undefined;
 
-  constructor(port: number) {
+  constructor(
+    port: number,
+    { tls, host = '127.0.0.1' }: { tls?: TlsMaterial; host?: string } = {}
+  ) {
     this.port = port;
+    this.#tls = tls;
+    this.#host = host;
   }
 
   public get origin(): string {
-    return `http://127.0.0.1:${this.port}`;
+    return `${this.#tls ? 'https' : 'http'}://${this.#host}:${this.port}`;
   }
 
   async start(): Promise<void> {
-    this.#server = createServer((request: IncomingMessage, response) => {
+    const handler: RequestListener = (request: IncomingMessage, response) => {
       const chunks: Buffer[] = [];
       request.on('data', (chunk: Buffer) => {
         if (chunks.reduce((n, c) => n + c.length, 0) < 64 * 1024) chunks.push(chunk);
@@ -36,6 +51,12 @@ export class Receiver {
           cookie: Boolean(request.headers.cookie),
           body: Buffer.concat(chunks).toString('utf8').slice(0, 4096),
         });
+        const fixed = this.static.get((request.url ?? '').split('?')[0]);
+        if (fixed) {
+          response.writeHead(200, { 'content-type': fixed.type, 'cache-control': 'no-store' });
+          response.end(fixed.body);
+          return;
+        }
         if (request.url === '/nav-control') {
           // Positive control without the guardian: a sandboxed child may navigate itself anywhere.
           response.writeHead(200, { 'content-type': 'text/html' });
@@ -65,7 +86,8 @@ export class Receiver {
         });
         response.end('ok');
       });
-    });
+    };
+    this.#server = this.#tls ? createTlsServer(this.#tls, handler) : createServer(handler);
     this.#server.on('connection', () => {
       this.connections += 1;
     });

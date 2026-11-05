@@ -22,8 +22,8 @@ import {
   waitForChild,
   waitForStatus,
 } from '../ui_harness';
-import { kfetch, release, session, type SuiteContext } from './context';
-import { ensureHostile, readProbe, waitProbe } from './t5_t6_browser';
+import { jestEvidence, kfetch, release, session, type SuiteContext } from './context';
+import { ensureHostile, waitProbe } from './t5_t6_browser';
 import {
   apiHeaders,
   codeOf,
@@ -48,7 +48,7 @@ interface RunProbe {
   __probe: { run: Record<string, (marker: string) => unknown> };
 }
 
-const runIn = (child: Frame, name: string, marker: string) =>
+export const runIn = (child: Frame, name: string, marker: string): Promise<unknown> =>
   child
     .evaluate(([fn, m]) => (window as unknown as RunProbe).__probe.run[fn](m), [
       name,
@@ -91,7 +91,7 @@ const legacyReader = (): { username: string; password: string } | undefined => {
     : undefined;
 };
 
-const openBound = async (page: Page, ctx: SuiteContext) => {
+export const openBound = async (page: Page, ctx: SuiteContext) => {
   await openAndAllow(page, ctx.kibana);
   await waitForStatus(page, /^bound$/);
   return waitForChild(page);
@@ -168,34 +168,40 @@ export const runT3 = async (ctx: SuiteContext) => {
         );
         report.expect(
           T,
-          'compromised UI: out-of-grant and non-delegable attempts denied',
+          'compromised UI: out-of-grant and non-delegable attempts denied with their exact codes',
           engine,
-          ['otherIndex', 'ungrantedDashboard', 'unknownMethod'].every((k) =>
-            (b[k] ?? '').startsWith('err:')
-          ),
+          b.otherIndex === 'err:bridge_invalid_request' &&
+            b.ungrantedDashboard === 'err:app_denied' &&
+            b.unknownMethod === 'err:app_unavailable',
           {
             otherIndex: b.otherIndex,
             ungrantedDashboard: b.ungrantedDashboard,
             unknownMethod: b.unknownMethod,
           }
         );
+        const violations = await child.evaluate(
+          () => (window as unknown as { __probe: { violations: string[] } }).__probe.violations
+        );
         report.expect(
           T,
-          'unsafe renderer: inline handler blocked by CSP, parent DOM unchanged',
+          'unsafe renderer: inline handler blocked by CSP (violation observed), parent DOM unchanged',
           engine,
           probe.results.inlineHandler === 'blocked' &&
+            violations.some((v) => /^script-src(-attr|-elem)?\|inline/.test(v)) &&
             (probe.results.parentBodyWrite ?? '').startsWith('blocked') &&
-            !(await s.page.locator('body').innerText()).startsWith('PWN')
+            !(await s.page.locator('body').innerText()).startsWith('PWN'),
+          {
+            inlineHandler: probe.results.inlineHandler,
+            inlineViolations: violations.filter((v) => /\|inline/.test(v)),
+          }
         );
         await sleep(1000);
         const records = auditLines()
           .slice(auditBefore)
           .map((line) => JSON.parse(line) as Record<string, any>);
-        const permitted = records.filter(
-          (r) =>
-            r.user?.name === users.viewer.username &&
-            r.event?.outcome === 'success' &&
-            r.app?.via === 'bridge'
+        const mine = records.filter((r) => r.user?.name === users.viewer.username);
+        const permitted = mine.filter(
+          (r) => r.event?.outcome === 'success' && r.app?.via === 'bridge'
         );
         report.expect(
           T,
@@ -206,272 +212,156 @@ export const runT3 = async (ctx: SuiteContext) => {
           ),
           { capabilities: permitted.map((r) => r.app?.capability) }
         );
-        // Full abuse corpus last: repeated invalid calls terminate the session by design.
-        await runIn(child, 'bridgeAbuse', '');
-        await sleep(1500);
-        const after = await readProbe(child).catch(() => undefined);
-        report.add(
+        // The hostile run's out-of-grant attempts (other index, ungranted dashboard, unknown method)
+        // are refused by the parent and never reach the server: no failure records, while the
+        // permitted reads above (positive control) are recorded.
+        const serverFailures = mine.filter(
+          (r) => r.event?.outcome === 'failure' && r.app?.via === 'bridge'
+        );
+        report.expect(
           T,
-          'bridge abuse corpus (other route, traversal, wildcard, prototype names, callbacks)',
+          'local-only parent rejections are not server audit events (permitted reads are)',
           engine,
-          'PASS',
-          { results: after?.bridge, frame: await frameStatus(s.page) }
+          permitted.length >= 3 && serverFailures.length === 0,
+          {
+            permitted: permitted.length,
+            serverFailures: serverFailures.map((r) => r.event?.reason),
+          }
         );
       } finally {
         await s.close();
       }
     });
+    await report.guard(T, 'bridge abuse corpus', engine, () => runBridgeCorpus(ctx, engine));
   }
 };
 
-// ---------------------------------------------------------------- T4
-const BLOCKED_MARKERS = [
-  'fetch',
-  'fetchnocors',
-  'xhr',
-  'ws',
-  'beacon',
-  'sse',
-  'img',
-  'cssimport',
-  'cssbg',
-  'font',
-  'video',
-  'audio',
-  'object',
-  'embed',
-  'nestedframe',
-  'prefetch',
-  'stylesheet',
-  'worker',
-  'sharedworker',
-  'form',
-  'popup',
-  'dynimport',
-  'script',
+/** Expected public code for each named abuse case (asserted exactly). */
+const ABUSE_EXPECTED: Record<string, string> = {
+  otherRoute: 'err:bridge_invalid_request',
+  traversal: 'err:bridge_invalid_request',
+  encodedPath: 'err:bridge_invalid_request',
+  queryTrick: 'err:bridge_invalid_request',
+  postMethod: 'err:bridge_invalid_request',
+  otherIndex: 'err:bridge_invalid_request',
+  auditIndex: 'err:bridge_invalid_request',
+  wildcard: 'err:bridge_invalid_request',
+  extraField: 'err:bridge_invalid_request',
+  functionArg: 'err:bridge_invalid_request',
+  thenableArg: 'err:bridge_invalid_request',
+  ungrantedDashboard: 'err:app_denied',
+  unknownMethod: 'err:app_unavailable',
+};
+// The hostile auto-run already makes 1 invalid call (other index), so at most 6 more per frame (the
+// 8th invalid call terminates by design). Each batch ends with a positive control proving the
+// session was still open, so no case is "passed" by a dead session.
+const ABUSE_BATCHES: string[][] = [
+  ['otherRoute', 'traversal', 'encodedPath', 'queryTrick', 'postMethod', 'otherIndex'],
+  [
+    'auditIndex',
+    'wildcard',
+    'extraField',
+    'functionArg',
+    'thenableArg',
+    'ungrantedDashboard',
+    'unknownMethod',
+  ],
 ];
+const RAW_NAMES = ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'valueOf'];
 
-const NAVIGATIONS: Array<[string, string]> = [
-  ['navigateReceiver', 'self-navigation to receiver'],
-  ['linkClick', 'link click to receiver'],
-  ['metaRefresh', 'meta refresh to receiver'],
-  ['setWindowNameAndNavigate', 'window.name + navigation to receiver'],
-  ['navigateKibana', 'self-navigation to another Kibana path'],
-  ['navigateRedirect', 'navigation via Kibana login redirect'],
-  ['ping', '<a ping> (fragment navigation)'],
-];
-
-export const runT4 = async (ctx: SuiteContext) => {
+const runBridgeCorpus = async (ctx: SuiteContext, engine: string) => {
   const { report, users } = ctx;
-  const T = 'T4';
-  await ensureHostile(ctx);
-  for (const engine of ctx.engines) {
-    await report.guard(T, 'channels', engine, async () => {
-      // Positive controls: the receiver works from Node and from a normal browser page.
-      const control = `ctl-${engine}-${Date.now()}`;
-      await fetch(`${ctx.receiver.origin}/hit?m=${control}`);
-      const s = await session(ctx, engine, users.viewer);
-      try {
-        const page = s.page;
-        const requests: Array<{ url: string; referer?: string }> = [];
-        page.on('request', (request) =>
-          requests.push({ url: request.url(), referer: request.headers().referer })
-        );
-        await page.goto(`${ctx.kibana}/app/home`, { waitUntil: 'domcontentloaded' });
-        await page.evaluate(
-          (url) => fetch(url, { mode: 'no-cors' }).catch(() => undefined),
-          `${ctx.receiver.origin}/hit?m=${control}-browser`
-        );
-        await sleep(500);
-        report.expect(
-          T,
-          'positive control: receiver reachable from Node and from an ordinary page',
-          engine,
-          ctx.receiver.count(control) >= 2,
-          { hits: ctx.receiver.count(control) }
-        );
-        const hitsBefore = ctx.receiver.hits.length;
-        const connectionsBefore = ctx.receiver.connections;
-        const kibanaLogMark = httpDebugMark();
-        const child = await openBound(page, ctx);
-        const probe = await waitProbe(child);
-        await sleep(2500);
-        const newHits = ctx.receiver.hits.slice(hitsBefore);
-        const byMarker = Object.fromEntries(
-          BLOCKED_MARKERS.map((m) => [
-            m,
-            newHits.filter((h) => h.path.includes(`m=${m}`) || h.path.includes(`/hit?m=${m}`))
-              .length,
-          ])
-        );
-        report.expect(
-          T,
-          'fetch/XHR/WS/beacon/SSE/image/CSS import+background/font/media/object/embed/nested frame/prefetch/worker/form/popup/import: zero receiver hits',
-          engine,
-          newHits.length === 0,
-          {
-            totalHits: newHits.length,
-            byMarker,
-            results: pick(probe.results, [
-              'fetchReceiver',
-              'fetchReceiverNoCors',
-              'xhr',
-              'webSocket',
-              'beacon',
-              'eventSource',
-              'worker',
-              'blobWorker',
-              'sharedWorker',
-              'formSubmit',
-            ]),
-          }
-        );
-        const kibanaHits = httpDebugSince(kibanaLogMark).filter((line) =>
-          line.includes('m=fetchkibana')
-        );
-        report.expect(
-          T,
-          "credentialed fetch to Kibana (credentials:'include') never sent",
-          engine,
-          kibanaHits.length === 0 && (probe.results.fetchKibana ?? '').startsWith('blocked'),
-          { result: probe.results.fetchKibana, kibanaLogHits: kibanaHits.length }
-        );
-        report.add(
-          T,
-          'policy violations observed in frame (evidence of blocking, not only rejected promises)',
-          engine,
-          'DIAGNOSTIC',
-          {
-            count: await child.evaluate(
-              () =>
-                (window as unknown as { __probe: { violations: string[] } }).__probe.violations
-                  .length
-            ),
-          }
-        );
-        const assetRequest = requests.find((r) =>
-          r.url.includes(`/ui_assets/${ctx.current?.ui.digest}.js`)
-        );
-        report.expect(
-          T,
-          'no Referer on the frame’s allowed requests (no-referrer)',
-          engine,
-          Boolean(assetRequest) && !assetRequest?.referer,
-          { referer: assetRequest?.referer ?? null }
-        );
-        // Known-leak canaries: reported separately, never as containment PASS.
-        const preconnects = ctx.receiver.connections - connectionsBefore;
-        report.add(
-          T,
-          'preconnect canary (TCP connection without HTTP request)',
-          engine,
-          preconnects > 0 ? 'KNOWN_LEAK' : 'NOT_VERIFIED',
-          {
-            tcpConnectionsToReceiver: preconnects,
-            note:
-              preconnects > 0
-                ? 'browser opened a socket despite CSP'
-                : 'no TCP connection observed; not proof of absence',
-          }
-        );
-        report.add(T, 'DNS-prefetch canary (app-host-dns-canary.invalid)', engine, 'NOT_VERIFIED', {
-          note: 'no authoritative DNS observer provisioned; packet absence not verified',
-        });
-        report.add(T, 'WebRTC/STUN canary (stun:127.0.0.1:3478)', engine, 'NOT_VERIFIED', {
-          result: probe.results.webrtc,
-          note: 'ICE gathering result only; no UDP/STUN observer',
-        });
-      } finally {
-        await s.close();
-      }
-      // Navigation channels: one fresh frame per attempt (a blocked navigation ends the frame).
-      for (const [fn, label] of NAVIGATIONS) {
-        const marker = `${fn.toLowerCase()}-${engine}-${Date.now()}`;
-        const n = await session(ctx, engine, users.viewer);
-        try {
-          const before = httpDebugMark();
-          const child = await openBound(n.page, ctx);
-          await waitProbe(child);
-          const result = await runIn(child, fn, marker);
-          await sleep(2500);
-          const kibana = httpDebugSince(before).filter((line) => line.includes(marker));
-          report.expect(
-            T,
-            `${label}: blocked (zero receiver/Kibana hits)`,
-            engine,
-            ctx.receiver.count(marker) === 0 && kibana.length === 0,
-            {
-              result,
-              receiver: ctx.receiver.count(marker),
-              kibana: kibana.length,
-              frame: await frameStatus(n.page),
-            }
-          );
-        } finally {
-          await n.close();
-        }
-      }
-      // Exact-path self-navigation with a query string: allowed by frame-src path matching (CSP ignores
-      // queries), so the data reaches Kibana's own logs; S7 returns no document and the reload revokes.
-      {
-        const marker = `selfquery-${engine}-${Date.now()}`;
-        const n = await session(ctx, engine, users.viewer);
-        try {
-          const before = httpDebugMark();
-          const child = await openBound(n.page, ctx);
-          await waitProbe(child);
-          await runIn(child, 'selfFrameQuery', marker);
-          await sleep(2500);
-          const kibana = httpDebugSince(before).filter((line) => line.includes(marker));
-          report.add(
-            T,
-            'exact frame path + query (accepted residual: reaches Kibana logs, no document, revoked)',
-            engine,
-            kibana.length > 0 ? 'KNOWN_LEAK' : 'PASS',
-            {
-              kibanaLogHits: kibana.length,
-              frame: await frameStatus(n.page),
-              receiver: ctx.receiver.count(marker),
-            }
-          );
-        } finally {
-          await n.close();
-        }
-      }
-      // Parent-policy omission control: same sandboxed self-navigation without a guardian reaches the receiver.
-      {
-        const c = await session(ctx, engine, users.viewer);
-        try {
-          const before = ctx.receiver.hits.filter((h) => h.path.includes('navcontrol')).length;
-          await c.page.goto(`${ctx.receiver.origin}/nav-control`);
-          await sleep(2500);
-          const after = ctx.receiver.hits.filter((h) => h.path.includes('navcontrol')).length;
-          report.expect(
-            T,
-            'navigation positive control: without the guardian frame-src the child navigation reaches the receiver',
-            engine,
-            after > before,
-            { hits: after - before }
-          );
-        } finally {
-          await c.close();
-        }
-      }
+  const T = 'T3';
+  const s = await session(ctx, engine, users.viewer);
+  try {
+    const executes: string[] = [];
+    s.page.on('request', (request) => {
+      if (/\/leases\/[^/]+\/execute$/.test(request.url())) executes.push(request.url());
     });
-  }
-  report.add(
-    T,
-    'credentialed requests under a SameSite=None HTTPS fixture',
-    'all',
-    'NOT_VERIFIED',
-    {
-      note: 'Not implemented in this run: Kibana was served over HTTP with default cookie settings. Blocked channels sent no request at all (receiver/Kibana counters), which is independent of cookie attributes.',
+    for (const [index, batch] of ABUSE_BATCHES.entries()) {
+      if (index > 0) {
+        await disableFrame(s.page);
+        await s.page.reload();
+      }
+      const child = await openBound(s.page, ctx);
+      await waitProbe(child);
+      const executesBefore = executes.length;
+      for (const name of batch) {
+        const result = String(await runIn(child, 'bridgeCase', name));
+        report.expect(
+          T,
+          `bridge abuse: ${name} → ${ABUSE_EXPECTED[name]}`,
+          engine,
+          result === ABUSE_EXPECTED[name],
+          { result }
+        );
+      }
+      const alive = String(await runIn(child, 'bridgeCase', 'alive'));
+      report.expect(
+        T,
+        `bridge abuse batch ${
+          index + 1
+        }: no server call; session still open afterwards (positive control)`,
+        engine,
+        executes.length === executesBefore &&
+          alive.startsWith('ok:') &&
+          (await frameStatus(s.page)) === 'bound',
+        { executes: executes.length - executesBefore, alive: alive.slice(0, 40) }
+      );
+      if (index === ABUSE_BATCHES.length - 1) {
+        // Raw protocol frames naming Object/prototype members: each rejected with a fixed code.
+        const result = await runIn(child, 'rawProtocolNames', '');
+        const pairs = Array.isArray(result) ? (result as Array<[string, string]>) : [];
+        for (const name of RAW_NAMES) {
+          const found = pairs.find(([key]) => key === name);
+          const reply =
+            typeof found?.[1] === 'string'
+              ? found[1]
+              : `missing (${typeof result === 'string' ? result.slice(0, 60) : 'no result'})`;
+          report.expect(
+            T,
+            `bridge abuse (raw frame): ${name} → reject app_unavailable, no stack`,
+            engine,
+            reply.startsWith('["reject"') &&
+              reply.includes('app_unavailable') &&
+              // V8 (`at fn (file:1:2)`) and Firefox/WebKit (`fn@url:1:2`) stack formats.
+              !/\sat\s|\.ts:|@https?:|\.js:\d/.test(reply),
+            { reply, frame: await frameStatus(s.page) }
+          );
+        }
+        report.expect(
+          T,
+          'bridge abuse (raw frames): no server call',
+          engine,
+          executes.length === executesBefore
+        );
+      }
     }
-  );
+    // Intentional termination: the 8th invalid call ends the session.
+    await disableFrame(s.page);
+    await s.page.reload();
+    const child = await openBound(s.page, ctx);
+    await waitProbe(child);
+    // 1 invalid call in the auto-run + 6 here = 7 tolerated; the next one is the 8th.
+    const results: string[] = [];
+    for (let i = 0; i < 6; i++)
+      results.push(String(await runIn(child, 'bridgeCase', 'otherRoute')));
+    const statusBefore = await frameStatus(s.page);
+    results.push(String(await runIn(child, 'bridgeCase', 'otherRoute')));
+    await waitForStatus(s.page, /ended: protocol_error/, 10_000).catch(() => undefined);
+    report.expect(
+      T,
+      'bridge abuse: 7 invalid calls tolerated (1 auto-run + 6), the 8th terminates the session (repeated_invalid_calls)',
+      engine,
+      statusBefore === 'bound' &&
+        results.slice(0, 6).every((r) => r === 'err:bridge_invalid_request') &&
+        /ended: protocol_error \(repeated_invalid_calls\)/.test(await frameStatus(s.page)),
+      { statusBefore, statusAfter: await frameStatus(s.page), eighth: results[6]?.slice(0, 60) }
+    );
+  } finally {
+    await s.close();
+  }
 };
-
-const pick = (record: Record<string, string>, keys: string[]) =>
-  Object.fromEntries(keys.map((key) => [key, record[key]]));
 
 // ---------------------------------------------------------------- T8
 const leaseFromResponses = (page: Page) => {
@@ -671,10 +561,47 @@ export const runT8 = async (ctx: SuiteContext) => {
       }
     });
   }
-  report.add(T, 'pending read during disable / lease expiry / principal mismatch', 'jest', 'PASS', {
-    evidence:
-      'server/ui/bridge_service.test.ts (disable during pending read → app_disabled, no data; expiry → app_expired; principal/space mismatch → app_denied); live principal mismatch in T7/T14',
-  });
+  // Lifecycle races that need a controlled clock or a held lease request run as Jest tests; this
+  // harness executes them now and records each one's actual result (never a literal PASS).
+  await jestEvidence(
+    ctx,
+    T,
+    ['server/ui/bridge_service.test.ts', 'public/components/app_ui_page.test.tsx'],
+    [
+      [
+        'disable during a pending read: no data returned, lease revoked',
+        'T8: a release change or disable during a pending read returns no data and revokes the lease',
+      ],
+      [
+        'lease expiry during a pending read: read aborted at expiry, app_expired, no data',
+        'aborts the pending read at expiry and returns app_expired instead of data',
+      ],
+      [
+        'expiry / principal / space / secret mismatch fail closed',
+        'binds principal, space and secret; expiry fails closed',
+      ],
+      [
+        'idle frame torn down and lease released at expiry (parent)',
+        'tears down an idle frame and releases the lease when the lease expires',
+      ],
+      [
+        'lease resolving after Disable never mounts; released',
+        'a lease that resolves after Disable never mounts a frame and is released',
+      ],
+      [
+        'lease resolving after unmount never mounts; released',
+        'a lease that resolves after unmount never mounts a frame and is released',
+      ],
+      [
+        'lease resolving after a release change never mounts; released',
+        'a lease that resolves after a release change never mounts a frame and is released',
+      ],
+      [
+        'positive control: a current lease mounts exactly one frame',
+        'positive control: a lease that resolves while consent is current mounts exactly one frame',
+      ],
+    ]
+  );
 };
 
 // ---------------------------------------------------------------- T10
@@ -849,10 +776,6 @@ export const runT10 = async (ctx: SuiteContext) => {
         native: native ? { action: native.event?.action, at: native['@timestamp'] } : null,
       }
     );
-    report.add(T, 'local-only parent rejections are not server audit events', 'http', 'PASS', {
-      evidence:
-        'parent-side denials (e.g. ungranted dashboard id, invalid args) never reach the execute route; only server-reached calls produce app_host.bridge records (T3 hostile session)',
-    });
   } finally {
     await revokeAll(ctx);
   }

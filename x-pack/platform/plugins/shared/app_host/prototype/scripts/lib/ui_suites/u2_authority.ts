@@ -22,6 +22,7 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import { ApprovalError, approveRelease, readConsent, CONSENT_FILE } from '../approval';
+import { http as defaultHttp } from '../http';
 import { LOCAL_DIR } from '../secrets';
 import { buildUiRelease, releaseUiPackage } from '../ui_release';
 import type { UiUser } from '../ui_harness';
@@ -533,9 +534,10 @@ export const runT9Server = async (ctx: SuiteContext) => {
     const extra = await createLease(ctx, adminUser(ctx));
     report.expect(
       T,
-      'S11 global cap: once 32 leases are active, a principal with none is refused',
+      'S11 global cap: exactly 32 leases accepted, the 33rd (a principal with none) refused',
       HTTP,
-      codeOf(extra.response) === 'app_rate_limited' && createdByTest <= 32,
+      // Exactly 32 (T9 runs first, so no other leases exist): a smaller cap fails this check.
+      codeOf(extra.response) === 'app_rate_limited' && createdByTest === 32,
       { createdByTest, extra: codeOf(extra.response) }
     );
     await revokeAll(ctx);
@@ -707,17 +709,18 @@ export const runT12 = async (ctx: SuiteContext) => {
   const attempt = async (
     esAuth: string,
     kbAuth: string,
-    overrides: { esUrl?: string; manifest?: typeof base.manifest } = {}
+    overrides: { esUrl?: string; manifest?: typeof base.manifest; http?: typeof defaultHttp } = {}
   ) => {
     try {
-      await approveRelease({
+      const result = await approveRelease({
         manifest: overrides.manifest ?? base.manifest,
         esUrl: overrides.esUrl ?? ctx.es,
         kbUrl: ctx.kibana,
         esAuth,
         kbAuth,
+        http: overrides.http,
       });
-      return 'written';
+      return result.idempotent ? 'idempotent' : 'written';
     } catch (error) {
       return error instanceof ApprovalError ? error.code : String(error).slice(0, 80);
     }
@@ -741,6 +744,54 @@ export const runT12 = async (ctx: SuiteContext) => {
     mixed === 'mixed_identities' && unchanged(),
     mixed
   );
+  // F5: the same username through two realms (ES: the admin's basic login; Kibana: an API key the
+  // admin owns, realm `_es_api_key`) is two principals. The key is local, short-lived, never printed
+  // and invalidated afterwards.
+  const apiKey = await defaultHttp(`${ctx.es}/_security/api_key`, {
+    method: 'POST',
+    auth: ctx.adminAuth,
+    body: { name: 'app-host-t12-realm', expiration: '10m', role_descriptors: {} },
+  });
+  const { id: keyId, encoded } = apiKey.body as { id?: string; encoded?: string };
+  try {
+    const viaApiKey: typeof defaultHttp = (url, options = {}) =>
+      url.startsWith(ctx.kibana)
+        ? defaultHttp(url, {
+            ...options,
+            auth: undefined,
+            headers: { ...options.headers, authorization: `ApiKey ${encoded}` },
+          })
+        : defaultHttp(url, options);
+    const me = await viaApiKey(`${ctx.kibana}/internal/security/me`, {
+      headers: { 'x-elastic-internal-origin': 'app-host-approval' },
+    });
+    const meBody = me.body as { username?: string; authentication_realm?: { type?: string } };
+    const realm = await attempt(ctx.adminAuth, ctx.adminAuth, { http: viaApiKey });
+    report.expect(
+      T,
+      'F5: same username in two realms (ES basic vs Kibana API key) refused as mixed identities',
+      HTTP,
+      apiKey.status === 200 &&
+        me.status === 200 &&
+        meBody.username === adminUser(ctx).username &&
+        meBody.authentication_realm?.type === '_es_api_key' &&
+        realm === 'mixed_identities' &&
+        unchanged(),
+      {
+        realm,
+        kibanaUser: meBody.username === adminUser(ctx).username,
+        kibanaRealm: meBody.authentication_realm?.type,
+      }
+    );
+  } finally {
+    if (keyId) {
+      await defaultHttp(`${ctx.es}/_security/api_key`, {
+        method: 'DELETE',
+        auth: ctx.adminAuth,
+        body: { ids: [keyId] },
+      });
+    }
+  }
   const unavailable = await attempt(ctx.adminAuth, ctx.adminAuth, { esUrl: 'http://127.0.0.1:9' });
   report.expect(
     T,
@@ -786,9 +837,9 @@ export const runT12 = async (ctx: SuiteContext) => {
   const again = await attempt(auth(users.superuser), auth(users.superuser));
   report.expect(
     T,
-    'same-digest approval is idempotent',
+    'same-digest approval is idempotent (reported idempotent, file unchanged)',
     HTTP,
-    again === 'written' && readFileSync(CONSENT_FILE, 'utf8') === raw,
+    again === 'idempotent' && readFileSync(CONSENT_FILE, 'utf8') === raw,
     again
   );
   const older = await buildUiRelease({
@@ -975,6 +1026,26 @@ export const runT14 = async (ctx: SuiteContext) => {
         dispatcherDelta: dispatcherConnections() - before,
       }
     );
+    // F7: the native summary route is pinned to the default space as well.
+    const nativeBefore = dispatcherConnections();
+    const nativeSpace = await kfetch(ctx, `/s/${space}/api/apps/alert-digest/summary`, {
+      user: su,
+    });
+    const nativeDefault = await kfetch(ctx, '/api/apps/alert-digest/summary', { user: su });
+    await sleep(500);
+    report.expect(
+      T,
+      'F7: native summary from a non-default space → 404 before any app invocation (default space control: 200)',
+      HTTP,
+      nativeSpace.status === 404 &&
+        nativeDefault.status === 200 &&
+        dispatcherConnections() === nativeBefore + 1,
+      {
+        space: nativeSpace.status,
+        defaultSpace: nativeDefault.status,
+        dispatcherDelta: dispatcherConnections() - nativeBefore,
+      }
+    );
     const audit = await execute(ctx, suLease, {
       op: 'es.search',
       params: { index: 'logs-kibana.audit-default', size: 1 },
@@ -985,10 +1056,49 @@ export const runT14 = async (ctx: SuiteContext) => {
       HTTP,
       codeOf(audit) === 'app_denied'
     );
-    report.add(T, 'no durable/shared store created', HTTP, 'PASS', {
-      evidence:
-        'leases, consent clicks and buckets are in-memory only (server LeaseStore/OperationBuckets, parent React state); no saved objects or indices are written by App Host',
-    });
+    // No durable/shared store: after this run's leases, consent clicks and bridge calls, ES holds no
+    // App Host index and no App Host saved object. Positive control: the same query finds the seeded
+    // dashboards, so an empty result is not a broken query.
+    const soQuery = (pattern: string) =>
+      defaultHttp(`${ctx.es}/.kibana*/_search?expand_wildcards=all&size=0`, {
+        method: 'POST',
+        auth: ctx.adminAuth,
+        body: {
+          query: { wildcard: { type: { value: pattern, case_insensitive: true } } },
+        },
+      });
+    const total = (r: Awaited<ReturnType<typeof soQuery>>) =>
+      (r.body as { hits?: { total?: { value?: number } } }).hits?.total?.value ?? -1;
+    const [appHostObjects, dashboards, indicesList] = await Promise.all([
+      soQuery('*app*host*'),
+      soQuery('dashboard'),
+      defaultHttp(`${ctx.es}/_cat/indices?format=json&h=index&expand_wildcards=all`, {
+        auth: ctx.adminAuth,
+      }),
+    ]);
+    // Kibana's own per-space indices for the seeded empty test space (e.g. entity analytics
+    // watchlists) carry that space id; they are not App Host's and are listed separately.
+    const named = ((indicesList.body as Array<{ index: string }>) ?? [])
+      .map(({ index }) => index)
+      .filter((index) => /app[-_.]?host/i.test(index));
+    const perSpace = named.filter((index) => index.endsWith(ctx.seed.emptySpaceId));
+    const appHostIndices = named.filter((index) => !perSpace.includes(index));
+    report.expect(
+      T,
+      'no durable/shared store: no App Host saved objects or indices (positive control finds dashboards)',
+      HTTP,
+      appHostObjects.status === 200 &&
+        total(appHostObjects) === 0 &&
+        total(dashboards) > 0 &&
+        indicesList.status === 200 &&
+        appHostIndices.length === 0,
+      {
+        appHostSavedObjects: total(appHostObjects),
+        dashboardControl: total(dashboards),
+        appHostIndices,
+        kibanaPerSpaceIndicesOfTestSpace: perSpace,
+      }
+    );
   } finally {
     await revokeAll(ctx);
   }

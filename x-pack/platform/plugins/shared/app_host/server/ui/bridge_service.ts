@@ -464,10 +464,18 @@ export class BridgeService {
         ),
         timedOut,
       ]);
-      // Recheck enablement and release before returning data; revocation suppresses results.
+      // Recheck lease expiry/revocation, enablement and release before returning data; any of
+      // them suppresses the result (delivered data cannot be recalled, undelivered data is kept).
+      if (this.#leases.isExpired(lease)) return deny('app_expired', 'expired', true);
+      if (!this.#leases.isLive(lease) || lease.abort.signal.aborted) {
+        return deny('app_disabled', 'revoked_during_call');
+      }
       const after = this.#checkRelease(await this.#readState(), binding);
       if (after) return deny(after.code, after.reason, true);
-      if (lease.abort.signal.aborted) return deny('app_disabled', 'revoked_during_call');
+      if (this.#leases.isExpired(lease)) return deny('app_expired', 'expired', true);
+      if (!this.#leases.isLive(lease) || lease.abort.signal.aborted) {
+        return deny('app_disabled', 'revoked_during_call');
+      }
       if (!outcome.ok) return deny(outcome.code, outcome.reason);
       if (Buffer.byteLength(JSON.stringify(outcome.result)) > UI_LIMITS.resultBytes) {
         return deny('app_unavailable', 'invalid_result');

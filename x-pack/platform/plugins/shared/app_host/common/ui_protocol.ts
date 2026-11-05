@@ -140,7 +140,10 @@ export interface CreateLeaseRequest {
 export interface CreateLeaseResponse {
   readonly leaseId: string;
   readonly secret: string;
+  /** Server clock. */
   readonly expiresAt: number;
+  /** Lease lifetime from creation; the parent derives its own teardown deadline from it. */
+  readonly ttlMs: number;
 }
 export interface ExecuteRequest {
   readonly secret: string;

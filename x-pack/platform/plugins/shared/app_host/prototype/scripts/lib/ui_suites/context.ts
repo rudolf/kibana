@@ -5,6 +5,8 @@
  * 2.0.
  */
 
+import { spawn } from 'node:child_process';
+import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import type { Browser, BrowserContext, Page } from '@playwright/test';
 import { approveRelease, readConsent } from '../approval';
@@ -26,6 +28,10 @@ export interface SuiteContext {
   readonly report: Report;
   readonly receiver: Receiver;
   readonly collector: Receiver;
+  /** Receiver referenced only by the preconnect probe (exact TCP attribution, F6). */
+  readonly preconnect: Receiver;
+  /** Kibana served over local TLS with SameSite=None session cookies (A17 fixture run). */
+  readonly tls: boolean;
   /** Mutable: the currently installed release and its UI entry. */
   current: UiManifest | undefined;
   currentEntry: string | undefined;
@@ -98,6 +104,7 @@ export const release = async (ctx: SuiteContext, options: ReleaseOptions = {}) =
     extraDefine: {
       __RECEIVER__: JSON.stringify(ctx.receiver.origin),
       __KIBANA__: JSON.stringify(ctx.kibana),
+      __PRECONNECT__: JSON.stringify(ctx.preconnect.origin),
     },
   });
   await releaseUiPackage(ctx.packageDir, built);
@@ -133,9 +140,10 @@ export const session = async (
   initScript?: string
 ): Promise<Session> => {
   const browser = await launch(engine);
-  const context = await browser.newContext({ acceptDownloads: true });
+  // TLS fixture: the local self-signed certificate is trusted for this context only.
+  const context = await browser.newContext({ acceptDownloads: true, ignoreHTTPSErrors: ctx.tls });
   if (initScript) await context.addInitScript({ content: initScript });
-  await login(context, ctx.kibana, user);
+  await login(context, ctx.kibana, user, { viaBrowser: ctx.tls });
   const page = await context.newPage();
   const consoleLines: string[] = [];
   page.on('console', (message) =>
@@ -168,3 +176,55 @@ export const session = async (
 };
 
 export const readSeed = readUiSeed;
+
+const REPO_ROOT = resolve(LOCAL_DIR, '..', '..', '..', '..', '..', '..', '..');
+const PLUGIN_DIR = 'x-pack/platform/plugins/shared/app_host';
+
+interface JestAssertion {
+  readonly title: string;
+  readonly ancestorTitles: readonly string[];
+  readonly status: string;
+}
+
+/**
+ * Runs the named plugin Jest files (repository runner) and records one check per required test
+ * title: PASS only if that test actually ran and passed in this harness run.
+ */
+export const jestEvidence = async (
+  ctx: SuiteContext,
+  test: string,
+  files: readonly string[],
+  required: ReadonlyArray<readonly [check: string, title: string]>
+): Promise<void> => {
+  const outputFile = join(LOCAL_DIR, `jest-${test}-${Date.now()}.json`);
+  const exitCode = await new Promise<number>((done) => {
+    const child = spawn(
+      process.execPath,
+      [
+        'scripts/jest',
+        ...files.map((file) => `${PLUGIN_DIR}/${file}`),
+        '--json',
+        `--outputFile=${outputFile}`,
+        '--forceExit',
+      ],
+      { cwd: REPO_ROOT, stdio: 'ignore' }
+    );
+    child.on('exit', (code) => done(code ?? 1));
+    child.on('error', () => done(1));
+  });
+  const assertions: JestAssertion[] = existsSync(outputFile)
+    ? (
+        JSON.parse(readFileSync(outputFile, 'utf8')) as {
+          testResults: Array<{ assertionResults: JestAssertion[] }>;
+        }
+      ).testResults.flatMap((file) => file.assertionResults)
+    : [];
+  for (const [check, title] of required) {
+    const found = assertions.find((assertion) => assertion.title === title);
+    ctx.report.expect(test, check, 'jest', found?.status === 'passed', {
+      test: title,
+      status: found?.status ?? 'not run',
+      jestExit: exitCode,
+    });
+  }
+};

@@ -56,8 +56,8 @@ U1 — browser shell (no data capability):
   enabled release only, default space only, `Sec-Fetch-Dest: iframe` only (else 403 JSON), no query
   string, fixed generated HTML with server-derived values in a JSON data block.
 - Assets `GET /api/app_host/ui_assets/{file}`: the two fixed host scripts (`host-guardian.js`,
-  `host-child.js`) and the approved UI bundle `<uiDigest>.js` (≤512 KiB, SHA-256 recomputed on every
-  read). Public, `application/javascript`, `Content-Disposition: attachment`, `nosniff`, response
+  `host-child.js`) and the approved UI bundle `<uiDigest>.js` (≤512 KiB; its verified bytes are cached by
+  digest and re-hashed only when the approved digest or the file's inode/size/mtime changes, F3). Public, `application/javascript`, `Content-Disposition: attachment`, `nosniff`, response
   sandbox. Anything else (unknown, unapproved, disabled, tampered) is **404**, never 401/403 (S6).
 - A post-Core `onPreResponse` hook composes the final-wire headers on every App Host path (`/api/app_host/`,
   `/internal/app_host/`, `/api/apps/`), including 4xx/5xx: Core's enforcing policy rebuilt from
@@ -74,7 +74,12 @@ U1 — browser shell (no data capability):
   use the control port; the parent has no window `message` listener.
 - Parent RPC: capnweb `RpcSession` over a bounded string-only port transport (32 KiB UTF-8 per frame,
   256 KiB / 1,024-frame queue, ingress paced at 60/s burst 16, `messageerror` terminates; depth 12,
-  BigInt 64, ≤128 live stubs, 8 invalid calls terminate). No global message dispatcher.
+  BigInt 64, 8 invalid calls terminate). The cap of 128 live capnweb imports + exports is checked by the
+  transport each time capnweb asks for the next frame and after every send, so protocol-only growth
+  (retained pushes, guest-exported stubs, unknown-method pipelines) terminates the session too
+  (`live_stubs`), not only bridge-method entry. Depth and BigInt breaches terminate with
+  `depth_exceeded` / `bigint_too_large`. Errors sent to the guest carry no stack in any engine (an own
+  empty `stack` shadows Firefox's inherited accessor). No global message dispatcher.
 
 U2 — delegation and consent:
 
@@ -90,10 +95,11 @@ U2 — delegation and consent:
   installer is a `superuser` in ES, the same principal in Kibana, has ES `_has_privileges` read on the exact
   index and can natively GET the exact dashboard; it refuses downgrades and is idempotent for the same
   digest. Once an approval file exists, the native `/api/apps/{appId}/summary` also runs only the enabled,
-  approved release; without one, only legacy manifests run.
+  approved release; without one, only legacy manifests run. The approval tool's same-principal check
+  compares username **and** authentication realm (type and name) in ES and Kibana (F5).
 - Fixed per-app privilege `read_app_alert_digest` (feature `appHostAlertDigest`), required **with**
   `read_app_host` for metadata, documents, leases, execution and the native summary.
-- `POST /internal/app_host/ui/leases` → `{leaseId, secret, expiresAt}` to the parent only: authenticated,
+- `POST /internal/app_host/ui/leases` → `{leaseId, secret, expiresAt, ttlMs}` to the parent only: authenticated,
   both privileges, Kibana XSRF, exact configured `Origin`, default space, no run_as; 5-minute TTL, 32 global
   / 4 per principal, secret stored as SHA-256 and compared in constant time, bound to principal, space, app,
   release, scopes and resources. `POST …/leases/{leaseId}/execute` with `{secret, operation}` in the JSON
@@ -102,7 +108,10 @@ U2 — delegation and consent:
   `GET /api/dashboards/{id}` version `2023-10-31`; fails closed on redirects, non-200, bodies over 256 KiB
   and `body.id !== grantedId`, S5). Ungranted selectors are denied before lookup. Budgets: 5 ops/s burst
   10 per (app, user, space) across leases, 100 per lease, 2 in flight per lease, 4 per process, 5 s deadline.
-  Enablement and release are rechecked before returning data. Errors are fixed codes only
+  Lease liveness and expiry, enablement and release are rechecked before returning data. Each lease has
+  a server-side expiry timer: a read still pending at expiry is aborted and answered `app_expired`, with
+  no data. The parent tears the frame down at its own deadline (request time + `ttlMs`, never later than
+  the server's expiry), even when idle. Errors are fixed codes only
   (`app_denied`, `app_unavailable`, `app_stale`, `app_disabled`, `app_expired`, `app_rate_limited`,
   `app_timeout`, `app_cpu_limit`, `bridge_invalid_request`, `bridge_protocol_error`).
 - A closed capability registry (`server/ui/capability_registry.ts`) refuses credential-minting, deferred,
@@ -110,7 +119,9 @@ U2 — delegation and consent:
 - Parent bridge: exactly `callAppRoute({method:'GET', path:'/summary'})`, `search({index, size})`,
   `getDashboardPreview({id})`, `getTheme()`; plain-data arguments only; the lease secret stays in the
   parent's closure. Metadata is polled every 2 s and on focus; a different release unmounts the old
-  frame before its consent prompt appears (S10); closing the tab revokes the lease.
+  frame before its consent prompt appears (S10); closing the tab revokes the lease. A lease that is
+  still being created when consent is withdrawn (Disable), the page unmounts or the release changes is
+  released as soon as it arrives and never mounts or binds a frame (generation check).
 
 U3 — adversarial demo and attribution:
 
@@ -120,6 +131,9 @@ U3 — adversarial demo and attribution:
   same correlation id (S9). No secrets, lease ids, payloads, titles or raw errors; control characters are
   replaced and fields capped. Prototype attribution, not tamper-proof audit storage.
 - Release v2 needs operator approval and a new viewer click; no Kibana restart or dispatcher redeploy.
+- The native `GET /api/apps/{appId}/summary` serves the default space only (404 elsewhere) and writes one
+  `app_host.bridge` record per call (`event.provider: native`; app attribution from the approved release,
+  none in legacy mode) (F7).
 
 capnweb sessions use `maxMessageSize: 256 KiB`, `maxDepth: 32` and `maxBigIntDigits: 64`, plus a
 transport that rejects binary frames, frames over 256 KiB and a receive queue over 1 MiB before

@@ -47,8 +47,11 @@ export interface BridgeAuditEvent {
   readonly outcome: 'success' | 'failure';
   readonly reason: AuditReason;
   readonly correlationId: string;
-  /** `bridge` for UI calls; `app.summary` for Worker-path HostEs callbacks inside one. */
-  readonly via: 'bridge' | 'app.summary' | 'lease';
+  /**
+   * `bridge` for UI calls; `app.summary` for Worker-path HostEs callbacks inside one; `native` for
+   * the native summary route (F7).
+   */
+  readonly via: 'bridge' | 'app.summary' | 'lease' | 'native';
 }
 
 interface BridgeAuditMeta extends LogMeta {
@@ -85,6 +88,8 @@ export class BridgeAuditLogger {
         outcome: event.outcome,
         reason: event.reason,
         category: ['web'],
+        // Also present without an app actor (e.g. native summary in legacy mode).
+        provider: event.via,
       },
       kibana: {
         space_id: boundedField(event.spaceId, 64),

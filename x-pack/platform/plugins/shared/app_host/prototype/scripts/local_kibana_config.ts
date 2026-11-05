@@ -9,6 +9,10 @@
 // It contains the caller secret, so it is never printed. Usage:
 //   npm run kibana:config -- [--dispatcher ws://127.0.0.1:8787/rpc] [--package-dir DIR]
 //       [--public-base-url http://localhost:5601] [--csp-collector http://127.0.0.1:5699/csp]
+//       [--tls DIR]
+// --tls DIR writes .local/kibana.app_host.tls.yml instead: the SameSite=None HTTPS cookie fixture
+// (Kibana over local TLS with DIR/cert.pem + DIR/key.pem, a git-ignored self-signed certificate,
+// `xpack.security.sameSiteCookies: None` and secure cookies; publicBaseUrl https://localhost:5601).
 // The UI cut needs one initial restart for publicBaseUrl, frame-ancestors 'self', the approval
 // path, the synthetic CSP report collector and the JSON audit / HTTP debug log appenders.
 
@@ -23,17 +27,30 @@ const args = parseArgs(process.argv.slice(2), [
   'package-dir',
   'public-base-url',
   'csp-collector',
+  'tls',
 ]);
+const tlsDir = args.tls ? resolve(args.tls) : undefined;
 const dispatcherUrl = args.dispatcher ?? 'ws://127.0.0.1:8787/rpc';
 const packagePath = resolve(args['package-dir'] ?? resolve(LOCAL_DIR, 'package'));
-const publicBaseUrl = args['public-base-url'] ?? 'http://localhost:5601';
-const cspCollector = args['csp-collector'] ?? 'http://127.0.0.1:5699/csp-report';
+const publicBaseUrl =
+  args['public-base-url'] ?? (tlsDir ? 'https://localhost:5601' : 'http://localhost:5601');
+const cspCollector =
+  args['csp-collector'] ?? `${tlsDir ? 'https' : 'http'}://127.0.0.1:5699/csp-report`;
 const logs = resolve(LOCAL_DIR, 'logs');
 mkdirSync(packagePath, { recursive: true });
 mkdirSync(logs, { recursive: true });
 mkdirSync(resolve(LOCAL_DIR, 'operator'), { recursive: true, mode: 0o700 });
-const file = resolve(LOCAL_DIR, 'kibana.app_host.yml');
 const q = (value: string) => JSON.stringify(value);
+const file = resolve(LOCAL_DIR, tlsDir ? 'kibana.app_host.tls.yml' : 'kibana.app_host.yml');
+const tlsLines = tlsDir
+  ? [
+      'server.ssl.enabled: true',
+      `server.ssl.certificate: ${q(resolve(tlsDir, 'cert.pem'))}`,
+      `server.ssl.key: ${q(resolve(tlsDir, 'key.pem'))}`,
+      'xpack.security.secureCookies: true',
+      'xpack.security.sameSiteCookies: "None"',
+    ]
+  : [];
 writeFileSync(
   file,
   [
@@ -43,6 +60,7 @@ writeFileSync(
     `xpack.app_host.callerToken: ${q(readCallerToken())}`,
     `xpack.app_host.consentPath: ${q(CONSENT_FILE)}`,
     `server.publicBaseUrl: ${q(publicBaseUrl)}`,
+    ...tlsLines,
     `csp.frame_ancestors: ["'self'"]`,
     // Synthetic local collector: proves app surfaces send no reports while normal routes keep Core's.
     `csp.report_uri: [${q(cspCollector)}]`,

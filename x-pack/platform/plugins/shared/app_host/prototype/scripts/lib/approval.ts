@@ -101,6 +101,15 @@ export interface ApprovalResult {
   readonly installerGrantDigest: string;
 }
 
+interface Realm {
+  readonly type?: string;
+  readonly name?: string;
+}
+
+/** Both realms present, with non-empty and equal type and name. */
+const sameRealm = (a: Realm | undefined, b: Realm | undefined): boolean =>
+  Boolean(a?.type && a.name && b?.type && b.name) && a?.type === b?.type && a?.name === b?.name;
+
 const safe = async (call: () => Promise<HttpResult>, failure: ApprovalFailure) => {
   try {
     return await call();
@@ -124,7 +133,11 @@ export const approveRelease = async ({
     'es_unavailable'
   );
   if (authenticate.status !== 200) throw new ApprovalError('es_unavailable');
-  const esUser = authenticate.body as { username?: string; roles?: string[] };
+  const esUser = authenticate.body as {
+    username?: string;
+    roles?: string[];
+    authentication_realm?: Realm;
+  };
   if (!esUser.username || !(esUser.roles ?? []).includes('superuser')) {
     throw new ApprovalError('not_superuser');
   }
@@ -137,9 +150,16 @@ export const approveRelease = async ({
     'kibana_unavailable'
   );
   if (me.status !== 200) throw new ApprovalError('kibana_unavailable');
-  const kbUser = me.body as { username?: string };
+  const kbUser = me.body as { username?: string; authentication_realm?: Realm };
   // The same authenticated principal must pass both checks; never combine two people's privileges.
-  if (kbUser.username !== esUser.username) throw new ApprovalError('mixed_identities');
+  // A principal is username + authentication realm (type and name): the same username in two realms
+  // is two principals.
+  if (
+    kbUser.username !== esUser.username ||
+    !sameRealm(kbUser.authentication_realm, esUser.authentication_realm)
+  ) {
+    throw new ApprovalError('mixed_identities');
+  }
   const [index] = manifest.permissions.indices;
   const privileges = await safe(
     () =>

@@ -20,7 +20,7 @@ import {
   UI_METADATA_ROUTE,
   uiDocumentPath,
 } from '../../common/ui_protocol';
-import { readUiBundle } from '../package/read_package';
+import { VerifiedAssetCache } from './asset_cache';
 import { readUiReleaseState, type UiReleaseState } from './consent';
 import { renderFrameDocument, renderGuardianDocument } from './documents';
 import { CHILD_BOOTSTRAP_SCRIPT, GUARDIAN_SCRIPT } from './host_scripts';
@@ -57,6 +57,7 @@ export const registerUiRoutes = ({
   logger,
 }: UiRouteDependencies): void => {
   const readState = (): Promise<UiReleaseState> => readUiReleaseState(packagePath, consentPath);
+  const assetCache = new VerifiedAssetCache();
 
   // Guardian and frame documents. Iframe navigations only; response sandboxing is independent.
   router.get(
@@ -137,7 +138,7 @@ export const registerUiRoutes = ({
         return response.notFound();
       }
       try {
-        const bytes = await readUiBundle(packagePath, match[1]);
+        const bytes = await assetCache.get(packagePath, match[1]);
         decisions.set(request, asset);
         return response.ok({ body: bytes, headers: JS_HEADERS });
       } catch (error) {

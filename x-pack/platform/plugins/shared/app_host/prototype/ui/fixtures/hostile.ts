@@ -12,12 +12,15 @@
 // per fresh frame, because a blocked navigation ends the frame.
 
 import { connectBridge, errorCode } from '../src/sdk';
+import { runChannels } from './channels';
 
 declare const __UI_VERSION__: string;
 declare const __UI_LABEL__: string;
 declare const __DASHBOARD_ID__: string;
 declare const __RECEIVER__: string;
 declare const __KIBANA__: string;
+/** A receiver used only by the preconnect probe, so its TCP connections are attributable exactly. */
+declare const __PRECONNECT__: string;
 
 type Outcome = string;
 const results: Record<string, Outcome> = {};
@@ -29,7 +32,7 @@ const probe = {
   violations,
   done: false,
   bridge: {} as Record<string, Outcome>,
-  run: {} as Record<string, (marker: string) => Promise<Outcome> | Outcome>,
+  run: {} as Record<string, (marker: string) => unknown>,
 };
 (window as unknown as { __probe: typeof probe }).__probe = probe;
 
@@ -166,64 +169,39 @@ const parentProbes = async () => {
   results.overlay = 'placed';
 };
 
-const egressProbes = async () => {
-  const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-  await attempt('fetchReceiver', () => fetch(receiver('fetch'), { credentials: 'include' }));
-  await attempt('fetchReceiverNoCors', () =>
-    fetch(receiver('fetchnocors'), { mode: 'no-cors', credentials: 'include' })
-  );
-  await attempt('fetchKibana', () =>
-    fetch(`${__KIBANA__}/api/status?m=fetchkibana`, { credentials: 'include' })
-  );
-  await attempt('xhr', () => {
-    const xhr = new XMLHttpRequest();
-    xhr.open('GET', receiver('xhr'));
-    xhr.send();
-    return 'sent';
-  });
-  await attempt('webSocket', () => new WebSocket(receiver('ws').replace(/^http/, 'ws')));
-  await attempt('beacon', () => navigator.sendBeacon(receiver('beacon'), 'data'));
-  await attempt('eventSource', () => new EventSource(receiver('sse')));
-  addElement(`<img src="${receiver('img')}">`);
-  addElement(`<style>@import url("${receiver('cssimport')}");</style>`);
-  addElement(`<div style="background:url('${receiver('cssbg')}');width:10px;height:10px"></div>`);
-  addElement(
-    `<style>@font-face{font-family:p;src:url("${receiver(
-      'font'
-    )}")}</style><span style="font-family:p">x</span>`
-  );
-  addElement(
-    `<video src="${receiver('video')}"></video><audio src="${receiver('audio')}"></audio>`
-  );
-  addElement(`<object data="${receiver('object')}"></object><embed src="${receiver('embed')}">`);
-  addElement(`<iframe src="${receiver('nestedframe')}"></iframe>`);
-  addElement(`<link rel="prefetch" href="${receiver('prefetch')}">`);
-  addElement(`<link rel="preconnect" href="${__RECEIVER__}">`);
+// T4: one resource channel at a time with per-attempt markers (shared with the control page).
+probe.run.channels = (prefix) => runChannels(__RECEIVER__, prefix) as unknown as Outcome;
+// Credentialed requests to Kibana itself (`/api/spaces/space/<x>`: 401 without the session cookie,
+// 404 with it), for the ordinary and the SameSite=None cookie configurations.
+probe.run.kibanaChannels = (prefix) =>
+  runChannels(`${__KIBANA__}/api/spaces/space`, prefix, [
+    'fetch',
+    'fetchnocors',
+    'xhr',
+    'beacon',
+    'img',
+    'script',
+    'stylesheet',
+    'cssbg',
+    'nestedframe',
+  ]) as unknown as Outcome;
+// F6: preconnect alone, to a receiver nothing else uses.
+probe.run.preconnect = () => {
+  addElement(`<link rel="preconnect" href="${__PRECONNECT__}">`);
+  return 'inserted';
+};
+probe.run.dnsPrefetch = () => {
   addElement(`<link rel="dns-prefetch" href="//app-host-dns-canary.invalid">`);
-  addElement(`<link rel="stylesheet" href="${receiver('stylesheet')}">`);
-  await attempt('worker', () => new Worker(receiver('worker', 'w.js')));
-  await attempt('blobWorker', () => new Worker(URL.createObjectURL(new Blob(['1']))));
-  await attempt('sharedWorker', () => new SharedWorker(receiver('sharedworker', 'w.js')));
-  await attempt('formSubmit', () => {
-    const form = document.createElement('form');
-    form.action = receiver('form');
-    form.method = 'POST';
-    document.body.append(form);
-    form.submit();
-    return 'submitted';
-  });
-  await attempt('webrtc', async () => {
-    const connection = new RTCPeerConnection({
-      iceServers: [{ urls: 'stun:127.0.0.1:3478' }],
-    });
-    connection.createDataChannel('x');
-    await connection.setLocalDescription(await connection.createOffer());
-    await wait(1500);
-    const candidates = (connection.localDescription?.sdp ?? '').split('a=candidate').length - 1;
-    connection.close();
-    return `candidates=${candidates}`;
-  });
-  await wait(1500);
+  return 'inserted';
+};
+probe.run.webrtc = async () => {
+  const connection = new RTCPeerConnection({ iceServers: [{ urls: 'stun:127.0.0.1:3478' }] });
+  connection.createDataChannel('x');
+  await connection.setLocalDescription(await connection.createOffer());
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+  const candidates = (connection.localDescription?.sdp ?? '').split('a=candidate').length - 1;
+  connection.close();
+  return `candidates=${candidates}`;
 };
 
 const bridgeProbes = async () => {
@@ -248,7 +226,7 @@ const bridgeProbes = async () => {
   await call('summary', () => bridge.callAppRoute({ method: 'GET', path: '/summary' }));
   await call('search', () => bridge.search({ index: 'kbn-apps-prototype-alerts', size: 100 }));
   await call('dashboard', () => bridge.getDashboardPreview({ id: __DASHBOARD_ID__ }));
-  // A few out-of-grant attempts in the auto-run; the full corpus is `run.bridgeAbuse()` (too many
+  // A few out-of-grant attempts in the auto-run; the full corpus is `run.bridgeCase(name)` (too many
   // invalid calls terminate the session by design).
   await call('otherIndex', () => raw.search({ index: '.security-7', size: 1 }));
   await call('ungrantedDashboard', () =>
@@ -264,37 +242,101 @@ const bridgeProbes = async () => {
   probe.bridge.port = port ? 'held' : 'none';
 };
 
-probe.run.bridgeAbuse = async () => {
-  const raw = heldBridge as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
-  const call = async (name: string, run: () => Promise<unknown>) => {
-    try {
-      const value = await run();
-      probe.bridge[name] = `ok:${JSON.stringify(value).slice(0, 200)}`;
-    } catch (error) {
-      probe.bridge[name] = `err:${errorCode(error)}`;
-    }
+/** One named abuse case per call: `ok:<json>` or `err:<code>` (never an evaluation string). */
+const ABUSE: Record<
+  string,
+  (raw: Record<string, (...args: unknown[]) => Promise<unknown>>) => Promise<unknown>
+> = {
+  otherRoute: (raw) => raw.callAppRoute({ method: 'GET', path: '/admin' }),
+  traversal: (raw) => raw.callAppRoute({ method: 'GET', path: '/summary/../../x' }),
+  encodedPath: (raw) => raw.callAppRoute({ method: 'GET', path: '%2Fsummary' }),
+  queryTrick: (raw) => raw.callAppRoute({ method: 'GET', path: '/summary?x=1' }),
+  postMethod: (raw) => raw.callAppRoute({ method: 'POST', path: '/summary' }),
+  otherIndex: (raw) => raw.search({ index: '.security-7', size: 1 }),
+  auditIndex: (raw) => raw.search({ index: 'logs-kibana.audit-default', size: 1 }),
+  wildcard: (raw) => raw.search({ index: 'kbn-*', size: 1 }),
+  extraField: (raw) =>
+    raw.search({ index: 'kbn-apps-prototype-alerts', size: 1, query: { match_all: {} } }),
+  ungrantedDashboard: (raw) =>
+    raw.getDashboardPreview({ id: '00000000-0000-4000-8000-000000000000' }),
+  unknownMethod: (raw) => raw.createApiKey({ name: 'x' }),
+  functionArg: (raw) => raw.search(() => 1),
+  thenableArg: (raw) => raw.search({ then: (r: (v: unknown) => void) => r(1) }),
+  alive: (raw) => raw.getTheme(),
+};
+probe.run.bridgeCase = async (name) => {
+  const run = ABUSE[name];
+  if (!run || !heldBridge) return `missing:${name}`;
+  try {
+    const value = await run(
+      heldBridge as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>
+    );
+    return `ok:${JSON.stringify(value).slice(0, 200)}`;
+  } catch (error) {
+    return `err:${errorCode(error)}`;
+  }
+};
+
+// Prototype/Object member names sent as raw capnweb frames (an honest SDK stub handles these names
+// locally and never sends them). Uses `stream` frames, which the parent resolves on its own and
+// answers with the id it assigned, so no export id has to be guessed. Takes over the port: it must
+// be the last bridge use in a frame.
+probe.run.rawProtocolNames = async () => {
+  const port = heldPort;
+  if (!port) return { error: 'no-port' };
+  const replies: unknown[][] = [];
+  port.onmessage = (event) => {
+    if (typeof event.data === 'string') replies.push(JSON.parse(event.data));
   };
-  await call('otherRoute', () => raw.callAppRoute({ method: 'GET', path: '/admin' }));
-  await call('traversal', () => raw.callAppRoute({ method: 'GET', path: '/summary/../../x' }));
-  await call('encodedPath', () => raw.callAppRoute({ method: 'GET', path: '%2Fsummary' }));
-  await call('queryTrick', () => raw.callAppRoute({ method: 'GET', path: '/summary?x=1' }));
-  await call('postMethod', () => raw.callAppRoute({ method: 'POST', path: '/summary' }));
-  await call('otherIndex', () => raw.search({ index: '.security-7', size: 1 }));
-  await call('auditIndex', () => raw.search({ index: 'logs-kibana.audit-default', size: 1 }));
-  await call('wildcard', () => raw.search({ index: 'kbn-*', size: 1 }));
-  await call('extraField', () =>
-    raw.search({ index: 'kbn-apps-prototype-alerts', size: 1, query: { match_all: {} } })
-  );
-  await call('ungrantedDashboard', () =>
-    raw.getDashboardPreview({ id: '00000000-0000-4000-8000-000000000000' })
-  );
-  await call('unknownMethod', () => raw.createApiKey({ name: 'x' }));
-  await call('constructorCall', () => raw.constructor('x'));
-  await call('protoCall', () => raw.__proto__('x'));
-  await call('toStringCall', () => (raw.toString as unknown as () => Promise<unknown>)());
-  await call('functionArg', () => raw.search(() => 1));
-  await call('thenableArg', () => raw.search({ then: (r: (v: unknown) => void) => r(1) }));
-  return 'done';
+  const names = ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'valueOf'];
+  for (const name of names) {
+    port.postMessage(JSON.stringify(['stream', ['pipeline', 0, [name], ['x']]]));
+  }
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+  // Replies to these frames, in the parent's id order (= send order).
+  const answered = replies
+    .filter(([type]) => type === 'resolve' || type === 'reject')
+    .sort((a, b) => Number(a[1]) - Number(b[1]))
+    .slice(-names.length);
+  // Pairs, not an object: '__proto__' is not a safe key to serialize.
+  return names.map((name, i) => [
+    name,
+    answered[i] ? JSON.stringify(answered[i]).slice(0, 200) : 'no-reply',
+  ]);
+};
+
+// F1: navigating the parent (the guardian) in its common variants. Each variant runs in a fresh
+// frame. A sandboxed frame without allow-top-navigation may navigate only itself.
+probe.run.parentNavigation = (variant) => {
+  const target = receiver(`parentnav-${variant}`, 'parentnav');
+  try {
+    const parent = window.parent as Window;
+    switch (variant) {
+      case 'assignLocation':
+        (parent as unknown as { location: string }).location = target;
+        break;
+      case 'href':
+        parent.location.href = target;
+        break;
+      case 'assign':
+        parent.location.assign(target);
+        break;
+      case 'replace':
+        parent.location.replace(target);
+        break;
+      case 'openSelf':
+        parent.open(target, '_self');
+        break;
+      case 'openParent':
+        window.open(target, '_parent');
+        break;
+      default:
+        return `unknown:${variant}`;
+    }
+    return 'executed';
+  } catch (error) {
+    return `blocked:${(error as Error).name}`;
+  }
 };
 
 // <a ping> needs a navigation; a same-document fragment navigation is enough. (WebKit fires the
@@ -369,19 +411,33 @@ probe.run.oversizedFrame = () => {
 };
 
 // Click-activated probes (real user activation via the harness's frame.click()).
+// Each handler first logs `app-host-click:<id>` (observed by the harness through the browser's
+// console, which survives a frame reload) so that "nothing happened" can't mean "never clicked".
 const button = (id: string, label: string, onClick: () => void) => {
   const element = document.createElement('button');
   element.id = id;
   element.textContent = label;
-  element.addEventListener('click', onClick);
+  element.addEventListener('click', () => {
+    // eslint-disable-next-line no-console
+    console.log(`app-host-click:${id}`);
+    onClick();
+  });
   root.append(element);
 };
+// Unique per action: set by the harness through `run.setClickMarker` before each click.
+let clickMarker = 'click-unset';
+probe.run.setClickMarker = (marker) => {
+  clickMarker = marker;
+  return clickMarker;
+};
 button('click-popup', 'popup', () => {
-  results.clickPopup = window.open(receiver('clickpopup'), '_blank') ? 'opened' : 'null';
+  results.clickPopup = window.open(receiver(clickMarker, 'clickpopup'), '_blank')
+    ? 'opened'
+    : 'null';
 });
 button('click-top', 'top', () => {
   try {
-    (window.top as Window).location.href = receiver('clicktop', 'topnav');
+    (window.top as Window).location.href = receiver(clickMarker, 'topnav');
     results.clickTop = 'executed';
   } catch (error) {
     results.clickTop = `blocked:${(error as Error).name}`;
@@ -403,7 +459,7 @@ button('click-download', 'download', () => {
 });
 button('click-top-link', 'top link', () => {
   const link = document.createElement('a');
-  link.href = receiver('clicktoplink', 'topnav');
+  link.href = receiver(clickMarker, 'topnav');
   link.target = '_top';
   document.body.append(link);
   link.click();
@@ -411,7 +467,7 @@ button('click-top-link', 'top link', () => {
 });
 button('click-form', 'form', () => {
   const form = document.createElement('form');
-  form.action = receiver('clickform');
+  form.action = receiver(clickMarker, 'clickform');
   form.method = 'POST';
   form.target = '_top';
   document.body.append(form);
@@ -428,7 +484,6 @@ const main = async () => {
   await bridgeProbes();
   await executionProbes();
   await parentProbes();
-  await egressProbes();
   probe.done = true;
   document.body.setAttribute('data-ready', 'true');
 };

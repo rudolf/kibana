@@ -102,8 +102,42 @@ export const launch = (engine: string): Promise<Browser> => {
 export const login = async (
   context: BrowserContext,
   kibana: string,
-  user: UiUser
+  user: UiUser,
+  { viaBrowser = false }: { viaBrowser?: boolean } = {}
 ): Promise<void> => {
+  if (viaBrowser) {
+    // The browser itself stores the session cookie with every attribute Kibana sets (with
+    // SameSite=None that includes `Partitioned`, which an API-request login would not reproduce,
+    // leaving two `sid` cookies after the first refresh).
+    const page = await context.newPage();
+    try {
+      await page.goto(`${kibana}/login`, { waitUntil: 'domcontentloaded' });
+      const status = await page.evaluate(
+        async ({ username, password, currentURL }) =>
+          (
+            await fetch('/internal/security/login', {
+              method: 'POST',
+              headers: {
+                'kbn-xsrf': 'ui-security',
+                'x-elastic-internal-origin': 'Kibana',
+                'content-type': 'application/json',
+              },
+              body: JSON.stringify({
+                providerType: 'basic',
+                providerName: 'basic',
+                currentURL,
+                params: { username, password },
+              }),
+            })
+          ).status,
+        { username: user.username, password: user.password, currentURL: `${kibana}/login` }
+      );
+      if (status !== 200) throw new Error(`login failed: ${status}`);
+    } finally {
+      await page.close();
+    }
+    return;
+  }
   const response = await context.request.post(`${kibana}/internal/security/login`, {
     headers: {
       'kbn-xsrf': 'ui-security',

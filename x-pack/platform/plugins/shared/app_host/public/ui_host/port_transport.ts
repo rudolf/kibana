@@ -35,7 +35,10 @@ export type TerminationReason =
   | 'queue_overflow'
   | 'messageerror'
   | 'closed'
-  | 'aborted';
+  | 'aborted'
+  | 'live_stubs'
+  | 'depth_exceeded'
+  | 'bigint_too_large';
 
 export interface PortLike {
   onmessage: ((event: MessageEvent) => void) | null;
@@ -64,15 +67,23 @@ export class BoundedPortTransport implements RpcTransport {
   #reject: ((reason: Error) => void) | undefined;
   #error: Error | undefined;
   #timer: ReturnType<typeof setTimeout> | undefined;
+  readonly #admit: () => boolean;
 
+  /**
+   * `admit` is the session's retained-state check (live capnweb imports + exports). It runs every
+   * time capnweb asks for the next frame, i.e. right after it has processed the previous one, and
+   * after every send; false terminates with `live_stubs` before another frame is delivered.
+   */
   constructor(
     port: PortLike,
     onTerminate: (reason: TerminationReason) => void,
-    ingress: TokenBucket = new TokenBucket(UI_LIMITS.ingressPerSecond, UI_LIMITS.ingressBurst)
+    ingress: TokenBucket = new TokenBucket(UI_LIMITS.ingressPerSecond, UI_LIMITS.ingressBurst),
+    admit: () => boolean = () => true
   ) {
     this.#port = port;
     this.#onTerminate = onTerminate;
     this.#ingress = ingress;
+    this.#admit = admit;
     port.onmessage = (event) => this.#onMessage(event.data);
     port.onmessageerror = () => this.terminate('messageerror');
   }
@@ -84,10 +95,15 @@ export class BoundedPortTransport implements RpcTransport {
   send(message: string): void {
     if (this.#error) throw this.#error;
     this.#port.postMessage(message);
+    if (!this.#admit()) this.terminate('live_stubs');
   }
 
   receive(): Promise<string> {
     if (this.#error) return Promise.reject(this.#error);
+    if (!this.#admit()) {
+      this.terminate('live_stubs');
+      return Promise.reject(this.#error);
+    }
     return new Promise((resolve, reject) => {
       this.#resolve = resolve;
       this.#reject = reject;
@@ -114,8 +130,12 @@ export class BoundedPortTransport implements RpcTransport {
     resolve(next.data);
   }
 
-  abort(): void {
-    this.terminate('aborted');
+  /** capnweb aborts the session with the parse error; named limit breaches keep their reason. */
+  abort(reason?: unknown): void {
+    const message = reason instanceof Error ? reason.message : '';
+    if (/maximum allowed message depth/.test(message)) this.terminate('depth_exceeded');
+    else if (/bigint exceeds maximum length/i.test(message)) this.terminate('bigint_too_large');
+    else this.terminate('aborted');
   }
 
   /** Idempotent: closes the port, drops queued frames and rejects the pending receive. */

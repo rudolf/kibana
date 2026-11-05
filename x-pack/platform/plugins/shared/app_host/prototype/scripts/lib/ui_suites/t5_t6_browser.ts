@@ -20,6 +20,7 @@ import {
   waitForStatus,
 } from '../ui_harness';
 import { release, session, type SuiteContext } from './context';
+import { codeOf, execute } from './u2_authority';
 
 interface Probe {
   results: Record<string, string>;
@@ -36,6 +37,141 @@ export const waitProbe = async (child: Frame) => {
 };
 
 const T5 = 'T5';
+
+const CLICK_ACTIONS: Array<[string, string]> = [
+  ['click-popup', 'no popup'],
+  ['click-top', 'no top navigation (location assignment)'],
+  ['click-fullscreen', 'no fullscreen'],
+  ['click-download', 'no download'],
+  ['click-top-link', 'no _top link navigation'],
+  ['click-form', 'no _top form submission'],
+];
+
+const PARENT_NAVIGATIONS = [
+  'assignLocation',
+  'href',
+  'assign',
+  'replace',
+  'openSelf',
+  'openParent',
+];
+
+/** Calls `__probe.run[name](arg)` in the app frame. */
+export const runOn = (child: Frame, name: string, arg: string) =>
+  child.evaluate(
+    ([fn, value]) =>
+      (
+        window as unknown as { __probe: { run: Record<string, (m: string) => unknown> } }
+      ).__probe.run[fn](value),
+    [name, arg] as const
+  );
+
+/** Disable (the parent revokes its lease), reload, consent again and wait for a bound probe. */
+export const freshBound = async (page: Page, ctx: SuiteContext): Promise<Frame> => {
+  const disable = page.locator('[data-test-subj="appHostDisable"]');
+  if (await disable.isEnabled({ timeout: 500 }).catch(() => false)) {
+    await Promise.all([
+      page
+        .waitForResponse((r) => /\/revoke$/.test(r.url()), { timeout: 3000 })
+        .catch(() => undefined),
+      disable.click({ timeout: 1000 }).catch(() => undefined),
+    ]);
+  }
+  await openAndAllow(page, ctx.kibana);
+  await waitForStatus(page, /^bound$/);
+  const child = await waitForChild(page);
+  await waitProbe(child);
+  return child;
+};
+
+/** Leases created by the page (the parent's lease POST responses), for server-side checks. */
+const captureLeases = (page: Page) => {
+  const leases: Array<{ leaseId: string; secret: string }> = [];
+  page.on('response', async (response) => {
+    if (
+      response.request().method() === 'POST' &&
+      /\/internal\/app_host\/ui\/leases$/.test(response.url())
+    ) {
+      const body = (await response.json().catch(() => undefined)) as
+        | { leaseId?: string; secret?: string }
+        | undefined;
+      if (body?.leaseId && body.secret) leases.push({ leaseId: body.leaseId, secret: body.secret });
+    }
+  });
+  return leases;
+};
+
+/**
+ * F2: joint session history. The frame calls history.back(). Where that navigates the top page
+ * (a navigation residual, KNOWN_LEAK), the lease the old page held must be refused by the server.
+ */
+const runHistory = async (ctx: SuiteContext, engine: string) => {
+  const { report } = ctx;
+  const s = await session(ctx, engine, ctx.users.viewer);
+  try {
+    const { page } = s;
+    const leases = captureLeases(page);
+    await page.goto(`${ctx.kibana}/app/home`, { waitUntil: 'domcontentloaded' });
+    await openAndAllow(page, ctx.kibana);
+    await waitForStatus(page, /^bound$/);
+    const child = await waitForChild(page);
+    await waitProbe(child);
+    const held = leases[leases.length - 1];
+    if (!held) throw new Error('no lease captured');
+    const lease = { user: ctx.users.viewer, ...held };
+    const before = await execute(ctx, lease, { op: 'app.summary' });
+    const topBefore = page.url();
+    await runOn(child, 'historyBack', '').catch(() => undefined);
+    await sleep(2000);
+    const topChanged = page.url() !== topBefore;
+    let after = '';
+    for (let i = 0; i < 10; i++) {
+      after = codeOf(await execute(ctx, lease, { op: 'app.summary' }));
+      if (after !== 'ok') break;
+      await sleep(500);
+    }
+    report.expect(
+      T5,
+      'history control: the held lease worked before history.back()',
+      engine,
+      codeOf(before) === 'ok',
+      codeOf(before)
+    );
+    if (topChanged) {
+      report.add(
+        T5,
+        'history.back() from frame navigated the top page (joint history)',
+        engine,
+        'KNOWN_LEAK',
+        {
+          from: topBefore.replace(ctx.kibana, ''),
+          to: page.url().replace(ctx.kibana, ''),
+          note: 'navigation residual: the app cannot choose the URL, only traverse existing entries',
+        }
+      );
+      report.expect(
+        T5,
+        'F2: after history.back() changed the top page, the old lease is refused',
+        engine,
+        after === 'app_denied',
+        { afterNavigation: after }
+      );
+    } else {
+      report.add(
+        T5,
+        'history.back() from frame (joint history): top page unchanged here',
+        engine,
+        'DIAGNOSTIC',
+        {
+          afterCall: after,
+          status: await frameStatus(page).catch(() => 'page navigated'),
+        }
+      );
+    }
+  } finally {
+    await s.close();
+  }
+};
 
 const runT5Engine = async (ctx: SuiteContext, engine: string) => {
   const { report } = ctx;
@@ -95,68 +231,60 @@ const runT5Engine = async (ctx: SuiteContext, engine: string) => {
         ctx.receiver.count('popup') === 0,
       { open: r.windowOpen, fullscreen: r.requestFullscreen }
     );
-    // Real user activation inside the frame.
-    for (const id of [
-      'click-popup',
-      'click-top',
-      'click-fullscreen',
-      'click-download',
-      'click-top-link',
-      'click-form',
-    ]) {
-      await child.click(`#${id}`).catch(() => undefined);
-      await sleep(700);
-    }
-    const after = await readProbe(child).catch(() => undefined);
-    const fullscreen = await page.evaluate(() => Boolean(document.fullscreenElement));
-    report.expect(
-      T5,
-      'with a real click: no popup, download, fullscreen, top navigation or form',
-      engine,
-      popups.length === 0 &&
-        downloads.length === 0 &&
-        !fullscreen &&
-        page.url() === topUrl &&
-        ctx.receiver.count('clickpopup') +
-          ctx.receiver.count('clicktop') +
-          ctx.receiver.count('clickform') ===
-          0,
-      {
-        popups,
-        downloads,
+    // Real user activation inside the frame: one fresh bound frame per destructive action (a
+    // blocked action may reload the child in some engines). Each action needs proof that its click
+    // handler ran (console line from the frame) and is asserted on its own.
+    for (const [id, label] of CLICK_ACTIONS) {
+      const marker = `${id}-${engine}-${Date.now().toString(36)}`;
+      child = await freshBound(page, ctx);
+      const consoleBefore = s.console.length;
+      const popupsBefore = popups.length;
+      const downloadsBefore = downloads.length;
+      await runOn(child, 'setClickMarker', marker);
+      let clicked = 'clicked';
+      await child.click(`#${id}`, { timeout: 5000 }).catch((error) => {
+        clicked = `click failed: ${String(error).slice(0, 80)}`;
+      });
+      await sleep(1200);
+      const handlerRan = s.console
+        .slice(consoleBefore)
+        .some((line) => line.includes(`app-host-click:${id}`));
+      const fullscreen = await page.evaluate(() => Boolean(document.fullscreenElement));
+      const evidence = {
+        clicked,
+        handlerRan,
+        popups: popups.length - popupsBefore,
+        downloads: downloads.length - downloadsBefore,
         fullscreen,
-        url: page.url() === topUrl,
-        clicks: after?.results && {
-          popup: after.results.clickPopup,
-          top: after.results.clickTop,
-          fullscreen: after.results.clickFullscreen,
-          form: after.results.clickForm,
-        },
-      }
-    );
-    // Some engines turn a blocked click action into a child reload, which the guardian revokes;
-    // record it, then continue on a fresh frame.
-    report.add(T5, 'frame state after blocked click actions', engine, 'DIAGNOSTIC', {
-      status: await frameStatus(page),
-    });
-    if (!/^bound$/.test(await frameStatus(page))) {
-      await page.reload();
-      await openAndAllow(page, ctx.kibana);
-      await waitForStatus(page, /^bound$/);
-      child = await waitForChild(page);
-      await waitProbe(child);
+        topUrlUnchanged: page.url() === topUrl,
+        receiverHits: ctx.receiver.count(marker),
+        frame: await frameStatus(page),
+      };
+      const effects =
+        evidence.popups === 0 &&
+        evidence.downloads === 0 &&
+        !fullscreen &&
+        evidence.topUrlUnchanged &&
+        evidence.receiverHits === 0;
+      report.expect(
+        T5,
+        `with a real click (handler ran): ${label}`,
+        engine,
+        clicked === 'clicked' && handlerRan && effects,
+        evidence
+      );
     }
-    const top = await child.evaluate(() =>
-      (
-        window as unknown as { __probe: { run: Record<string, (m: string) => string> } }
-      ).__probe.run.topNavigation('topnav-noclick')
-    );
+    child = await freshBound(page, ctx);
+    const noClickMarker = `topnav-noclick-${engine}-${Date.now().toString(36)}`;
+    const top = String(await runOn(child, 'topNavigation', noClickMarker));
     await sleep(800);
     report.expect(
       T5,
-      'top location assignment without click blocked, top URL unchanged',
+      'top location assignment without click blocked (SecurityError), top URL unchanged',
       engine,
-      page.url() === topUrl && ctx.receiver.count('topnav-noclick') === 0,
+      top.startsWith('blocked:') &&
+        page.url() === topUrl &&
+        ctx.receiver.count(noClickMarker) === 0,
       { result: top }
     );
     // Fixed-position overlay stays clipped: trusted chrome remains hit-testable and uncovered.
@@ -211,20 +339,26 @@ const runT5Engine = async (ctx: SuiteContext, engine: string) => {
       { frameUrl: embedded?.url().slice(0, 80) ?? null }
     );
     await external.close();
-    // Joint session history: diagnostic only, never claimed as blocked.
-    const historyBefore = page.url();
-    await child
-      .evaluate(() =>
-        (
-          window as unknown as { __probe: { run: Record<string, () => string> } }
-        ).__probe.run.historyBack()
-      )
-      .catch(() => undefined);
-    await sleep(1500);
-    report.add(T5, 'history.back() from frame (joint history)', engine, 'DIAGNOSTIC', {
-      topUrlChanged: page.url() !== historyBefore,
-      status: await frameStatus(page).catch(() => 'page navigated'),
-    });
+    // F1: navigating the parent (guardian) in each variant, one fresh frame each.
+    for (const variant of PARENT_NAVIGATIONS) {
+      child = await freshBound(page, ctx);
+      const guardianBefore = guardianFrame(page)?.url();
+      const result = String(await runOn(child, 'parentNavigation', variant));
+      await sleep(1500);
+      const guardianAfter = guardianFrame(page)?.url();
+      const status = await frameStatus(page);
+      const hits = ctx.receiver.count(`parentnav-${variant}`);
+      report.expect(
+        T5,
+        `F1 frame navigating its parent (${variant}): denied, guardian not replaced`,
+        engine,
+        hits === 0 &&
+          page.url() === topUrl &&
+          ((guardianAfter === guardianBefore && status === 'bound') ||
+            /ended: guardian_reloaded/.test(status)),
+        { result, hits, guardianUnchanged: guardianAfter === guardianBefore, status }
+      );
+    }
     // Same-document fragment navigation: engine-specific iframe load behaviour (diagnostic).
     const fresh = await context.newPage();
     await openAndAllow(fresh, ctx.kibana);
@@ -256,21 +390,31 @@ export const ensureHostile = async (ctx: SuiteContext) => {
 
 export const runT5 = async (ctx: SuiteContext) => {
   await ensureHostile(ctx);
-  for (const engine of ctx.engines)
+  for (const engine of ctx.engines) {
     await ctx.report.guard(T5, 'browser', engine, () => runT5Engine(ctx, engine));
+    await ctx.report.guard(T5, 'history', engine, () => runHistory(ctx, engine));
+  }
 };
 
 const T6 = 'T6';
 
 /** Counts message-handler invocations per frame (installed in every frame before any script). */
 export const MESSAGE_COUNTER = `(() => {
-  const counts = { message: 0, listeners: 0 };
+  // F6: in the top window, also record who registered each message listener (registration stack
+  // and the listener's source head), so the listener that runs during the flood is identified.
+  const counts = { message: 0, listeners: 0, sources: [] };
   Object.defineProperty(window, '__msgCounter', { value: counts });
   const original = EventTarget.prototype.addEventListener;
   const wrapped = new WeakMap();
   EventTarget.prototype.addEventListener = function (type, listener, options) {
     if (type === 'message' && this === window && typeof listener === 'function') {
       counts.listeners += 1;
+      if (window === window.top) {
+        counts.sources.push({
+          stack: String(new Error().stack).split('\\n').slice(1, 8).map((l) => l.trim().slice(0, 200)),
+          fn: String(listener).slice(0, 600),
+        });
+      }
       const wrapper = function (event) { counts.message += 1; return listener.call(this, event); };
       wrapped.set(listener, wrapper);
       return original.call(this, type, wrapper, options);
@@ -439,6 +583,8 @@ const runT6Engine = async (ctx: SuiteContext, engine: string) => {
         {
           topHandlerInvocations: topAfter.message - topBefore.message,
           topListeners: topAfter.listeners,
+          // F6 listener inventory (registration stack + source head of each top-window listener).
+          topListenerSources: (topAfter as { sources?: unknown }).sources,
         }
       );
       report.expect(

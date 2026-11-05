@@ -54,10 +54,19 @@ export interface BridgeHooks {
   readonly onLocalRejection?: (method: string, code: BridgeErrorCode) => void;
 }
 
-/** A stackless error carrying only a fixed public code. */
+/**
+ * A stackless error carrying only a fixed public code. `stack` is shadowed by an own empty value:
+ * deleting it is not enough where it is an inherited accessor (Firefox), and capnweb serializes any
+ * truthy `stack` of the error it sends.
+ */
 export const bridgeError = (code: BridgeErrorCode): Error => {
   const error = new Error(code);
-  delete error.stack;
+  Object.defineProperty(error, 'stack', {
+    value: '',
+    configurable: true,
+    writable: true,
+    enumerable: false,
+  });
   return error;
 };
 

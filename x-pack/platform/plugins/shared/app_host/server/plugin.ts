@@ -43,7 +43,18 @@ export class AppHostPlugin
     const decisions = new SurfaceDecisions();
     registerSecurityHeadersHook(core.http, decisions);
 
-    registerRoutes({ router, runner, packagePath, consentPath, logger: this.#logger });
+    const audit = new BridgeAuditLogger(this.#logger.get('bridge_audit'));
+    registerRoutes({
+      router,
+      runner,
+      packagePath,
+      consentPath,
+      logger: this.#logger,
+      basePath: core.http.basePath,
+      audit,
+      userNameOf: async (request) =>
+        (await core.getStartServices())[0].security.authc.getCurrentUser(request)?.username,
+    });
 
     const { publicBaseUrl } = core.http.basePath;
     if (consentPath && publicBaseUrl) {
@@ -65,7 +76,7 @@ export class AppHostPlugin
           packagePath,
           consentPath,
           runner,
-          audit: new BridgeAuditLogger(this.#logger.get('bridge_audit')),
+          audit,
         }),
         getStart: async () => (await core.getStartServices())[0],
       });

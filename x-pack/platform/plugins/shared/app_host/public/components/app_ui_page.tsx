@@ -43,6 +43,8 @@ export const LOCAL_PROCESSOR_COPY = i18n.translate('xpack.appHost.ui.localProces
 export interface LeaseHandle {
   readonly executor: BridgeExecutor;
   readonly release: () => void;
+  /** Parent-clock deadline at or before the server's lease expiry; the frame is torn down then. */
+  readonly expiresAt: number;
 }
 
 /** Creates a parent-held lease for an approved release; undefined while not wired (U1). */
@@ -77,6 +79,9 @@ export const AppUiPage = ({ http, createLease }: PageProps) => {
   const leaseRef = useRef<LeaseHandle | undefined>();
   const themeRef = useRef<UiTheme>();
   const metadataRef = useRef<UiAppMetadata | undefined>();
+  // Bumped by every teardown (Disable, unmount, release change, disable/unapproval). An async mount
+  // only proceeds if its generation is still current after the lease request settles.
+  const generationRef = useRef(0);
 
   themeRef.current = {
     mode: colorMode === 'DARK' ? 'dark' : 'light',
@@ -90,6 +95,7 @@ export const AppUiPage = ({ http, createLease }: PageProps) => {
   };
 
   const unmountFrame = useCallback((reason: FrameHostEndReason) => {
+    generationRef.current += 1;
     const host = hostRef.current;
     hostRef.current = undefined;
     host?.end(reason);
@@ -142,12 +148,29 @@ export const AppUiPage = ({ http, createLease }: PageProps) => {
     async (current: UiAppMetadata) => {
       const container = containerRef.current;
       if (!container || hostRef.current) return;
+      const generation = generationRef.current;
       setFrame({ status: 'loading' });
       let lease: LeaseHandle | undefined;
       try {
         lease = createLease ? await createLease(current) : undefined;
       } catch {
-        setFrame({ status: 'ended', reason: 'lease_failed' });
+        if (generation === generationRef.current)
+          setFrame({ status: 'ended', reason: 'lease_failed' });
+        return;
+      }
+      // P1: consent was withdrawn, the page unmounted or the release changed while the lease was
+      // being created. A stale lease never mounts or binds a frame; it is released immediately.
+      const latest = metadataRef.current;
+      if (
+        generation !== generationRef.current ||
+        hostRef.current ||
+        !containerRef.current?.isConnected ||
+        !latest ||
+        latest.releaseDigest !== current.releaseDigest ||
+        !latest.approved ||
+        !latest.enabled
+      ) {
+        lease?.release();
         return;
       }
       leaseRef.current = lease;
@@ -172,6 +195,7 @@ export const AppUiPage = ({ http, createLease }: PageProps) => {
         grant: { scopes: current.scopes, dashboardIds: current.dashboardIds },
         theme: () => themeRef.current as UiTheme,
         executor,
+        leaseExpiresAt: lease?.expiresAt,
         onBound: () => setFrame({ status: 'bound' }),
         onEnded: (reason, detail) => {
           if (hostRef.current === host) {

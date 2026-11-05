@@ -18,7 +18,7 @@ the remote steps.
 | `release` | Build the sample app; write `<sha256>.js` first, then atomically replace `manifest.json`. `--with-ui` also builds the UI IIFE and the UI envelope; `--approve-local-synthetic` runs the checked superuser approval and writes `.local/operator/consent.json` (0600) |
 | `ui:seed` | UI cut seed on top of `seed`: hostile `medium` record, granted + ungranted synthetic dashboards, empty space `app-host-empty`, viewer matrix (`.local/ui_users.json`, never printed) |
 | `ui:operator` | Operator `disable` / `enable` / `status` / `reset` of the approval file (never reachable through the bridge) |
-| `ui:security` | T1–T14 Playwright/API harness in Chromium/Firefox/WebKit; JSON report in `.local/ui_security-*.json` |
+| `ui:security` | T1–T14 Playwright/API harness in Chromium/Firefox/WebKit; JSON report in `.local/ui_security-*.json`. `--suites t4tls --tls DIR` runs the SameSite=None HTTPS cookie fixture against Kibana started with `kibana:config -- --tls DIR` (see below) |
 | `acceptance` | Kibana-level M2/M3 assertions (authz, ES denial, package failures, limits, deadline, ...) |
 | `ui-check` | Page check of `/app/appHost` v1 → v2 via Refresh (uses the Kibana workspace's Playwright) |
 | `benchmark` | Fresh-invocation latency sample through Kibana (and optionally the raw seam) |
@@ -112,6 +112,22 @@ The total stays under 200 fresh invocations (~87). Cleanup (also needs approval)
 - `ui/src/` sample app UI (one classic IIFE: `main.ts` plus the small guest SDK `sdk.ts`); `ui/fixtures/hostile.ts`
   is the deliberately hostile UI used by T1/T3–T6.
 - `scripts/lib/ui_suites/` the `ui:security` suites; `scripts/lib/approval.ts` the local approval tool.
+  `ui/fixtures/channels.ts` holds the T4 channel probes, shared by the hostile frame and by an ordinary
+  control page (`ui/fixtures/channel_control.ts`) so that every claimed block has a working control.
+
+### SameSite=None HTTPS fixture (T4-TLS)
+
+```bash
+cd "$P/prototype"
+mkdir -p .local/tls && openssl req -x509 -newkey rsa:2048 -nodes -days 3 -subj /CN=localhost \
+  -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' -keyout .local/tls/key.pem -out .local/tls/cert.pem
+npm run kibana:config -- --tls "$PWD/.local/tls"     # writes .local/kibana.app_host.tls.yml
+# restart Kibana with -c .local/kibana.app_host.tls.yml (KBN_HMR=false), then:
+NODE_EXTRA_CA_CERTS="$PWD/.local/tls/cert.pem" npm run ui:security -- --kibana https://localhost:5601 \
+  --suites t4tls --tls "$PWD/.local/tls" --engines chromium,firefox,webkit
+```
+
+The certificate and key are local, self-signed and git-ignored; browsers trust them per context only.
 - `fixtures/` adversarial seam apps (egress, loop, misuse, budget, sentinel, echo, env probe).
 - `scripts/` Node tools run with the pinned `tsx`; `test/` node:test unit tests.
 
