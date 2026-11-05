@@ -11,7 +11,7 @@ import { UI_LIMITS } from '../../common/ui_protocol';
 import { BridgeLifecycle } from './bridge_lifecycle';
 import type { ExecuteOutcome } from './bridge_root';
 import { startBridgeSession } from './bridge_session';
-import { TokenBucket, type PortLike } from './port_transport';
+import type { PortLike } from './port_transport';
 
 const THEME: UiTheme = {
   mode: 'light',
@@ -44,8 +44,6 @@ const connect = () => {
     },
     lifecycle: new BridgeLifecycle(),
     onTerminate: (reason) => ended.push(reason),
-    // Remove ingress pacing so that the test exercises only the live-stub boundary.
-    ingress: new TokenBucket(1_000_000, 1_000_000),
   });
   const replies: string[] = [];
   channel.port2.on('message', (data: string) => replies.push(data));

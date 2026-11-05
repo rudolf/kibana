@@ -43,13 +43,9 @@ export const UI_INTERNAL_PREFIX = '/internal/app_host/ui/';
 export const UI_METADATA_ROUTE = '/internal/app_host/ui/apps/{appId}';
 export const uiMetadataPath = (appId: string): string =>
   `/internal/app_host/ui/apps/${encodeURIComponent(appId)}`;
-export const UI_LEASES_PATH = '/internal/app_host/ui/leases';
-export const UI_LEASE_EXECUTE_ROUTE = '/internal/app_host/ui/leases/{leaseId}/execute';
-export const UI_LEASE_REVOKE_ROUTE = '/internal/app_host/ui/leases/{leaseId}/revoke';
-export const uiLeaseExecutePath = (leaseId: string): string =>
-  `/internal/app_host/ui/leases/${encodeURIComponent(leaseId)}/execute`;
-export const uiLeaseRevokePath = (leaseId: string): string =>
-  `/internal/app_host/ui/leases/${encodeURIComponent(leaseId)}/revoke`;
+/** Mints the app session (restricted API key) and returns its opaque encrypted handle. */
+export const UI_SESSION_PATH = '/internal/app_host/ui/session';
+export const UI_EXECUTE_PATH = '/internal/app_host/ui/execute';
 
 export const UI_LIMITS = {
   uiBundleBytes: 512 * 1024,
@@ -62,20 +58,12 @@ export const UI_LIMITS = {
   rpcMaxBigIntDigits: 64,
   liveRpcStubs: 128,
   invalidCallsBeforeTermination: 8,
-  /** Ingress window messages on the port: 60/s, burst 16. */
-  ingressPerSecond: 60,
-  ingressBurst: 16,
-  /** Accepted operations, shared by every lease of one (app, user, space): 5/s, burst 10. */
-  operationsPerSecond: 5,
-  operationsBurst: 10,
-  operationsPerLease: 100,
-  inFlightPerLease: 2,
-  uiServerOperationsPerProcess: 4,
   operationDeadlineMs: 5000,
-  leaseTtlMs: 5 * 60 * 1000,
-  leasesGlobal: 32,
-  leasesPerPrincipal: 4,
-  pollIntervalMs: 2000,
+  /** App session (restricted API key and its handle) lifetime. */
+  sessionTtlMs: 60 * 60 * 1000,
+  /** Maximum age of the cached enablement/approval state read on every execute. */
+  stateCacheMs: 2000,
+  handleBytes: 1024,
   resultBytes: 16 * 1024,
   dashboardResultBytes: 4 * 1024,
   dashboardTitleLength: 256,
@@ -133,22 +121,15 @@ export interface UiTheme {
   };
 }
 
-export interface CreateLeaseRequest {
+export interface CreateSessionRequest {
   readonly appId: string;
   readonly releaseDigest: string;
 }
-export interface CreateLeaseResponse {
-  readonly leaseId: string;
-  readonly secret: string;
-  /** Server clock. */
-  readonly expiresAt: number;
-  /** Lease lifetime from creation; the parent derives its own teardown deadline from it. */
-  readonly ttlMs: number;
+/** Opaque to the browser: an AES-256-GCM sealed reference to a server-side-only API key. */
+export interface CreateSessionResponse {
+  readonly handle: string;
 }
-export interface ExecuteRequest {
-  readonly secret: string;
-  readonly operation: UiOperation;
-}
+export type ExecuteRequest = { readonly handle: string } & UiOperation;
 export type ExecuteResponse =
   | { readonly ok: true; readonly result: UiSummaryResult | UiSearchResult | UiDashboardPreview }
   | { readonly ok: false; readonly code: BridgeErrorCode };
@@ -174,14 +155,11 @@ export const LOCAL_DEMO_PUBLISHER = 'Local synthetic demo publisher';
 
 const HEX64 = /^[0-9a-f]{64}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-const LEASE_ID = /^[A-Za-z0-9_-]{22,64}$/;
 
 export const isHex64 = (value: unknown): value is string =>
   typeof value === 'string' && HEX64.test(value);
 export const isUuid = (value: unknown): value is string =>
   typeof value === 'string' && value.length <= 64 && UUID.test(value);
-export const isLeaseId = (value: unknown): value is string =>
-  typeof value === 'string' && LEASE_ID.test(value);
 
 const isPlainRecord = (value: unknown): value is Record<string, unknown> => {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;

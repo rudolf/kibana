@@ -58,12 +58,21 @@ const run = async () => {
   const summary = panel('panel-summary', 'App summary (remote app code)');
   const records = panel('panel-records', 'Synthetic records (raw)');
   const dashboard = panel('panel-dashboard', 'Dashboard');
-  try {
-    const result = await bridge.callAppRoute({ method: 'GET', path: '/summary' });
-    summary.textContent = `${result.label} ${result.version}: high ${result.counts.high}, low ${result.counts.low}`;
-  } catch (error) {
-    summary.textContent = `error ${errorCode(error)}`;
-  }
+  const loadSummary = async () => {
+    try {
+      const result = await bridge.callAppRoute({ method: 'GET', path: '/summary' });
+      summary.textContent = `${result.label} ${result.version}: high ${result.counts.high}, low ${result.counts.low}`;
+    } catch (error) {
+      summary.textContent = `error ${errorCode(error)}`;
+    }
+  };
+  // A later, user-initiated call: the host rejects it once the operator disabled the app.
+  const refresh = document.createElement('button');
+  refresh.id = 'refresh-summary';
+  refresh.textContent = 'Refresh summary';
+  refresh.addEventListener('click', () => loadSummary());
+  root.insertBefore(refresh, summary.parentElement);
+  await loadSummary();
   try {
     const result = await bridge.search({ index: 'kbn-apps-prototype-alerts', size: 100 });
     records.textContent = '';

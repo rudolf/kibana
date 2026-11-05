@@ -41,6 +41,17 @@ const configSchema = schema.object({
   // Operator-only approval record for the app UI (consent.json, mode 0600). Unset: UI disabled and
   // the native summary keeps its legacy backend-only behaviour.
   consentPath: schema.maybe(schema.string({ minLength: 1, maxLength: 4096 })),
+  // AES-256-GCM key material for the stateless app session handle (SHA-256 of this value).
+  handleEncryptionKey: whenEnabled(schema.string({ minLength: 32, maxLength: 256 })),
+  // K1 fault injection: skips the bridge's input schema so Elasticsearch/Kibana authz must deny.
+  // Exists only in dev mode (`--dev`); any value outside dev mode fails config validation.
+  testOnlySkipInputSchema: schema.conditional(
+    schema.contextRef('dev'),
+    true,
+    schema.boolean({ defaultValue: false }),
+    schema.literal(false),
+    { defaultValue: false }
+  ),
 });
 
 export type AppHostConfig = TypeOf<typeof configSchema>;

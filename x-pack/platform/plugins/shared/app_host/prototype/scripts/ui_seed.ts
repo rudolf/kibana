@@ -19,6 +19,8 @@ import { LOCAL_DIR } from './lib/secrets';
 import { DASHBOARD_TITLE, HOSTILE_RULE, UI_SEED_FILE, writeUiSeed } from './lib/ui_seed_state';
 
 const INDEX = 'kbn-apps-prototype-alerts';
+/** K1: a synthetic index the viewer can read but no app grant ever names. */
+export const VIEWER_ONLY_INDEX = 'kbn-apps-prototype-viewer-only';
 const EMPTY_SPACE = 'app-host-empty';
 
 const esUrl = requireEnv('ES_URL').replace(/\/$/, '');
@@ -45,6 +47,19 @@ check(
       method: 'PUT',
       auth: esAuth,
       body: { '@timestamp': new Date().toISOString(), severity: 'medium', rule: HOSTILE_RULE },
+    })
+  ).status,
+  [200, 201]
+);
+
+// 1b. One synthetic record in an index the viewer may read but the app is never granted (K1).
+check(
+  'viewer-only record',
+  (
+    await http(`${esUrl}/${VIEWER_ONLY_INDEX}/_doc/synthetic-viewer-only?refresh=wait_for`, {
+      method: 'PUT',
+      auth: esAuth,
+      body: { '@timestamp': new Date().toISOString(), severity: 'low', rule: 'viewer-only' },
     })
   ).status,
   [200, 201]
@@ -115,7 +130,7 @@ const role = async (name: string, indices: boolean, feature: Features) => {
   const result = await kb(`/api/security/role/${name}`, 'PUT', {
     elasticsearch: {
       cluster: [],
-      indices: indices ? [{ names: [INDEX], privileges: ['read'] }] : [],
+      indices: indices ? [{ names: [INDEX, VIEWER_ONLY_INDEX], privileges: ['read'] }] : [],
     },
     kibana: Object.keys(feature).length
       ? [{ base: [], feature, spaces: ['default', EMPTY_SPACE] }]

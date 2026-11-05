@@ -20,7 +20,6 @@ import {
   waitForStatus,
 } from '../ui_harness';
 import { release, session, type SuiteContext } from './context';
-import { codeOf, execute } from './u2_authority';
 
 interface Probe {
   results: Record<string, string>;
@@ -66,16 +65,11 @@ export const runOn = (child: Frame, name: string, arg: string) =>
     [name, arg] as const
   );
 
-/** Disable (the parent revokes its lease), reload, consent again and wait for a bound probe. */
+/** Disable (the parent drops its handle), reload, consent again and wait for a bound probe. */
 export const freshBound = async (page: Page, ctx: SuiteContext): Promise<Frame> => {
   const disable = page.locator('[data-test-subj="appHostDisable"]');
   if (await disable.isEnabled({ timeout: 500 }).catch(() => false)) {
-    await Promise.all([
-      page
-        .waitForResponse((r) => /\/revoke$/.test(r.url()), { timeout: 3000 })
-        .catch(() => undefined),
-      disable.click({ timeout: 1000 }).catch(() => undefined),
-    ]);
+    await disable.click({ timeout: 1000 }).catch(() => undefined);
   }
   await openAndAllow(page, ctx.kibana);
   await waitForStatus(page, /^bound$/);
@@ -84,59 +78,31 @@ export const freshBound = async (page: Page, ctx: SuiteContext): Promise<Frame> 
   return child;
 };
 
-/** Leases created by the page (the parent's lease POST responses), for server-side checks. */
-const captureLeases = (page: Page) => {
-  const leases: Array<{ leaseId: string; secret: string }> = [];
-  page.on('response', async (response) => {
-    if (
-      response.request().method() === 'POST' &&
-      /\/internal\/app_host\/ui\/leases$/.test(response.url())
-    ) {
-      const body = (await response.json().catch(() => undefined)) as
-        | { leaseId?: string; secret?: string }
-        | undefined;
-      if (body?.leaseId && body.secret) leases.push({ leaseId: body.leaseId, secret: body.secret });
-    }
-  });
-  return leases;
-};
-
 /**
  * F2: joint session history. The frame calls history.back(). Where that navigates the top page
- * (a navigation residual, KNOWN_LEAK), the lease the old page held must be refused by the server.
+ * (a navigation residual, KNOWN_LEAK), the app frame and the parent's handle must be gone: the
+ * authority lived only in the unloaded parent page, so nothing is left to call with.
  */
 const runHistory = async (ctx: SuiteContext, engine: string) => {
   const { report } = ctx;
   const s = await session(ctx, engine, ctx.users.viewer);
   try {
     const { page } = s;
-    const leases = captureLeases(page);
+    const executes: string[] = [];
+    page.on('request', (request) => {
+      if (/\/internal\/app_host\/ui\/execute$/.test(request.url())) executes.push(request.url());
+    });
     await page.goto(`${ctx.kibana}/app/home`, { waitUntil: 'domcontentloaded' });
     await openAndAllow(page, ctx.kibana);
     await waitForStatus(page, /^bound$/);
     const child = await waitForChild(page);
     await waitProbe(child);
-    const held = leases[leases.length - 1];
-    if (!held) throw new Error('no lease captured');
-    const lease = { user: ctx.users.viewer, ...held };
-    const before = await execute(ctx, lease, { op: 'app.summary' });
     const topBefore = page.url();
     await runOn(child, 'historyBack', '').catch(() => undefined);
     await sleep(2000);
     const topChanged = page.url() !== topBefore;
-    let after = '';
-    for (let i = 0; i < 10; i++) {
-      after = codeOf(await execute(ctx, lease, { op: 'app.summary' }));
-      if (after !== 'ok') break;
-      await sleep(500);
-    }
-    report.expect(
-      T5,
-      'history control: the held lease worked before history.back()',
-      engine,
-      codeOf(before) === 'ok',
-      codeOf(before)
-    );
+    const executesAfterBack = executes.length;
+    await sleep(1000);
     if (topChanged) {
       report.add(
         T5,
@@ -151,10 +117,11 @@ const runHistory = async (ctx: SuiteContext, engine: string) => {
       );
       report.expect(
         T5,
-        'F2: after history.back() changed the top page, the old lease is refused',
+        'F2: after history.back() changed the top page, the app frame is gone and no execute call follows',
         engine,
-        after === 'app_denied',
-        { afterNavigation: after }
+        page.frames().every((frame) => !/\/api\/app_host\/ui\//.test(frame.url())) &&
+          executes.length === executesAfterBack,
+        { frames: page.frames().length, executes: executes.length - executesAfterBack }
       );
     } else {
       report.add(
@@ -162,10 +129,7 @@ const runHistory = async (ctx: SuiteContext, engine: string) => {
         'history.back() from frame (joint history): top page unchanged here',
         engine,
         'DIAGNOSTIC',
-        {
-          afterCall: after,
-          status: await frameStatus(page).catch(() => 'page navigated'),
-        }
+        { status: await frameStatus(page).catch(() => 'page navigated') }
       );
     }
   } finally {
@@ -473,7 +437,7 @@ const runT6Engine = async (ctx: SuiteContext, engine: string) => {
       const { page } = s;
       const executes: string[] = [];
       page.on('request', (request) => {
-        if (/\/leases\/[^/]+\/execute$/.test(request.url())) executes.push(request.url());
+        if (/\/internal\/app_host\/ui\/execute$/.test(request.url())) executes.push(request.url());
       });
       const releaseFrame = await holdFrameDocument(page);
       await openAndAllow(page, ctx.kibana);

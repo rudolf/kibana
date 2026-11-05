@@ -154,19 +154,9 @@ export const session = async (
     context,
     page,
     console: consoleLines,
-    // Graceful close: use the app's own Disable control so the parent revokes its lease (4 per
-    // principal, 5-minute TTL), then close with beforeunload/pagehide.
+    // Nothing to revoke server-side: the parent drops its handle when the page goes away.
     close: async () => {
       for (const open of context.pages()) {
-        const disable = open.locator('[data-test-subj="appHostDisable"]');
-        if (await disable.isEnabled({ timeout: 500 }).catch(() => false)) {
-          await Promise.all([
-            open
-              .waitForResponse((r) => /\/revoke$/.test(r.url()), { timeout: 3000 })
-              .catch(() => undefined),
-            disable.click({ timeout: 1000 }).catch(() => undefined),
-          ]);
-        }
         await open.close({ runBeforeUnload: true }).catch(() => undefined);
       }
       await new Promise((done) => setTimeout(done, 300));

@@ -15,7 +15,7 @@ test('tool scope-map digest equals the plugin-pinned bridgeApi 1 contract digest
   // Same value as the inline snapshot in server/ui/contract.test.ts.
   assert.equal(
     scopeMapDigest(),
-    '696dca371b839606c8fd6173cd1bea24bd32d1395fa32e21d11ce9f0032cd508'
+    '23880e2aacc868856f20bd93bac94098a9050223512d9b9a96681e413c5c2888'
   );
 });
 

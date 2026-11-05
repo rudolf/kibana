@@ -24,8 +24,7 @@ export type FrameHostEndReason =
   | 'bad_init'
   | 'bad_ready'
   | 'messageerror'
-  | 'protocol_error'
-  | 'lease_rejected';
+  | 'protocol_error';
 
 export interface FrameHostOptions {
   readonly container: HTMLElement;
@@ -36,8 +35,6 @@ export interface FrameHostOptions {
   readonly grant: BridgeGrant;
   readonly theme: () => UiTheme;
   readonly executor: BridgeExecutor | undefined;
-  /** Parent-clock lease deadline: the frame and port are torn down then, even when idle. */
-  readonly leaseExpiresAt?: number;
   readonly onBound?: () => void;
   readonly onEnded: (reason: FrameHostEndReason, detail?: string) => void;
   readonly onLocalRejection?: (method: string, code: BridgeErrorCode) => void;
@@ -74,7 +71,6 @@ export class FrameHost {
   #transport: BoundedPortTransport | undefined;
   #control: MessagePort | undefined;
   #timer: ReturnType<typeof setTimeout> | undefined;
-  #expiryTimer: ReturnType<typeof setTimeout> | undefined;
   #ended = false;
   #bound = false;
 
@@ -108,13 +104,6 @@ export class FrameHost {
     this.#timer = setTimeout(() => {
       if (!this.#bound) this.end('handshake_timeout');
     }, this.#options.handshakeTimeoutMs ?? HANDSHAKE_TIMEOUT_MS);
-    const { leaseExpiresAt } = this.#options;
-    if (leaseExpiresAt !== undefined) {
-      this.#expiryTimer = setTimeout(
-        () => this.end('expired'),
-        Math.max(0, leaseExpiresAt - Date.now())
-      );
-    }
     this.#iframe = iframe;
     iframe.src = guardianUrl;
     container.appendChild(iframe);
@@ -125,7 +114,6 @@ export class FrameHost {
     if (this.#ended) return;
     this.#ended = true;
     if (this.#timer) clearTimeout(this.#timer);
-    if (this.#expiryTimer) clearTimeout(this.#expiryTimer);
     this.#lifecycle.revoke(END_CODES[reason] ?? 'app_disabled');
     this.#transport?.terminate('closed');
     if (this.#control) {

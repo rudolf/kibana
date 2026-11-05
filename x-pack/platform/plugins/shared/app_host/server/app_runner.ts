@@ -101,12 +101,7 @@ export class AppRunner {
         return { status: 'release_mismatch' };
       }
       if (legacyOnly && pkg.manifest.ui !== undefined) return { status: 'release_mismatch' };
-      // The grant comes from the verified release held for this whole invocation.
-      capability = new SearchCapability(
-        esClient,
-        { appId: pkg.manifest.id, indices: pkg.manifest.permissions.indices },
-        searchObserver
-      );
+      capability = new SearchCapability(esClient, { observer: searchObserver });
       const packageMs = performance.now() - started;
       const { value, timings } = await invokeApp({
         dispatcherUrl: this.#config.dispatcherUrl,

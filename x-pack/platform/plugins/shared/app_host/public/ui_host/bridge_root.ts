@@ -26,7 +26,7 @@ import {
   parseSummaryResult,
 } from '../../common/ui_protocol';
 import type { BridgeLifecycle } from './bridge_lifecycle';
-import { TokenBucket, utf8Bytes } from './port_transport';
+import { utf8Bytes } from './port_transport';
 
 export { BridgeLifecycle } from './bridge_lifecycle';
 
@@ -34,7 +34,7 @@ export type ExecuteOutcome =
   | { readonly ok: true; readonly result: Record<string, unknown> }
   | { readonly ok: false; readonly code: BridgeErrorCode };
 
-/** The fixed, host-owned server request for one operation (lease secret stays in its closure). */
+/** The fixed, host-owned server request for one operation (the session handle stays in its closure). */
 export type BridgeExecutor = (
   operation: UiOperation,
   signal: AbortSignal
@@ -87,8 +87,8 @@ export const isValidTheme = (theme: UiTheme): boolean => {
 /**
  * The only object exposed to the guest: exactly four public methods, all state private, plain-data
  * arguments only (functions, stubs, thenables and extra fields are rejected) and never an awaited
- * guest value. Budgets are checked synchronously before any awaited work. The server repeats every
- * check; this class is not the security boundary for server operations.
+ * guest value. The server repeats every check and runs operations as the app session key; this
+ * class is not the security boundary for server operations.
  */
 export class AppBridge extends RpcTarget {
   readonly #grant: BridgeGrant;
@@ -96,9 +96,6 @@ export class AppBridge extends RpcTarget {
   readonly #executor: BridgeExecutor | undefined;
   readonly #hooks: BridgeHooks;
   readonly #lifecycle: BridgeLifecycle;
-  readonly #operations = new TokenBucket(UI_LIMITS.operationsPerSecond, UI_LIMITS.operationsBurst);
-  #operationCount = 0;
-  #inFlight = 0;
   #invalidCalls = 0;
 
   constructor(
@@ -194,25 +191,13 @@ export class AppBridge extends RpcTarget {
     if (!this.#grant.scopes.includes(scope) || !this.#executor) {
       return this.#reject(method, 'app_denied');
     }
-    if (this.#operationCount >= UI_LIMITS.operationsPerLease) {
-      return this.#reject(method, 'app_rate_limited');
-    }
-    if (this.#inFlight >= UI_LIMITS.inFlightPerLease || !this.#operations.tryTake()) {
-      return this.#reject(method, 'app_rate_limited');
-    }
-    this.#operationCount += 1;
-    this.#inFlight += 1;
-    try {
-      const outcome = await this.#executor(operation, this.#lifecycle.signal);
-      // Suppress results that arrive after revocation; delivered data cannot be recalled.
-      const revokedNow = this.#lifecycle.revoked;
-      if (revokedNow) throw bridgeError(revokedNow);
-      if (!outcome.ok) throw bridgeError(outcome.code);
-      const parsed = parse(outcome.result);
-      if (parsed === undefined) throw bridgeError('app_unavailable');
-      return parsed;
-    } finally {
-      this.#inFlight -= 1;
-    }
+    const outcome = await this.#executor(operation, this.#lifecycle.signal);
+    // Suppress results that arrive after revocation; delivered data cannot be recalled.
+    const revokedNow = this.#lifecycle.revoked;
+    if (revokedNow) throw bridgeError(revokedNow);
+    if (!outcome.ok) throw bridgeError(outcome.code);
+    const parsed = parse(outcome.result);
+    if (parsed === undefined) throw bridgeError('app_unavailable');
+    return parsed;
   }
 }

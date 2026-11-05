@@ -90,31 +90,6 @@ describe('AppBridge', () => {
     expect(terminated).toEqual(['repeated_invalid_calls']);
   });
 
-  it('enforces 2 in flight and the 5/s burst-10 operation bucket synchronously', async () => {
-    const pending: Array<() => void> = [];
-    let hold = true;
-    const { bridge, calls } = setup(() =>
-      hold
-        ? new Promise((resolve) =>
-            pending.push(() => resolve({ ok: true, result: { ...SUMMARY } }))
-          )
-        : Promise.resolve({ ok: true, result: { ...SUMMARY } })
-    );
-    const first = bridge.callAppRoute({ method: 'GET', path: '/summary' });
-    const second = bridge.callAppRoute({ method: 'GET', path: '/summary' });
-    expect(await codeOf(bridge.callAppRoute({ method: 'GET', path: '/summary' }))).toBe(
-      'app_rate_limited'
-    );
-    expect(calls).toHaveLength(2);
-    hold = false;
-    pending.forEach((resolve) => resolve());
-    await Promise.all([first, second]);
-    const results = [];
-    for (let i = 0; i < 10; i++)
-      results.push(await codeOf(bridge.callAppRoute({ method: 'GET', path: '/summary' })));
-    expect(results.filter((r) => r === 'app_rate_limited').length).toBeGreaterThan(0);
-  });
-
   it('suppresses results that arrive after revocation and fails later calls', async () => {
     let resolveCall: (() => void) | undefined;
     const { bridge, lifecycle } = setup(
@@ -238,29 +213,6 @@ describe('AppBridge over capnweb + bounded MessageChannel (T9)', () => {
     expect(operations).toEqual([
       { op: 'es.search', params: { index: 'kbn-apps-prototype-alerts', size: 2 } },
     ]);
-    close();
-  });
-
-  it('pipelined calls do not bypass per-lease in-flight and rate budgets', async () => {
-    const holds: Array<() => void> = [];
-    const operations: unknown[] = [];
-    const { remote, close } = connect(
-      (op) =>
-        new Promise((resolve) => {
-          operations.push(op);
-          holds.push(() => resolve({ ok: true, result: { ...SUMMARY } }));
-        })
-    );
-    // Twelve calls issued without awaiting (capnweb pushes them back to back).
-    const calls = Array.from({ length: 12 }, () =>
-      codeOf(remote.callAppRoute({ method: 'GET', path: '/summary' }))
-    );
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(operations).toHaveLength(2);
-    holds.forEach((release) => release());
-    const codes = await Promise.all(calls);
-    expect(codes.filter((code) => code === 'ok')).toHaveLength(2);
-    expect(codes.filter((code) => code === 'app_rate_limited')).toHaveLength(10);
     close();
   });
 

@@ -13,9 +13,9 @@ import { registerRoutes } from './routes/register_routes';
 import type { AppHostPluginSetup, AppHostPluginStart, AppHostSetupDependencies } from './types';
 import { BridgeAuditLogger } from './ui/audit';
 import { BridgeService } from './ui/bridge_service';
-import { registerLeaseRoutes } from './ui/register_lease_routes';
 import { registerUiRoutes } from './ui/register_ui_routes';
 import { registerSecurityHeadersHook, SurfaceDecisions } from './ui/security_headers';
+import { registerSessionRoutes } from './ui/register_session_routes';
 import { UiUrls } from './ui/ui_context';
 
 export class AppHostPlugin
@@ -30,9 +30,18 @@ export class AppHostPlugin
   }
 
   setup(core: CoreSetup, { features }: AppHostSetupDependencies): AppHostPluginSetup {
-    const { packagePath, dispatcherUrl, callerToken, consentPath } = this.#config;
-    if (!packagePath || !dispatcherUrl || !callerToken) {
-      throw new Error('xpack.app_host requires packagePath, dispatcherUrl and callerToken');
+    const {
+      packagePath,
+      dispatcherUrl,
+      callerToken,
+      consentPath,
+      handleEncryptionKey,
+      testOnlySkipInputSchema,
+    } = this.#config;
+    if (!packagePath || !dispatcherUrl || !callerToken || !handleEncryptionKey) {
+      throw new Error(
+        'xpack.app_host requires packagePath, dispatcherUrl, callerToken and handleEncryptionKey'
+      );
     }
     features.registerKibanaFeature(appHostFeature);
     features.registerKibanaFeature(appHostAlertDigestFeature);
@@ -68,7 +77,7 @@ export class AppHostPlugin
         decisions,
         logger: this.#logger.get('ui'),
       });
-      registerLeaseRoutes({
+      registerSessionRoutes({
         router,
         basePath: core.http.basePath,
         urls,
@@ -77,10 +86,15 @@ export class AppHostPlugin
           consentPath,
           runner,
           audit,
+          handleEncryptionKey,
+          skipInputSchema: testOnlySkipInputSchema,
         }),
         getStart: async () => (await core.getStartServices())[0],
       });
       this.#logger.info('App Host prototype enabled (third-party UI: synthetic local cut)');
+      if (testOnlySkipInputSchema) {
+        this.#logger.warn('App Host bridge input schema is OFF (dev-only K1 fault injection)');
+      }
     } else {
       this.#logger.info(
         'App Host prototype enabled (UI disabled: needs consentPath and publicBaseUrl)'

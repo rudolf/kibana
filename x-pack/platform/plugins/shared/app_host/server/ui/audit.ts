@@ -10,11 +10,9 @@ import type { Logger, LogMeta } from '@kbn/core/server';
 /** Fixed reason codes; logs may be more specific than the public error, never raw text. */
 export type AuditReason =
   | 'ok'
-  | 'lease_created'
-  | 'lease_revoked'
-  | 'lease_limit'
-  | 'unknown_lease'
-  | 'bad_secret'
+  | 'session_created'
+  | 'mint_failed'
+  | 'bad_handle'
   | 'expired'
   | 'principal_mismatch'
   | 'non_default_space'
@@ -27,20 +25,24 @@ export type AuditReason =
   | 'invalid_operation'
   | 'scope_not_granted'
   | 'resource_not_granted'
-  | 'rate_limited'
-  | 'lease_budget'
-  | 'in_flight_limit'
   | 'process_limit'
   | 'deadline'
   | 'native_denied'
   | 'native_failed'
   | 'invalid_result'
-  | 'revoked_during_call'
   | 'cpu_limit';
 
 export interface BridgeAuditEvent {
-  /** From the verified lease/registry only; omitted when no valid app context exists. */
-  readonly app?: { readonly id: string; readonly version: string; readonly releaseDigest: string };
+  /**
+   * From the verified handle/registry only; omitted when no valid app context exists. `apiKeyId`
+   * is the app session key's id (never the key itself).
+   */
+  readonly app?: {
+    readonly id: string;
+    readonly version: string;
+    readonly releaseDigest: string;
+    readonly apiKeyId?: string;
+  };
   readonly userName?: string;
   readonly spaceId: string;
   readonly capability: string;
@@ -51,7 +53,7 @@ export interface BridgeAuditEvent {
    * `bridge` for UI calls; `app.summary` for Worker-path HostEs callbacks inside one; `native` for
    * the native summary route (F7).
    */
-  readonly via: 'bridge' | 'app.summary' | 'lease' | 'native';
+  readonly via: 'bridge' | 'app.summary' | 'session' | 'native';
 }
 
 interface BridgeAuditMeta extends LogMeta {
@@ -63,6 +65,7 @@ interface BridgeAuditMeta extends LogMeta {
     via: string;
   };
   kibana: { space_id: string; correlation_id: string };
+  api_key?: { id: string };
 }
 
 /** Strips control characters (CRLF, ANSI escapes) and caps length; values are JSON-escaped later. */
@@ -70,8 +73,8 @@ export const boundedField = (value: string, max = 256): string =>
   value.replace(/[\u0000-\u001f\u007f-\u009f]/g, '?').slice(0, max);
 
 /**
- * Structured `app_host.bridge` records with a fixed message. No secrets, lease ids, tokens, query
- * bodies, payloads, titles or raw errors are ever included. Prototype attribution only, not
+ * Structured `app_host.bridge` records with a fixed message. No API keys, handles, tokens, query
+ * bodies, payloads, titles or raw errors are ever included; only the key id (`api_key.id`). Prototype attribution only, not
  * tamper-proof compliance storage.
  */
 export class BridgeAuditLogger {
@@ -107,6 +110,7 @@ export class BridgeAuditLogger {
             },
           }
         : {}),
+      ...(event.app?.apiKeyId ? { api_key: { id: boundedField(event.app.apiKeyId, 64) } } : {}),
     };
     this.#logger.info<BridgeAuditMeta>('app_host.bridge', meta);
   }

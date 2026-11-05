@@ -3,8 +3,8 @@
 Prototype plugin that runs one operator-installed backend app bundle in a fresh Cloudflare Dynamic
 Worker. It gives the app a request-scoped, read-only Elasticsearch capability for the current user,
 and renders the app's result on a static host page. With an operator approval file it also hosts the
-app's own UI in a guardian-wrapped, opaque-origin iframe with a typed, lease-bound bridge (the synthetic,
-local-only UI cut below). It is **disabled by default**, is not production code, and does not offer an SDK,
+app's own UI in a guardian-wrapped, opaque-origin iframe with a typed bridge whose calls run as a
+restricted, short-lived Elasticsearch API key (the synthetic, local-only UI cut below). It is **disabled by default**, is not production code, and does not offer an SDK,
 install API, saved objects or tasks. App-authored browser code never runs in Kibana's origin.
 
 ## What it does
@@ -73,8 +73,8 @@ U1 — browser shell (no data capability):
   clears `window.name`, answers the challenge, then loads only the verified UI bundle. Lifecycle notices
   use the control port; the parent has no window `message` listener.
 - Parent RPC: capnweb `RpcSession` over a bounded string-only port transport (32 KiB UTF-8 per frame,
-  256 KiB / 1,024-frame queue, ingress paced at 60/s burst 16, `messageerror` terminates; depth 12,
-  BigInt 64, 8 invalid calls terminate). The cap of 128 live capnweb imports + exports is checked by the
+  256 KiB / 1,024-frame queue, `messageerror` terminates; depth 12, BigInt 64, 8 invalid calls
+  terminate). These are structural memory bounds, not usage quotas; there are no rate limits. The cap of 128 live capnweb imports + exports is checked by the
   transport each time capnweb asks for the next frame and after every send, so protocol-only growth
   (retained pushes, guest-exported stubs, unknown-method pipelines) terminates the session too
   (`live_stubs`), not only bridge-method entry. Depth and BigInt breaches terminate with
@@ -98,38 +98,67 @@ U2 — delegation and consent:
   approved release; without one, only legacy manifests run. The approval tool's same-principal check
   compares username **and** authentication realm (type and name) in ES and Kibana (F5).
 - Fixed per-app privilege `read_app_alert_digest` (feature `appHostAlertDigest`), required **with**
-  `read_app_host` for metadata, documents, leases, execution and the native summary.
-- `POST /internal/app_host/ui/leases` → `{leaseId, secret, expiresAt, ttlMs}` to the parent only: authenticated,
-  both privileges, Kibana XSRF, exact configured `Origin`, default space, no run_as; 5-minute TTL, 32 global
-  / 4 per principal, secret stored as SHA-256 and compared in constant time, bound to principal, space, app,
-  release, scopes and resources. `POST …/leases/{leaseId}/execute` with `{secret, operation}` in the JSON
-  body (S11, never a header) and a closed operation union: `app.summary`, `es.search` (shared pure grant
-  evaluator with the Worker `HostEs` path, S8), `kibana.dashboard.read` (current-user local self client,
-  `GET /api/dashboards/{id}` version `2023-10-31`; fails closed on redirects, non-200, bodies over 256 KiB
-  and `body.id !== grantedId`, S5). Ungranted selectors are denied before lookup. Budgets: 5 ops/s burst
-  10 per (app, user, space) across leases, 100 per lease, 2 in flight per lease, 4 per process, 5 s deadline.
-  Lease liveness and expiry, enablement and release are rechecked before returning data. Each lease has
-  a server-side expiry timer: a read still pending at expiry is aborted and answered `app_expired`, with
-  no data. The parent tears the frame down at its own deadline (request time + `ttlMs`, never later than
-  the server's expiry), even when idle. Errors are fixed codes only
-  (`app_denied`, `app_unavailable`, `app_stale`, `app_disabled`, `app_expired`, `app_rate_limited`,
+  `read_app_host` for metadata, documents, sessions, execution and the native summary.
+- **App session = restricted API key** (spec `kibana-apps-key-session-spec.md`). When the viewer clicks
+  **Allow this version**, the parent calls `POST /internal/app_host/ui/session` `{appId, releaseDigest}`
+  (authenticated, both privileges, Kibana XSRF, exact configured `Origin`, default space, no run_as; the
+  release must be enabled and approved). The server mints one key with the security service's
+  `grantAsInternalUser` from the viewer's own credentials: name `app:{appId}@{releaseDigest}`, metadata
+  `{app_host, app, release, space}`, expiration 1 h, and a role descriptor derived **only** from the
+  approved manifest: `read` on `permissions.indices`, `feature_dashboard_v2.read` on `space:default` only
+  with the `kibana.dashboard.read` scope, no cluster privileges, no `run_as`
+  (`server/ui/app_key.ts`). Elasticsearch caps the key at the viewer's privileges (`limited_by`), so
+  every call is enforced natively as **viewer ∩ app**.
+- The response is an opaque **handle** `<releaseDigest>.<base64url(iv|tag|ciphertext)>`: AES-256-GCM
+  (key = SHA-256 of `xpack.app_host.handleEncryptionKey`) over `{id, apiKey, app, release, space,
+  principal, exp}` with AAD `app|release|space|principal` (`server/ui/session_handle.ts`). It is
+  stateless: nothing is stored and any node with the same key can open it. The raw API key never
+  leaves the Kibana server process (not to parent JS, the frame, the port, the Worker, logs or audit).
+- `POST /internal/app_host/ui/execute` `{handle, op, params}` (same route checks). The server opens
+  the handle (tampered, another principal or space → `app_denied`; expired → `app_expired`), reads
+  enablement and approval (cached ≤ 2 s; disabled → `app_disabled`, release changed → `app_stale`),
+  validates the closed operation union, scope, the exact synthetic index and size, and the declared
+  dashboard id **as input validation only**, then runs the operation **as the key**: `es.search` via
+  `elasticsearch.client.asScoped({headers: {authorization: 'ApiKey …'}})`, `kibana.dashboard.read`
+  via the local `selfClient` on a fake request carrying the same header (`GET /api/dashboards/{id}`
+  version `2023-10-31`; fails closed on redirects, non-200, bodies over 256 KiB and
+  `body.id !== grantedId`, S5), and `app.summary` → Worker → `HostEs` callbacks with the same
+  key-scoped client. 5 s deadline. Errors are fixed codes only (`app_denied`, `app_unavailable`,
+  `app_stale`, `app_disabled`, `app_expired`, `app_rate_limited` (backend invocation limiter only),
   `app_timeout`, `app_cpu_limit`, `bridge_invalid_request`, `bridge_protocol_error`).
+- **Revocation.** The operator command flips the persisted state first (`ui:operator -- disable|reset`,
+  or a new approval), then invalidates the app's keys by name as Kibana's internal user
+  (`DELETE /_security/api_key {name: "app:alert-digest@*"}` or `@<previous release>`). `kibana_system`
+  can invalidate by name (wildcards included) but cannot list or query other users' keys, so
+  query-then-invalidate-by-id is not available to it. The per-call state check covers the window
+  before invalidation lands. Unmount or navigation just drops the handle in the parent; no server call.
+- No leases, lease secrets, lease caps, token buckets, operation counters, in-flight caps or UI process
+  cap remain. Abuse is handled by audit plus disable; ES-native protections (search timeouts,
+  `search.max_buckets`, circuit breakers) cover node safety.
 - A closed capability registry (`server/ui/capability_registry.ts`) refuses credential-minting, deferred,
-  egress-side-effect and reference-accepting capabilities. No API keys are minted in this cut.
+  egress-side-effect and reference-accepting capabilities. The never-delegable list is enforced by *not
+  granting* it in the key's role descriptor plus the typed surface. Minting the session key is a
+  host-internal broker on consent, never an app capability.
 - Parent bridge: exactly `callAppRoute({method:'GET', path:'/summary'})`, `search({index, size})`,
-  `getDashboardPreview({id})`, `getTheme()`; plain-data arguments only; the lease secret stays in the
-  parent's closure. Metadata is polled every 2 s and on focus; a different release unmounts the old
-  frame before its consent prompt appears (S10); closing the tab revokes the lease. A lease that is
-  still being created when consent is withdrawn (Disable), the page unmounts or the release changes is
-  released as soon as it arrives and never mounts or binds a frame (generation check).
+  `getDashboardPreview({id})`, `getTheme()`; plain-data arguments only; the handle stays in the parent's
+  closure and travels only in the execute JSON body. No metadata polling: the page reads metadata on
+  load and once more after a server rejection that ends the frame (`app_disabled`, `app_stale`,
+  `app_expired`), so a different release unmounts the old frame before its consent prompt appears (S10).
+  An expired handle is re-minted once per call, only inside the session created by this page's consent.
+  A session that is still being minted when consent is withdrawn (Disable), the page unmounts or the
+  release changes never mounts or binds a frame (generation check).
+- **K1 fault injection (dev-only).** `xpack.app_host.testOnlySkipInputSchema: true` skips the scope,
+  index-literal and dashboard-id input checks so that Elasticsearch and Kibana must deny on their own. The
+  setting exists only in dev mode (`--dev`); any value outside dev mode fails config validation. It is
+  off by default and set only by `.local/kibana.app_host.k1.yml`.
 
 U3 — adversarial demo and attribution:
 
-- `app_host.bridge` structured records (logger `plugins.appHost.bridge_audit`, JSON appender): lease-derived
-  `app.{id,version,release_digest,capability,via}`, `user.name`, `kibana.{space_id,correlation_id}`,
-  `event.{action,outcome,reason}`. Worker-path `HostEs` reads inside `app.summary` are recorded with the
-  same correlation id (S9). No secrets, lease ids, payloads, titles or raw errors; control characters are
-  replaced and fields capped. Prototype attribution, not tamper-proof audit storage.
+- `app_host.bridge` structured records (logger `plugins.appHost.bridge_audit`, JSON appender): handle-derived
+  `app.{id,version,release_digest,capability,via}`, `api_key.id` (the session key's id, never the key),
+  `user.name`, `kibana.{space_id,correlation_id}`, `event.{action,outcome,reason}`. Worker-path `HostEs`
+  reads inside `app.summary` are recorded with the same correlation id (S9). No keys, handles, payloads,
+  titles or raw errors; control characters are replaced and fields capped. Prototype attribution, not tamper-proof audit storage.
 - Release v2 needs operator approval and a new viewer click; no Kibana restart or dispatcher redeploy.
 - The native `GET /api/apps/{appId}/summary` serves the default space only (404 elsewhere) and writes one
   `app_host.bridge` record per call (`event.provider: native`; app attribution from the approved release,
@@ -154,14 +183,19 @@ xpack.app_host:
   dispatcherUrl: wss://<name>.<subdomain>.workers.dev/rpc   # ws:// only for 127.0.0.1/localhost
   callerToken: <32+ char random secret>         # same value as the dispatcher's KIBANA_CALLER_TOKEN
   consentPath: /abs/path/to/operator/consent.json  # optional; enables the third-party UI cut
+  handleEncryptionKey: <32+ char random secret>  # required; AES-256-GCM key material for session handles
+  # testOnlySkipInputSchema: true               # K1 fault injection; accepted only in --dev, default false
 server.publicBaseUrl: http://localhost:5601     # required for the UI cut (exact CSP sources, Origin check)
 csp.frame_ancestors: ["'self'"]                 # trusted chrome cannot be embedded externally
 ```
 
-`npm run kibana:config` writes all of the above for local development, plus a synthetic CSP report
-collector (`csp.report_uri`), Kibana's security audit log, the JSON `app_host.bridge` audit appender and an
-`http.server.response` debug appender (used to prove the lease secret never reaches logs). Logs go to
-`prototype/.local/logs/`.
+`npm run kibana:config` writes all of the above for local development (the handle key is generated once
+into `.local/handle_key`, never printed), plus a synthetic CSP report collector (`csp.report_uri`),
+Kibana's security audit log, the JSON `app_host.bridge` audit appender and debug appenders for
+`http.server.response`, `plugins.appHost` and `plugins.security` (used to prove neither handle nor key
+reaches logs). It also writes `.local/kibana.app_host.k1.yml` (the K1 bypass; pass it as a second `-c`).
+Logs go to `prototype/.local/logs/`. Elasticsearch must have API keys enabled
+(`xpack.security.authc.api_key.enabled`, the default; `node scripts/es snapshot` needs nothing extra).
 
 Installing the plugin needs one Kibana restart. After that, releasing new app code (a new
 `<digest>.js` and an atomically replaced `manifest.json`) needs no Kibana restart and no dispatcher
@@ -211,8 +245,11 @@ npm --prefix "$P/prototype" run benchmark -- --kibana "$KB_URL" --samples 20 \
 # prototype/.local change, which breaks long browser runs)
 npm --prefix "$P/prototype" run ui:seed           # hostile record, synthetic dashboards, empty space, viewers
 npm --prefix "$P/prototype" run release -- --with-ui --version 2.0.0 --approve-local-synthetic  # INSTALLER_AUTH or ES_AUTH
-npm --prefix "$P/prototype" run ui:operator -- disable|enable|status|reset
+npm --prefix "$P/prototype" run ui:operator -- disable|enable|status|reset   # disable/reset also invalidate keys
 npm --prefix "$P/prototype" run ui:security -- --kibana "$KB_URL" --engines chromium,firefox,webkit
+# K1 (ES enforces with the input schema bypassed): restart Kibana with a second config, then
+#   node scripts/kibana --dev --no-base-path -c .../kibana.app_host.yml -c .../kibana.app_host.k1.yml
+npm --prefix "$P/prototype" run ui:security -- --kibana "$KB_URL" --suites k1
 ```
 
 `acceptance` runs in legacy mode: remove the approval file first (`ui:operator -- reset`); `ui:security`

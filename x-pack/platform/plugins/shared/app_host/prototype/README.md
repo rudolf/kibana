@@ -13,12 +13,12 @@ the remote steps.
 | `secret:local` | Generate the 32-byte caller secret (`.local/caller_token`, `cloudflare/.dev.vars`), never printed |
 | `dev` / `dev:probe` | `wrangler dev` for the dispatcher (8787) / the diagnostic env probe (8788) |
 | `seam` | M1 assertions: Node → dispatcher → fresh Dynamic Worker → Node callback |
-| `kibana:config` | Write the git-ignored Kibana config `.local/kibana.app_host.yml` (0600) |
+| `kibana:config` | Write the git-ignored Kibana config `.local/kibana.app_host.yml` (0600, incl. the generated `.local/handle_key`) and `.local/kibana.app_host.k1.yml` (dev-only K1 input-schema bypass, add as a second `-c`) |
 | `seed` | Synthetic index (high/high/low, no aliases) and reader/no-index/no-feature roles and users |
 | `release` | Build the sample app; write `<sha256>.js` first, then atomically replace `manifest.json`. `--with-ui` also builds the UI IIFE and the UI envelope; `--approve-local-synthetic` runs the checked superuser approval and writes `.local/operator/consent.json` (0600) |
-| `ui:seed` | UI cut seed on top of `seed`: hostile `medium` record, granted + ungranted synthetic dashboards, empty space `app-host-empty`, viewer matrix (`.local/ui_users.json`, never printed) |
-| `ui:operator` | Operator `disable` / `enable` / `status` / `reset` of the approval file (never reachable through the bridge) |
-| `ui:security` | T1–T14 Playwright/API harness in Chromium/Firefox/WebKit; JSON report in `.local/ui_security-*.json`. `--suites t4tls --tls DIR` runs the SameSite=None HTTPS cookie fixture against Kibana started with `kibana:config -- --tls DIR` (see below) |
+| `ui:seed` | UI cut seed on top of `seed`: hostile `medium` record, a viewer-only index `kbn-apps-prototype-viewer-only` (K1), granted + ungranted synthetic dashboards, empty space `app-host-empty`, viewer matrix (`.local/ui_users.json`, never printed) |
+| `ui:operator` | Operator `disable` / `enable` / `status` / `reset` of the approval file (never reachable through the bridge). `disable` and `reset` then invalidate the app's session keys by name as `kibana_system` (`KIBANA_SYSTEM_AUTH`, local default `kibana_system:changeme`) |
+| `ui:security` | K1–K6 (app session key) and the surviving T-suites, Playwright/API harness in Chromium/Firefox/WebKit; JSON report in `.local/ui_security-*.json`. `--suites t4tls --tls DIR` runs the SameSite=None HTTPS cookie fixture against Kibana started with `kibana:config -- --tls DIR` (see below) |
 | `acceptance` | Kibana-level M2/M3 assertions (authz, ES denial, package failures, limits, deadline, ...) |
 | `ui-check` | Page check of `/app/appHost` v1 → v2 via Refresh (uses the Kibana workspace's Playwright) |
 | `benchmark` | Fresh-invocation latency sample through Kibana (and optionally the raw seam) |
@@ -111,7 +111,8 @@ The total stays under 200 fresh invocations (~87). Cleanup (also needs approval)
 - `app/src/` sample app: plain `Summary` class plus a native `WorkerEntrypoint` adapter (`App`).
 - `ui/src/` sample app UI (one classic IIFE: `main.ts` plus the small guest SDK `sdk.ts`); `ui/fixtures/hostile.ts`
   is the deliberately hostile UI used by T1/T3–T6.
-- `scripts/lib/ui_suites/` the `ui:security` suites; `scripts/lib/approval.ts` the local approval tool.
+- `scripts/lib/ui_suites/` the `ui:security` suites (`k_session.ts`: K1–K6); `scripts/lib/approval.ts` the
+  local approval tool; `scripts/lib/app_keys.ts` operator-side key invalidation by name.
   `ui/fixtures/channels.ts` holds the T4 channel probes, shared by the hostile frame and by an ordinary
   control page (`ui/fixtures/channel_control.ts`) so that every claimed block has a working control.
 

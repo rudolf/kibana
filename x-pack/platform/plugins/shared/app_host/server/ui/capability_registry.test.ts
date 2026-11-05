@@ -36,17 +36,22 @@ describe('CapabilityRegistry (T11)', () => {
     expect(() => registry.register(base, () => undefined)).toThrow('frozen');
   });
 
-  it('bridge server code never references credential minting, connectors or inference', () => {
+  it('capability code never mints credentials or reaches connectors or inference; the session route is the only minting site', () => {
     const dirs = [__dirname, join(__dirname, '..', 'remote')];
-    const source = dirs
-      .flatMap((dir) =>
-        readdirSync(dir)
-          .filter((f) => f.endsWith('.ts') && !f.endsWith('.test.ts'))
-          .map((f) => readFileSync(join(dir, f), 'utf8'))
-      )
-      .join('\n');
-    expect(source).not.toMatch(
-      /grantAsInternalUser|apiKeys\.|asInternalUser|actions-plugin|inference-plugin|getActionsClient/
+    const files = dirs.flatMap((dir) =>
+      readdirSync(dir)
+        .filter((f) => f.endsWith('.ts') && !f.endsWith('.test.ts'))
+        .map((f) => ({ name: f, text: readFileSync(join(dir, f), 'utf8') }))
     );
+    const pattern =
+      /grantAsInternalUser|apiKeys\.|asInternalUser|actions-plugin|inference-plugin|getActionsClient/g;
+    const hits = files.flatMap(({ name, text }) =>
+      (text.match(pattern) ?? []).map((match) => `${name}:${match}`)
+    );
+    // Host-internal broker: one viewer-credential grant on consent, never an app capability.
+    expect(hits.sort()).toEqual([
+      'register_session_routes.ts:apiKeys.',
+      'register_session_routes.ts:grantAsInternalUser',
+    ]);
   });
 });

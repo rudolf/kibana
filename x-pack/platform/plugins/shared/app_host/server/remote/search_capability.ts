@@ -7,18 +7,12 @@
 
 import type { ElasticsearchClient } from '@kbn/core/server';
 import { isRequestAbortedError, isResponseError } from '@kbn/es-errors';
-import { LIMITS, SYNTHETIC_INDEX } from '../../common';
-import { evaluateSearch, isGrantedHitIndex, type VerifiedGrant } from '../grant_evaluator';
+import { LIMITS } from '../../common';
+import { parseSearchInput } from '../search_input';
 import { HostError } from './host_error';
 
 /** Observes every search attempt (audit attribution); never receives payloads. */
 export type SearchObserver = (outcome: 'success' | 'failure', reason: string) => void;
-
-/** Grant used when no verified release grant is supplied (legacy backend-only manifests). */
-export const LEGACY_SYNTHETIC_GRANT: VerifiedGrant = {
-  appId: 'legacy',
-  indices: [SYNTHETIC_INDEX],
-};
 
 export interface HostEsRecord {
   readonly severity: string;
@@ -45,14 +39,21 @@ interface AlertSource {
 
 const SEVERITY_PATTERN = /^[a-z]{1,16}$/;
 
+export interface SearchCapabilityOptions {
+  readonly observer?: SearchObserver;
+  /** K1 fault injection only (dev-only config): skip the index literal of the input schema. */
+  readonly anyIndex?: boolean;
+}
+
 /**
- * Request-scoped Elasticsearch capability behind the exposed `HostEs` facade.
- * Holds the route's `asCurrentUser` client, a one-call budget and an abort signal; never exposed.
+ * Request-scoped Elasticsearch capability behind the exposed `HostEs` facade. Holds a scoped
+ * client (the app session key on the bridge path, `asCurrentUser` on the native route), a one-call
+ * budget and an abort signal; never exposed. Elasticsearch decides what the client may read.
  */
 export class SearchCapability {
   readonly #client: ElasticsearchClient;
-  readonly #grant: VerifiedGrant;
   readonly #observer: SearchObserver | undefined;
+  readonly #anyIndex: boolean;
   readonly #abort = new AbortController();
   #active = true;
   #calls = 0;
@@ -63,12 +64,11 @@ export class SearchCapability {
 
   constructor(
     client: ElasticsearchClient,
-    grant: VerifiedGrant = LEGACY_SYNTHETIC_GRANT,
-    observer?: SearchObserver
+    { observer, anyIndex = false }: SearchCapabilityOptions = {}
   ) {
     this.#client = client;
-    this.#grant = grant;
     this.#observer = observer;
+    this.#anyIndex = anyIndex;
   }
 
   public get active(): boolean {
@@ -107,9 +107,9 @@ export class SearchCapability {
     this.#calls += 1;
     if (this.#calls > LIMITS.callbacksPerInvocation) throw new HostError('callback_budget');
     this.#requestBytes += Buffer.byteLength(JSON.stringify(params) ?? '');
-    const decision = evaluateSearch(this.#grant, params);
-    if (!decision.allowed) throw new HostError(decision.reason);
-    const { index, size } = decision;
+    const input = parseSearchInput(params, { anyIndex: this.#anyIndex });
+    if (!input.ok) throw new HostError(input.reason);
+    const { index, size } = input;
     const started = performance.now();
     try {
       const response = await this.#client.search<AlertSource>(
@@ -138,13 +138,11 @@ export class SearchCapability {
 
   #toResult(hits: {
     total?: number | { value: number };
-    hits: Array<{ _index: string; _source?: AlertSource }>;
+    hits: Array<{ _source?: AlertSource }>;
   }): HostEsSearchResult {
     const records: HostEsRecord[] = [];
     let bytes = 0;
     for (const hit of hits.hits.slice(0, LIMITS.callbackRecords)) {
-      // An alias with the granted name could resolve elsewhere; refuse rather than leak.
-      if (!isGrantedHitIndex(this.#grant, hit._index)) throw new HostError('index_not_granted');
       const { severity, rule } = hit._source ?? {};
       if (typeof severity !== 'string' || !SEVERITY_PATTERN.test(severity)) continue;
       if (typeof rule !== 'string' || rule.length === 0 || rule.length > LIMITS.ruleLength) {

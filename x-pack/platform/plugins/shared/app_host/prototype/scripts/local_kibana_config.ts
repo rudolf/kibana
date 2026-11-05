@@ -10,6 +10,8 @@
 //   npm run kibana:config -- [--dispatcher ws://127.0.0.1:8787/rpc] [--package-dir DIR]
 //       [--public-base-url http://localhost:5601] [--csp-collector http://127.0.0.1:5699/csp]
 //       [--tls DIR]
+// It also writes .local/kibana.app_host.k1.yml: add it as a second `-c` to switch on the dev-only
+// K1 fault injection (`xpack.app_host.testOnlySkipInputSchema`, refused outside `--dev`).
 // --tls DIR writes .local/kibana.app_host.tls.yml instead: the SameSite=None HTTPS cookie fixture
 // (Kibana over local TLS with DIR/cert.pem + DIR/key.pem, a git-ignored self-signed certificate,
 // `xpack.security.sameSiteCookies: None` and secure cookies; publicBaseUrl https://localhost:5601).
@@ -20,7 +22,7 @@ import { chmodSync, mkdirSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { parseArgs } from './lib/args';
 import { CONSENT_FILE } from './lib/approval';
-import { LOCAL_DIR, readCallerToken } from './lib/secrets';
+import { LOCAL_DIR, readCallerToken, readOrCreateHandleKey } from './lib/secrets';
 
 const args = parseArgs(process.argv.slice(2), [
   'dispatcher',
@@ -59,6 +61,7 @@ writeFileSync(
     `xpack.app_host.dispatcherUrl: ${q(dispatcherUrl)}`,
     `xpack.app_host.callerToken: ${q(readCallerToken())}`,
     `xpack.app_host.consentPath: ${q(CONSENT_FILE)}`,
+    `xpack.app_host.handleEncryptionKey: ${q(readOrCreateHandleKey())}`,
     `server.publicBaseUrl: ${q(publicBaseUrl)}`,
     ...tlsLines,
     `csp.frame_ancestors: ["'self'"]`,
@@ -83,19 +86,39 @@ writeFileSync(
     `      fileName: ${q(resolve(logs, 'http_debug.ndjson'))}`,
     '      layout:',
     '        type: json',
+    '    kibana_debug:',
+    '      type: file',
+    `      fileName: ${q(resolve(logs, 'kibana_debug.ndjson'))}`,
+    '      layout:',
+    '        type: json',
     '  loggers:',
     '    - name: plugins.appHost.bridge_audit',
     '      level: info',
     '      appenders: [app_host_audit]',
-    // S11: prove the lease secret never appears even with response debug logging on.
+    // S11/K4: prove neither the handle nor the API key appears even with debug logging on.
     '    - name: http.server.response',
     '      level: debug',
     '      appenders: [http_debug]',
+    '    - name: plugins.appHost',
+    '      level: debug',
+    '      appenders: [kibana_debug]',
+    '    - name: plugins.security',
+    '      level: debug',
+    '      appenders: [kibana_debug]',
     '',
   ].join('\n'),
   { mode: 0o600 }
 );
 chmodSync(file, 0o600);
+const k1File = resolve(LOCAL_DIR, 'kibana.app_host.k1.yml');
+writeFileSync(k1File, 'xpack.app_host.testOnlySkipInputSchema: true\n', { mode: 0o600 });
 process.stdout.write(
-  `${JSON.stringify({ config: file, packagePath, dispatcherUrl, publicBaseUrl, cspCollector })}\n`
+  `${JSON.stringify({
+    config: file,
+    k1Config: k1File,
+    packagePath,
+    dispatcherUrl,
+    publicBaseUrl,
+    cspCollector,
+  })}\n`
 );

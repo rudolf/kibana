@@ -7,24 +7,27 @@
 
 import { randomUUID } from 'node:crypto';
 import type { ElasticsearchClient, HttpSelfScopedClient } from '@kbn/core/server';
+import { INSTALLED_APP_ID } from '../../common';
 import { BRIDGE_V1_CAPABILITIES } from '../../common/ui_contract';
-import type {
-  BridgeErrorCode,
-  CreateLeaseResponse,
-  UiOperation,
-  UiScope,
-} from '../../common/ui_protocol';
+import type { BridgeErrorCode, CreateSessionResponse, UiOperation } from '../../common/ui_protocol';
 import { UI_LIMITS, isHex64, parseUiOperation } from '../../common/ui_protocol';
 import type { AppRunner, SummaryOutcome } from '../app_runner';
-import { evaluateSearch } from '../grant_evaluator';
+import type { UiAppManifest } from '../package/manifest_schema';
 import { HostError } from '../remote/host_error';
 import { SearchCapability } from '../remote/search_capability';
-import type { AuditReason, BridgeAuditLogger } from './audit';
-import { OperationBuckets, Semaphore } from './budgets';
+import { parseSearchInput } from '../search_input';
+import { appKeyRequest, type AppKey, type AppKeyRequest } from './app_key';
+import type { AuditReason, BridgeAuditEvent, BridgeAuditLogger } from './audit';
 import { CapabilityRegistry } from './capability_registry';
 import { readUiReleaseState, type UiReleaseState } from './consent';
 import { readDashboardPreview } from './dashboard_preview';
-import { LeaseStore, type Lease, type LeaseBinding } from './leases';
+import { SessionHandles, type SessionPayload } from './session_handle';
+
+/** Clients that authenticate as one app session key, never as the viewer's own session. */
+export interface KeyScopedClients {
+  readonly esClient: ElasticsearchClient;
+  readonly selfClient: HttpSelfScopedClient;
+}
 
 /** Per-request facts derived by the route from the authenticated scoped request. */
 export interface CallerContext {
@@ -38,8 +41,9 @@ export interface CallerContext {
   /** An `es-security-runas-user` header or run_as parameter was present. */
   readonly runAs: boolean;
   readonly requestAborted: AbortSignal;
-  readonly esClient: () => ElasticsearchClient;
-  readonly selfClient: () => HttpSelfScopedClient;
+  /** Grants a key from the viewer's own credentials; null when API keys are unavailable. */
+  readonly grantKey: (request: AppKeyRequest) => Promise<AppKey | null>;
+  readonly asKey: (key: AppKey) => KeyScopedClients;
   /** Absolute pathname the dashboard self call must hit (server base path, default space). */
   readonly dashboardPathname: (id: string) => string;
 }
@@ -47,10 +51,9 @@ export interface CallerContext {
 export interface ServiceResponse {
   readonly status: number;
   readonly body:
-    | CreateLeaseResponse
+    | CreateSessionResponse
     | { readonly ok: true; readonly result: Record<string, unknown> }
-    | { readonly ok: false; readonly code: BridgeErrorCode }
-    | { readonly revoked: true };
+    | { readonly ok: false; readonly code: BridgeErrorCode };
 }
 
 const STATUS: Record<BridgeErrorCode, number> = {
@@ -78,7 +81,9 @@ type OperationOutcome =
 
 interface OperationInput {
   readonly operation: UiOperation;
-  readonly lease: Lease;
+  readonly session: SessionPayload;
+  readonly app: BridgeAuditEvent['app'];
+  readonly clients: KeyScopedClients;
   readonly caller: CallerContext;
   readonly signal: AbortSignal;
   readonly correlationId: string;
@@ -114,24 +119,56 @@ const summaryOutcome = (outcome: SummaryOutcome): OperationOutcome => {
   }
 };
 
+/** Reuses one state read for at most `maxAgeMs`; a failed read is never cached. */
+const cachedState = (
+  read: () => Promise<UiReleaseState>,
+  maxAgeMs: number,
+  now: () => number
+): (() => Promise<UiReleaseState>) => {
+  let readAt = -Infinity;
+  let value: Promise<UiReleaseState> | undefined;
+  return () => {
+    if (!value || now() - readAt >= maxAgeMs) {
+      readAt = now();
+      const pending = read();
+      value = pending;
+      pending.catch(() => {
+        if (value === pending) value = undefined;
+      });
+    }
+    return value;
+  };
+};
+
+const appOf = (manifest: UiAppManifest, apiKeyId?: string): BridgeAuditEvent['app'] => ({
+  id: manifest.id,
+  version: manifest.version,
+  releaseDigest: manifest.releaseDigest,
+  apiKeyId,
+});
+
 /**
- * Server half of the bridge: lease creation and the fixed execute union. Every check is repeated
- * here regardless of what the parent checked; the parent is not a security boundary. App identity
- * comes from the lease and the installed registry only (an `x-kbn-app-id` header is ignored).
+ * Server half of the bridge. The app session is a restricted API key minted on consent from the
+ * viewer's credentials and the approved manifest's role descriptor; the browser only ever holds an
+ * encrypted handle to it. Every operation runs as that key, so Elasticsearch and Kibana's native
+ * authorization enforce viewer ∩ app. The checks here are input validation and lifecycle only.
  */
 export class BridgeService {
   readonly #audit: BridgeAuditLogger;
-  readonly #leases: LeaseStore;
-  readonly #buckets: OperationBuckets;
-  readonly #semaphore: Semaphore;
+  readonly #handles: SessionHandles;
   readonly #registry: CapabilityRegistry<OperationHandler>;
   readonly #readState: () => Promise<UiReleaseState>;
+  readonly #cachedState: () => Promise<UiReleaseState>;
+  readonly #now: () => number;
+  readonly #skipInputSchema: boolean;
 
   constructor({
     packagePath,
     consentPath,
     runner,
     audit,
+    handleEncryptionKey,
+    skipInputSchema = false,
     now = Date.now,
     readState,
   }: {
@@ -139,25 +176,29 @@ export class BridgeService {
     readonly consentPath: string | undefined;
     readonly runner: Pick<AppRunner, 'runSummary'>;
     readonly audit: BridgeAuditLogger;
+    readonly handleEncryptionKey: string;
+    /** K1 fault injection (dev-only config): skip scope, index and dashboard-id input checks. */
+    readonly skipInputSchema?: boolean;
     readonly now?: () => number;
     readonly readState?: () => Promise<UiReleaseState>;
   }) {
     this.#audit = audit;
-    this.#leases = new LeaseStore(now);
-    this.#buckets = new OperationBuckets(now);
-    this.#semaphore = new Semaphore(UI_LIMITS.uiServerOperationsPerProcess);
+    this.#now = now;
+    this.#skipInputSchema = skipInputSchema;
+    this.#handles = new SessionHandles(handleEncryptionKey, now);
     this.#readState = readState ?? (() => readUiReleaseState(packagePath, consentPath));
+    this.#cachedState = cachedState(this.#readState, UI_LIMITS.stateCacheMs, now);
     this.#registry = new CapabilityRegistry<OperationHandler>();
     this.#registry.register(
       descriptor('app.summary'),
-      async ({ lease, caller, signal, correlationId }) =>
+      async ({ session, app, clients, caller, signal, correlationId }) =>
         summaryOutcome(
-          await runner.runSummary(lease.binding.appId, caller.esClient(), signal, {
-            expectedReleaseDigest: lease.binding.releaseDigest,
+          await runner.runSummary(session.app, clients.esClient, signal, {
+            expectedReleaseDigest: session.release,
             // S9: Worker-path HostEs reads inside app.summary are attributed with this correlation id.
             searchObserver: (outcome, reason) =>
               this.#record(
-                lease.binding,
+                app,
                 caller,
                 'es.search',
                 outcome,
@@ -172,44 +213,45 @@ export class BridgeService {
           })
         )
     );
-    this.#registry.register(
-      descriptor('es.search'),
-      async ({ operation, lease, caller, signal }) => {
-        if (operation.op !== 'es.search')
-          return { ok: false, code: 'app_denied', reason: 'invalid_operation' };
-        const capability = new SearchCapability(caller.esClient(), {
-          appId: lease.binding.appId,
-          indices: lease.binding.indices,
-        });
-        const onAbort = () => capability.revoke();
-        signal.addEventListener('abort', onAbort, { once: true });
-        try {
-          const result = await capability.search({ ...operation.params });
-          return { ok: true, result: { total: result.total, records: [...result.records] } };
-        } catch (error) {
-          if (error instanceof HostError) {
-            if (error.code === 'es_forbidden' || error.code === 'index_not_granted') {
-              return { ok: false, code: 'app_denied', reason: 'native_denied' };
-            }
-            if (error.code === 'host_revoked')
-              return { ok: false, code: 'app_timeout', reason: 'deadline' };
-          }
-          return { ok: false, code: 'app_unavailable', reason: 'native_failed' };
-        } finally {
-          signal.removeEventListener('abort', onAbort);
-          capability.revoke();
-        }
+    this.#registry.register(descriptor('es.search'), async ({ operation, clients, signal }) => {
+      if (operation.op !== 'es.search') {
+        return { ok: false, code: 'app_denied', reason: 'invalid_operation' };
       }
-    );
+      const capability = new SearchCapability(clients.esClient, {
+        anyIndex: this.#skipInputSchema,
+      });
+      const onAbort = () => capability.revoke();
+      signal.addEventListener('abort', onAbort, { once: true });
+      try {
+        const result = await capability.search({ ...operation.params });
+        return { ok: true, result: { total: result.total, records: [...result.records] } };
+      } catch (error) {
+        if (error instanceof HostError) {
+          if (error.code === 'es_forbidden') {
+            return { ok: false, code: 'app_denied', reason: 'native_denied' };
+          }
+          if (error.code === 'index_not_granted' || error.code === 'invalid_search') {
+            return { ok: false, code: 'app_denied', reason: 'resource_not_granted' };
+          }
+          if (error.code === 'host_revoked') {
+            return { ok: false, code: 'app_timeout', reason: 'deadline' };
+          }
+        }
+        return { ok: false, code: 'app_unavailable', reason: 'native_failed' };
+      } finally {
+        signal.removeEventListener('abort', onAbort);
+        capability.revoke();
+      }
+    });
     this.#registry.register(
       descriptor('kibana.dashboard.read'),
-      async ({ operation, caller, signal }) => {
+      async ({ operation, clients, caller, signal }) => {
         if (operation.op !== 'kibana.dashboard.read') {
           return { ok: false, code: 'app_denied', reason: 'invalid_operation' };
         }
         const { id } = operation.params;
         const outcome = await readDashboardPreview(
-          caller.selfClient(),
+          clients.selfClient,
           id,
           caller.dashboardPathname(id),
           signal
@@ -225,23 +267,17 @@ export class BridgeService {
     return this.#registry.ids();
   }
 
-  public get activeLeases(): number {
-    return this.#leases.size;
-  }
-
   #record(
-    binding: LeaseBinding | undefined,
+    app: BridgeAuditEvent['app'],
     caller: CallerContext,
     capability: string,
     outcome: 'success' | 'failure',
     reason: AuditReason,
     correlationId: string,
-    via: 'bridge' | 'app.summary' | 'lease' = 'bridge'
+    via: BridgeAuditEvent['via'] = 'bridge'
   ): void {
     this.#audit.log({
-      app: binding
-        ? { id: binding.appId, version: binding.version, releaseDigest: binding.releaseDigest }
-        : undefined,
+      app,
       userName: caller.userName,
       spaceId: caller.spaceId,
       capability,
@@ -252,7 +288,7 @@ export class BridgeService {
     });
   }
 
-  /** Common pre-checks for lease creation and execution; fail closed before any service I/O. */
+  /** Common pre-checks for session creation and execution; fail closed before any I/O. */
   #precheck(caller: CallerContext): { code: BridgeErrorCode; reason: AuditReason } | undefined {
     if (!caller.principal) return { code: 'app_denied', reason: 'principal_mismatch' };
     if (!caller.originOk) return { code: 'app_denied', reason: 'origin_mismatch' };
@@ -261,113 +297,61 @@ export class BridgeService {
     return undefined;
   }
 
-  async createLease(
+  /** Mints one restricted API key for (viewer, space, approved release) and seals its handle. */
+  async createSession(
     caller: CallerContext,
     appId: string,
     releaseDigest: string
   ): Promise<ServiceResponse> {
     const correlationId = randomUUID();
-    const pre = this.#precheck(caller);
-    if (pre) {
-      this.#record(
-        undefined,
-        caller,
-        'lease.create',
-        'failure',
-        pre.reason,
-        correlationId,
-        'lease'
-      );
-      return failure(pre.code);
-    }
-    const state = await this.#readState();
-    if (state.status !== 'approved') {
-      this.#record(
-        undefined,
-        caller,
-        'lease.create',
-        'failure',
-        state.status === 'disabled' ? 'disabled' : 'not_approved',
-        correlationId,
-        'lease'
-      );
-      return failure(state.status === 'disabled' ? 'app_disabled' : 'app_denied');
-    }
-    const { manifest } = state;
-    if (
-      appId !== manifest.id ||
-      !isHex64(releaseDigest) ||
-      releaseDigest !== manifest.releaseDigest
-    ) {
-      this.#record(
-        undefined,
-        caller,
-        'lease.create',
-        'failure',
-        'app_mismatch',
-        correlationId,
-        'lease'
-      );
-      return failure(releaseDigest === manifest.releaseDigest ? 'app_denied' : 'app_stale');
-    }
-    const binding: LeaseBinding = {
-      principal: caller.principal as string,
-      userName: caller.userName ?? '',
-      spaceId: caller.spaceId,
-      appId: manifest.id,
-      releaseDigest: manifest.releaseDigest,
-      version: manifest.version,
-      scopes: manifest.ui.scopes as UiScope[],
-      indices: [...manifest.permissions.indices],
-      dashboardIds: [...manifest.permissions.dashboardIds],
+    const deny = (
+      code: BridgeErrorCode,
+      reason: AuditReason,
+      app?: BridgeAuditEvent['app']
+    ): ServiceResponse => {
+      this.#record(app, caller, 'session.create', 'failure', reason, correlationId, 'session');
+      return failure(code);
     };
-    const created = this.#leases.create(binding);
-    if ('error' in created) {
-      this.#record(
-        binding,
-        caller,
-        'lease.create',
-        'failure',
-        'lease_limit',
-        correlationId,
-        'lease'
-      );
-      return failure('app_rate_limited');
+    const pre = this.#precheck(caller);
+    if (pre) return deny(pre.code, pre.reason);
+    const state = await this.#readState();
+    if (state.status === 'disabled') return deny('app_disabled', 'disabled');
+    if (state.status !== 'approved') return deny('app_denied', 'not_approved');
+    const { manifest } = state;
+    if (appId !== manifest.id || !isHex64(releaseDigest)) return deny('app_denied', 'app_mismatch');
+    if (releaseDigest !== manifest.releaseDigest) return deny('app_stale', 'stale_release');
+    let key: AppKey | null;
+    try {
+      key = await caller.grantKey(appKeyRequest(manifest, caller.spaceId));
+    } catch {
+      key = null;
     }
+    if (!key) return deny('app_unavailable', 'mint_failed', appOf(manifest));
+    const handle = this.#handles.seal({
+      id: key.id,
+      apiKey: key.apiKey,
+      app: manifest.id,
+      release: manifest.releaseDigest,
+      space: caller.spaceId,
+      principal: caller.principal as string,
+      // The key's own expiration starts when Elasticsearch creates it, after this instant.
+      exp: this.#now() + UI_LIMITS.sessionTtlMs,
+    });
     this.#record(
-      binding,
+      appOf(manifest, key.id),
       caller,
-      'lease.create',
+      'session.create',
       'success',
-      'lease_created',
+      'session_created',
       correlationId,
-      'lease'
+      'session'
     );
-    return { status: 200, body: created };
-  }
-
-  revokeLease(caller: CallerContext, leaseId: string, secret: string): ServiceResponse {
-    const lookup = this.#leases.lookup(leaseId, secret);
-    if (lookup.status === 'ok' && lookup.lease.binding.principal === caller.principal) {
-      this.#leases.revoke(leaseId);
-      this.#record(
-        lookup.lease.binding,
-        caller,
-        'lease.revoke',
-        'success',
-        'lease_revoked',
-        randomUUID(),
-        'lease'
-      );
-    }
-    // Uniform response: no oracle for lease existence.
-    return { status: 200, body: { revoked: true } };
+    return { status: 200, body: { handle } };
   }
 
   async execute(
     caller: CallerContext,
-    leaseId: string,
-    secret: string,
+    handle: string,
     rawOperation: unknown
   ): Promise<ServiceResponse> {
     const correlationId = randomUUID();
@@ -380,76 +364,67 @@ export class BridgeService {
       this.#record(undefined, caller, capabilityName, 'failure', pre.reason, correlationId);
       return failure(pre.code);
     }
-    const lookup = this.#leases.lookup(leaseId, secret);
-    if (lookup.status !== 'ok') {
-      // No valid app context: recorded as an authentication/protocol failure without an app actor.
+    // 1. Handle integrity, principal/space binding and expiry.
+    const opened = this.#handles.open(handle, {
+      app: INSTALLED_APP_ID,
+      space: caller.spaceId,
+      principal: caller.principal as string,
+    });
+    if (opened.status !== 'ok') {
+      // No valid app context: recorded without an app actor.
+      const expired = opened.status === 'expired';
       this.#record(
         undefined,
         caller,
         capabilityName,
         'failure',
-        lookup.status === 'expired'
-          ? 'expired'
-          : lookup.status === 'bad_secret'
-          ? 'bad_secret'
-          : 'unknown_lease',
+        expired ? 'expired' : 'bad_handle',
         correlationId
       );
-      return failure(lookup.status === 'expired' ? 'app_expired' : 'app_denied');
+      return failure(expired ? 'app_expired' : 'app_denied');
     }
-    const { lease } = lookup;
-    const { binding } = lease;
-    const deny = (code: BridgeErrorCode, reason: AuditReason, revoke = false): ServiceResponse => {
-      if (revoke) this.#leases.revoke(lease.id);
-      this.#record(binding, caller, capabilityName, 'failure', reason, correlationId);
+    const { payload: session } = opened;
+    // 2. Enablement and approval (cached ≤ 2 s); key invalidation covers the remaining window.
+    const state = await this.#cachedState();
+    const sessionApp: BridgeAuditEvent['app'] =
+      state.status === 'approved' || state.status === 'disabled'
+        ? appOf(state.manifest, session.id)
+        : undefined;
+    const deny = (code: BridgeErrorCode, reason: AuditReason): ServiceResponse => {
+      this.#record(sessionApp, caller, capabilityName, 'failure', reason, correlationId);
       return failure(code);
     };
-    if (binding.principal !== caller.principal || binding.spaceId !== caller.spaceId) {
-      return deny('app_denied', 'principal_mismatch');
+    if (state.status === 'disabled') return deny('app_disabled', 'disabled');
+    if (state.status !== 'approved') return deny('app_stale', 'not_approved');
+    const { manifest } = state;
+    if (manifest.releaseDigest !== session.release || manifest.id !== session.app) {
+      return deny('app_stale', 'stale_release');
     }
-    const state = await this.#readState();
-    const releaseCheck = this.#checkRelease(state, binding);
-    if (releaseCheck) return deny(releaseCheck.code, releaseCheck.reason, true);
+    // 3. Input schema only (closed union, scope, exact index and dashboard id). Not authorization:
+    // the key's role descriptor and the viewer's own privileges are enforced natively.
     const operation = parseUiOperation(rawOperation);
     if (!operation) return deny('bridge_invalid_request', 'invalid_operation');
-    if (!binding.scopes.includes(operation.op)) return deny('app_denied', 'scope_not_granted');
-    // Resource selectors are checked against the lease grant before any lookup or I/O.
-    if (operation.op === 'es.search') {
-      const decision = evaluateSearch(
-        { appId: binding.appId, indices: binding.indices },
-        operation.params
-      );
-      if (!decision.allowed) return deny('app_denied', 'resource_not_granted');
+    if (!this.#skipInputSchema) {
+      if (!(manifest.ui.scopes as readonly string[]).includes(operation.op)) {
+        return deny('app_denied', 'scope_not_granted');
+      }
+      if (operation.op === 'es.search' && !parseSearchInput(operation.params).ok) {
+        return deny('app_denied', 'resource_not_granted');
+      }
+      if (
+        operation.op === 'kibana.dashboard.read' &&
+        !manifest.permissions.dashboardIds.includes(operation.params.id)
+      ) {
+        return deny('app_denied', 'resource_not_granted');
+      }
     }
-    if (
-      operation.op === 'kibana.dashboard.read' &&
-      !binding.dashboardIds.includes(operation.params.id)
-    ) {
-      return deny('app_denied', 'resource_not_granted');
-    }
-    // Budgets: checked synchronously before awaiting any work.
-    if (lease.operations >= UI_LIMITS.operationsPerLease)
-      return deny('app_rate_limited', 'lease_budget');
-    if (lease.inFlight >= UI_LIMITS.inFlightPerLease)
-      return deny('app_rate_limited', 'in_flight_limit');
-    if (!this.#buckets.tryTake(binding.appId, binding.principal, binding.spaceId)) {
-      return deny('app_rate_limited', 'rate_limited');
-    }
-    const releaseSlot = this.#semaphore.tryAcquire();
-    if (!releaseSlot) return deny('app_rate_limited', 'process_limit');
     const handler = this.#registry.get(operation.op);
-    if (!handler) {
-      releaseSlot();
-      return deny('bridge_invalid_request', 'invalid_operation');
-    }
-    lease.operations += 1;
-    lease.inFlight += 1;
-    // One signal for the operation: lease revocation, request abort or the 5 s deadline.
+    if (!handler) return deny('bridge_invalid_request', 'invalid_operation');
+    // 4. Run as the key: request abort or the 5 s deadline aborts the operation.
     const controller = new AbortController();
     const abort = () => controller.abort();
-    lease.abort.signal.addEventListener('abort', abort, { once: true });
     caller.requestAborted.addEventListener('abort', abort, { once: true });
-    if (lease.abort.signal.aborted || caller.requestAborted.aborted) abort();
+    if (caller.requestAborted.aborted) abort();
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       const timedOut = new Promise<OperationOutcome>((resolve) => {
@@ -459,50 +434,28 @@ export class BridgeService {
         }, UI_LIMITS.operationDeadlineMs);
       });
       const outcome = await Promise.race([
-        handler({ operation, lease, caller, signal: controller.signal, correlationId }).catch(
+        handler({
+          operation,
+          session,
+          app: sessionApp,
+          clients: caller.asKey({ id: session.id, apiKey: session.apiKey }),
+          caller,
+          signal: controller.signal,
+          correlationId,
+        }).catch(
           (): OperationOutcome => ({ ok: false, code: 'app_unavailable', reason: 'native_failed' })
         ),
         timedOut,
       ]);
-      // Recheck lease expiry/revocation, enablement and release before returning data; any of
-      // them suppresses the result (delivered data cannot be recalled, undelivered data is kept).
-      if (this.#leases.isExpired(lease)) return deny('app_expired', 'expired', true);
-      if (!this.#leases.isLive(lease) || lease.abort.signal.aborted) {
-        return deny('app_disabled', 'revoked_during_call');
-      }
-      const after = this.#checkRelease(await this.#readState(), binding);
-      if (after) return deny(after.code, after.reason, true);
-      if (this.#leases.isExpired(lease)) return deny('app_expired', 'expired', true);
-      if (!this.#leases.isLive(lease) || lease.abort.signal.aborted) {
-        return deny('app_disabled', 'revoked_during_call');
-      }
       if (!outcome.ok) return deny(outcome.code, outcome.reason);
       if (Buffer.byteLength(JSON.stringify(outcome.result)) > UI_LIMITS.resultBytes) {
         return deny('app_unavailable', 'invalid_result');
       }
-      this.#record(binding, caller, operation.op, 'success', 'ok', correlationId);
+      this.#record(sessionApp, caller, operation.op, 'success', 'ok', correlationId);
       return { status: 200, body: { ok: true, result: outcome.result } };
     } finally {
       if (timer) clearTimeout(timer);
-      lease.abort.signal.removeEventListener('abort', abort);
       caller.requestAborted.removeEventListener('abort', abort);
-      lease.inFlight -= 1;
-      releaseSlot();
     }
-  }
-
-  #checkRelease(
-    state: UiReleaseState,
-    binding: LeaseBinding
-  ): { code: BridgeErrorCode; reason: AuditReason } | undefined {
-    if (state.status === 'disabled') return { code: 'app_disabled', reason: 'disabled' };
-    if (state.status !== 'approved') return { code: 'app_stale', reason: 'not_approved' };
-    if (
-      state.manifest.releaseDigest !== binding.releaseDigest ||
-      state.manifest.id !== binding.appId
-    ) {
-      return { code: 'app_stale', reason: 'stale_release' };
-    }
-    return undefined;
   }
 }

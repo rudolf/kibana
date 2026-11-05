@@ -9,7 +9,6 @@ import { MessageChannel } from 'node:worker_threads';
 import {
   BoundedPortTransport,
   MAX_QUEUED_FRAMES,
-  TokenBucket,
   utf8Bytes,
   type PortLike,
   type TerminationReason,
@@ -31,10 +30,10 @@ class FakePort implements PortLike {
   }
 }
 
-const setup = (bucket?: TokenBucket) => {
+const setup = () => {
   const port = new FakePort();
   const reasons: TerminationReason[] = [];
-  const transport = new BoundedPortTransport(port, (reason) => reasons.push(reason), bucket);
+  const transport = new BoundedPortTransport(port, (reason) => reasons.push(reason));
   return { port, reasons, transport };
 };
 
@@ -84,25 +83,6 @@ describe('BoundedPortTransport (T9)', () => {
     const { port, reasons } = setup();
     port.onmessageerror?.({} as MessageEvent);
     expect(reasons).toEqual(['messageerror']);
-  });
-
-  it('paces ingress at the bucket rate instead of delivering a burst', async () => {
-    let now = 0;
-    const { port, transport } = setup(new TokenBucket(60, 16, () => now));
-    for (let i = 0; i < 20; i++) port.deliver(`m${i}`);
-    const received: string[] = [];
-    for (let i = 0; i < 16; i++) received.push(await transport.receive());
-    expect(received).toHaveLength(16);
-    let late: string | undefined;
-    transport.receive().then((value) => {
-      late = value;
-    });
-    await new Promise((resolve) => setTimeout(resolve, 30));
-    expect(late).toBeUndefined();
-    now += 1000;
-    await new Promise((resolve) => setTimeout(resolve, 40));
-    expect(late).toBe('m16');
-    transport.terminate('closed');
   });
 
   it('works over a real MessageChannel', async () => {

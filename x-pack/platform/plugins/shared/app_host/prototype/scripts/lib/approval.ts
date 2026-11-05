@@ -9,11 +9,13 @@
 // authenticated installer principal in ES and Kibana: the reserved `superuser` role, ES
 // `_has_privileges` read on the exact index, and a successful native GET of the exact dashboard.
 // Every negative or unavailable check fails closed without writing. No credentials are persisted.
+// Replacing an approval flips the state first, then invalidates the previous release's app keys.
 
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { canonicalJson } from '../../../common/ui_contract';
+import { invalidateAppKeys, type InvalidationResult } from './app_keys';
 import { http as defaultHttp, type HttpResult } from './http';
 import { LOCAL_DIR } from './secrets';
 import { sha256, type UiManifest } from './ui_release';
@@ -66,6 +68,20 @@ export const writeConsent = (record: ConsentRecord, path = CONSENT_FILE): void =
   renameSync(tmp, path);
 };
 
+/**
+ * Operator enable/disable: flips the persisted state, then (on disable) invalidates every app
+ * session key of the app. The per-call state check covers the window before invalidation lands.
+ */
+export const setAppEnabled = async (
+  enabled: boolean,
+  { consentPath = CONSENT_FILE, esUrl }: { consentPath?: string; esUrl?: string } = {}
+): Promise<InvalidationResult | undefined> => {
+  const consent = readConsent(consentPath);
+  if (!consent) throw new Error('No approval to change');
+  writeConsent({ ...consent, enabled }, consentPath);
+  return enabled ? undefined : invalidateAppKeys({ esUrl, appId: consent.appId });
+};
+
 export type ApprovalFailure =
   | 'es_unavailable'
   | 'kibana_unavailable'
@@ -99,6 +115,8 @@ export interface ApprovalResult {
   readonly idempotent: boolean;
   readonly approvedBy: string;
   readonly installerGrantDigest: string;
+  /** Keys of the superseded release, invalidated after the new approval was written. */
+  readonly revoked?: InvalidationResult;
 }
 
 interface Realm {
@@ -211,5 +229,13 @@ export const approveRelease = async ({
     },
     consentPath
   );
-  return { written: true, idempotent: false, approvedBy, installerGrantDigest: grant };
+  const revoked = existing
+    ? await invalidateAppKeys({
+        esUrl,
+        appId: existing.appId,
+        releaseDigest: existing.approvedReleaseDigest,
+        http,
+      })
+    : undefined;
+  return { written: true, idempotent: false, approvedBy, installerGrantDigest: grant, revoked };
 };

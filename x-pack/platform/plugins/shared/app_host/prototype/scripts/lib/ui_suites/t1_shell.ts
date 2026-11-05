@@ -288,10 +288,12 @@ export const runT1Browser = async (ctx: SuiteContext, engine: string) => {
     await sleep(2500);
     report.expect(
       T,
-      'before consent: no guest frame, port or lease',
+      'before consent: no guest frame, port or app session',
       engine,
       (await page.locator('iframe').count()) === 0 &&
-        !requests.some((url) => /\/api\/app_host\/ui\/|\/internal\/app_host\/ui\/leases/.test(url)),
+        !requests.some((url) =>
+          /\/api\/app_host\/ui\/|\/internal\/app_host\/ui\/session/.test(url)
+        ),
       { iframes: await page.locator('iframe').count() }
     );
     const consent = await page.locator('[data-test-subj="appHostConsentCopy"]').innerText();

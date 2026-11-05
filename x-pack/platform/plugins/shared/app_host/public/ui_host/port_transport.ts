@@ -7,9 +7,6 @@
 
 import type { RpcTransport } from 'capnweb';
 import { UI_LIMITS } from '../../common/ui_protocol';
-import { TokenBucket } from './token_bucket';
-
-export { TokenBucket } from './token_bucket';
 
 /** UTF-8 byte length without allocating; lone surrogates count as 3 bytes (U+FFFD). */
 export const utf8Bytes = (value: string): number => {
@@ -53,20 +50,17 @@ export const MAX_QUEUED_FRAMES = 1024;
 /**
  * capnweb string-only transport over a MessagePort. Rejects objects/binary, frames over 32 KiB
  * UTF-8 and a receive queue over 256 KiB (or 1,024 frames) *before* capnweb parses anything, and
- * terminates the session on `messageerror`. Ingress is paced at 60 msgs/s (burst 16): frames above
- * the rate wait in the bounded queue instead of being delivered to capnweb. The browser's structured
- * clone of the incoming value still happens before this code runs (documented residual).
+ * terminates the session on `messageerror`. Frames wait in the bounded queue until capnweb asks for
+ * the next one. The browser's structured clone of the incoming value still happens before this code runs (documented residual).
  */
 export class BoundedPortTransport implements RpcTransport {
   readonly #port: PortLike;
-  readonly #ingress: TokenBucket;
   readonly #onTerminate: (reason: TerminationReason) => void;
   #queue: Array<{ data: string; bytes: number }> = [];
   #queuedBytes = 0;
   #resolve: ((value: string) => void) | undefined;
   #reject: ((reason: Error) => void) | undefined;
   #error: Error | undefined;
-  #timer: ReturnType<typeof setTimeout> | undefined;
   readonly #admit: () => boolean;
 
   /**
@@ -77,12 +71,10 @@ export class BoundedPortTransport implements RpcTransport {
   constructor(
     port: PortLike,
     onTerminate: (reason: TerminationReason) => void,
-    ingress: TokenBucket = new TokenBucket(UI_LIMITS.ingressPerSecond, UI_LIMITS.ingressBurst),
     admit: () => boolean = () => true
   ) {
     this.#port = port;
     this.#onTerminate = onTerminate;
-    this.#ingress = ingress;
     this.#admit = admit;
     port.onmessage = (event) => this.#onMessage(event.data);
     port.onmessageerror = () => this.terminate('messageerror');
@@ -111,16 +103,9 @@ export class BoundedPortTransport implements RpcTransport {
     });
   }
 
-  /** Delivers the next queued frame when both a receiver and an ingress token are available. */
+  /** Delivers the next queued frame when a receiver is waiting. */
   #pump(): void {
-    if (this.#error || !this.#resolve || this.#queue.length === 0 || this.#timer) return;
-    if (!this.#ingress.tryTake()) {
-      this.#timer = setTimeout(() => {
-        this.#timer = undefined;
-        this.#pump();
-      }, Math.ceil(1000 / UI_LIMITS.ingressPerSecond));
-      return;
-    }
+    if (this.#error || !this.#resolve || this.#queue.length === 0) return;
     const next = this.#queue.shift();
     if (!next) return;
     this.#queuedBytes -= next.bytes;
@@ -144,8 +129,6 @@ export class BoundedPortTransport implements RpcTransport {
     this.#error = new Error(`bridge_protocol_error:${reason}`);
     this.#port.onmessage = null;
     this.#port.onmessageerror = null;
-    if (this.#timer) clearTimeout(this.#timer);
-    this.#timer = undefined;
     try {
       this.#port.close();
     } catch {

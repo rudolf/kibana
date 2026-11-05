@@ -10,10 +10,9 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { I18nProvider } from '@kbn/i18n-react';
 import { httpServiceMock } from '@kbn/core/public/mocks';
 import type { UiAppMetadata } from '../../common/ui_protocol';
-import { AppUiPage, type LeaseHandle } from './app_ui_page';
+import { AppUiPage, type AppSession } from './app_ui_page';
 
 const DIGEST_A = 'a'.repeat(64);
-const DIGEST_B = 'b'.repeat(64);
 
 const metadataFor = (releaseDigest: string, enabled = true): UiAppMetadata => ({
   appId: 'alert-digest',
@@ -31,37 +30,30 @@ const metadataFor = (releaseDigest: string, enabled = true): UiAppMetadata => ({
   guardianPath: `/api/app_host/ui/alert-digest/${releaseDigest}/guardian`,
 });
 
-interface HeldLease {
-  readonly resolve: (handle: LeaseHandle) => void;
+interface HeldSession {
+  readonly resolve: (session: AppSession) => void;
 }
 
 const setup = () => {
   const http = httpServiceMock.createStartContract();
-  let current = metadataFor(DIGEST_A);
-  http.get.mockImplementation((async () => current) as unknown as typeof http.get);
-  const held: HeldLease[] = [];
-  const createLease = jest.fn(
+  http.get.mockImplementation((async () => metadataFor(DIGEST_A)) as unknown as typeof http.get);
+  const held: HeldSession[] = [];
+  const createSession = jest.fn(
     () =>
-      new Promise<LeaseHandle | undefined>((resolve) => {
+      new Promise<AppSession | undefined>((resolve) => {
         held.push({ resolve });
       })
   );
-  const release = jest.fn();
-  const handle = (expiresAt = Date.now() + 5 * 60 * 1000): LeaseHandle => ({
+  const session = (): AppSession => ({
     executor: async () => ({ ok: false, code: 'app_denied' }),
-    release,
-    expiresAt,
   });
   const view = render(
     <I18nProvider>
-      <AppUiPage http={http} createLease={createLease} />
+      <AppUiPage http={http} createSession={createSession} />
     </I18nProvider>
   );
-  const setMetadata = (next: UiAppMetadata) => {
-    current = next;
-  };
   const guardians = () => document.querySelectorAll('[data-test-subj="appHostGuardianFrame"]');
-  return { http, view, held, createLease, release, handle, setMetadata, guardians };
+  return { http, view, held, createSession, session, guardians };
 };
 
 const allow = async () => {
@@ -72,64 +64,44 @@ const allow = async () => {
 
 const settle = () => act(async () => new Promise((resolve) => setTimeout(resolve, 20)));
 
-describe('AppUiPage lease lifecycle (P1)', () => {
-  it('a lease that resolves after Disable never mounts a frame and is released', async () => {
-    const { held, createLease, release, handle, guardians } = setup();
+describe('AppUiPage app session lifecycle (P1)', () => {
+  it('a session that resolves after Disable never mounts a frame', async () => {
+    const { held, createSession, session, guardians } = setup();
     await allow();
-    await waitFor(() => expect(createLease).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
     fireEvent.click(screen.getByTestId('appHostDisable'));
-    await act(async () => held[0].resolve(handle()));
+    await act(async () => held[0].resolve(session()));
     await settle();
     expect(guardians()).toHaveLength(0);
-    expect(release).toHaveBeenCalledTimes(1);
   });
 
-  it('a lease that resolves after unmount never mounts a frame and is released', async () => {
-    const { view, held, createLease, release, handle, guardians } = setup();
+  it('a session that resolves after unmount never mounts a frame', async () => {
+    const { view, held, createSession, session, guardians } = setup();
     await allow();
-    await waitFor(() => expect(createLease).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
     view.unmount();
-    await act(async () => held[0].resolve(handle()));
+    await act(async () => held[0].resolve(session()));
     await settle();
     expect(guardians()).toHaveLength(0);
-    expect(release).toHaveBeenCalledTimes(1);
   });
 
-  it('a lease that resolves after a release change never mounts a frame and is released', async () => {
-    const { held, createLease, release, handle, setMetadata, guardians } = setup();
+  it('positive control: a session that resolves while consent is current mounts exactly one frame', async () => {
+    const { held, createSession, session, guardians } = setup();
     await allow();
-    await waitFor(() => expect(createLease).toHaveBeenCalledTimes(1));
-    setMetadata(metadataFor(DIGEST_B));
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    await act(async () => held[0].resolve(session()));
+    await settle();
+    expect(guardians()).toHaveLength(1);
+  });
+
+  it('mints nothing before consent and never polls the metadata', async () => {
+    const { http, createSession } = setup();
+    await screen.findByTestId('appHostAllowVersion');
     await act(async () => {
       window.dispatchEvent(new Event('focus'));
+      await new Promise((resolve) => setTimeout(resolve, 2500));
     });
-    await waitFor(() => expect(screen.getByTestId('appHostAllowVersion')).not.toBeDisabled());
-    await act(async () => held[0].resolve(handle()));
-    await settle();
-    expect(guardians()).toHaveLength(0);
-    expect(release).toHaveBeenCalledTimes(1);
-  });
-
-  it('positive control: a lease that resolves while consent is current mounts exactly one frame', async () => {
-    const { held, createLease, release, handle, guardians } = setup();
-    await allow();
-    await waitFor(() => expect(createLease).toHaveBeenCalledTimes(1));
-    await act(async () => held[0].resolve(handle()));
-    await settle();
-    expect(guardians()).toHaveLength(1);
-    expect(release).not.toHaveBeenCalled();
-  });
-
-  it('tears down an idle frame and releases the lease when the lease expires', async () => {
-    const { held, createLease, release, handle, guardians } = setup();
-    await allow();
-    await waitFor(() => expect(createLease).toHaveBeenCalledTimes(1));
-    await act(async () => held[0].resolve(handle(Date.now() + 150)));
-    await settle();
-    expect(guardians()).toHaveLength(1);
-    await act(async () => new Promise((resolve) => setTimeout(resolve, 300)));
-    expect(guardians()).toHaveLength(0);
-    expect(release).toHaveBeenCalledTimes(1);
-    expect(screen.getByTestId('appHostFrameStatus')).toHaveTextContent('ended: expired');
+    expect(http.get).toHaveBeenCalledTimes(1);
+    expect(createSession).not.toHaveBeenCalled();
   });
 });

@@ -13,29 +13,20 @@ import type {
   KibanaRequest,
   KibanaResponseFactory,
 } from '@kbn/core/server';
-import {
-  UI_LEASES_PATH,
-  UI_LEASE_EXECUTE_ROUTE,
-  UI_LEASE_REVOKE_ROUTE,
-} from '../../common/ui_protocol';
+import { kibanaRequestFactory } from '@kbn/core-http-server-utils';
+import { UI_EXECUTE_PATH, UI_LIMITS, UI_SESSION_PATH } from '../../common/ui_protocol';
+import type { AppKey } from './app_key';
 import type { BridgeService, CallerContext, ServiceResponse } from './bridge_service';
 import { APP_UI_PRIVILEGES } from './register_ui_routes';
 import { isDefaultSpace, spaceIdOf, type UiUrls } from './ui_context';
 
-export interface LeaseRouteDependencies {
+export interface SessionRouteDependencies {
   readonly router: IRouter;
   readonly basePath: IBasePath;
   readonly urls: UiUrls;
   readonly service: BridgeService;
   readonly getStart: () => Promise<CoreStart>;
 }
-
-const leaseId = schema.string({
-  minLength: 22,
-  maxLength: 64,
-  validate: (v) => (/^[A-Za-z0-9_-]+$/.test(v) ? undefined : 'invalid'),
-});
-const secret = schema.string({ minLength: 43, maxLength: 43 });
 
 const abortSignalOf = (request: KibanaRequest) => {
   const controller = new AbortController();
@@ -54,18 +45,21 @@ const respond = (response: KibanaResponseFactory, result: ServiceResponse) => {
   });
 };
 
+const apiKeyAuthorization = ({ id, apiKey }: AppKey): string =>
+  `ApiKey ${Buffer.from(`${id}:${apiKey}`).toString('base64')}`;
+
 /**
- * Parent-only lease API. Requires authentication, both privileges, normal XSRF (Kibana core), the
- * exact configured same-origin `Origin`, the default space and no run_as. The lease secret travels
- * in the JSON body, never in a header (S11: Kibana's response logger does not redact custom headers).
+ * Parent-only app session API. Requires authentication (session cookie or basic), both
+ * privileges, normal XSRF (Kibana core), the exact configured same-origin `Origin`, the default
+ * space and no run_as. The handle travels in the JSON body, never in a header or URL (S11).
  */
-export const registerLeaseRoutes = ({
+export const registerSessionRoutes = ({
   router,
   basePath,
   urls,
   service,
   getStart,
-}: LeaseRouteDependencies) => {
+}: SessionRouteDependencies) => {
   const callerOf = async (request: KibanaRequest, signal: AbortSignal): Promise<CallerContext> => {
     const start = await getStart();
     const user = start.security.authc.getCurrentUser(request);
@@ -87,8 +81,20 @@ export const registerLeaseRoutes = ({
       originOk: request.headers.origin === urls.origin,
       runAs,
       requestAborted: signal,
-      esClient: () => start.elasticsearch.client.asScoped(request).asCurrentUser,
-      selfClient: () => start.http.selfClient.asScoped(request),
+      grantKey: async (keyRequest) => {
+        const granted = await start.security.authc.apiKeys.grantAsInternalUser(request, {
+          ...keyRequest,
+          role_descriptors: { ...keyRequest.role_descriptors },
+        });
+        return granted ? { id: granted.id, apiKey: granted.api_key } : null;
+      },
+      asKey: (key) => {
+        const headers = { authorization: apiKeyAuthorization(key) };
+        return {
+          esClient: start.elasticsearch.client.asScoped({ headers }).asCurrentUser,
+          selfClient: start.http.selfClient.asScoped(kibanaRequestFactory({ headers })),
+        };
+      },
       dashboardPathname: (id) =>
         `${basePath.serverBasePath}/api/dashboards/${encodeURIComponent(id)}`,
     };
@@ -96,7 +102,7 @@ export const registerLeaseRoutes = ({
 
   router.post(
     {
-      path: UI_LEASES_PATH,
+      path: UI_SESSION_PATH,
       security: { authz: { requiredPrivileges: [...APP_UI_PRIVILEGES] } },
       options: { access: 'internal', body: { maxBytes: 1024 } },
       validate: {
@@ -111,7 +117,7 @@ export const registerLeaseRoutes = ({
       try {
         const caller = await callerOf(request, aborted.signal);
         const { appId, releaseDigest } = request.body;
-        return respond(response, await service.createLease(caller, appId, releaseDigest));
+        return respond(response, await service.createSession(caller, appId, releaseDigest));
       } finally {
         aborted.dispose();
       }
@@ -120,17 +126,19 @@ export const registerLeaseRoutes = ({
 
   router.post(
     {
-      path: UI_LEASE_EXECUTE_ROUTE,
+      path: UI_EXECUTE_PATH,
       security: { authz: { requiredPrivileges: [...APP_UI_PRIVILEGES] } },
       options: { access: 'internal', body: { maxBytes: 4096 } },
       validate: {
-        params: schema.object({ leaseId }),
         // The operation is parsed strictly by the closed union; config-schema only bounds it.
         body: schema.object({
-          secret,
-          operation: schema.recordOf(schema.string({ maxLength: 16 }), schema.any(), {
-            validate: (value) => (Object.keys(value).length <= 4 ? undefined : 'too many fields'),
-          }),
+          handle: schema.string({ minLength: 1, maxLength: UI_LIMITS.handleBytes }),
+          op: schema.string({ minLength: 1, maxLength: 32 }),
+          params: schema.maybe(
+            schema.recordOf(schema.string({ maxLength: 16 }), schema.any(), {
+              validate: (value) => (Object.keys(value).length <= 4 ? undefined : 'too many fields'),
+            })
+          ),
         }),
       },
     },
@@ -138,30 +146,12 @@ export const registerLeaseRoutes = ({
       const aborted = abortSignalOf(request);
       try {
         const caller = await callerOf(request, aborted.signal);
-        const { secret: leaseSecret, operation } = request.body;
-        return respond(
-          response,
-          await service.execute(caller, request.params.leaseId, leaseSecret, operation)
-        );
+        const { handle, op, params } = request.body;
+        const operation = params === undefined ? { op } : { op, params };
+        return respond(response, await service.execute(caller, handle, operation));
       } finally {
         aborted.dispose();
       }
-    }
-  );
-
-  router.post(
-    {
-      path: UI_LEASE_REVOKE_ROUTE,
-      security: { authz: { requiredPrivileges: [...APP_UI_PRIVILEGES] } },
-      options: { access: 'internal', body: { maxBytes: 1024 } },
-      validate: { params: schema.object({ leaseId }), body: schema.object({ secret }) },
-    },
-    async (_context, request, response) => {
-      const caller = await callerOf(request, new AbortController().signal);
-      return respond(
-        response,
-        service.revokeLease(caller, request.params.leaseId, request.body.secret)
-      );
     }
   );
 };

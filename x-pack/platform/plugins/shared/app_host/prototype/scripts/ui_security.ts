@@ -5,11 +5,11 @@
  * 2.0.
  */
 
-// UI-cut acceptance harness (T1–T14) against local Kibana/ES/Wrangler with synthetic data only.
+// UI-cut acceptance harness (K1–K6 app session key plus the surviving T-suites) against local Kibana/ES/Wrangler with synthetic data only.
 // Usage: npm run ui:security -- --kibana http://localhost:5601 --engines chromium,firefox,webkit
 //          [--suites t1,t5,...] [--es http://localhost:9200]
 // Env: ES_AUTH (local admin user:pass; also the local superuser installer). Results are written to
-// .local/ui_security-<timestamp>.json; credentials and lease secrets are never printed.
+// .local/ui_security-<timestamp>.json; credentials, handles and API keys are never printed.
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';

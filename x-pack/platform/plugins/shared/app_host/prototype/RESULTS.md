@@ -5,6 +5,78 @@ The backend acceptance was re-run at each UI milestone and after the UI review f
 `acceptance --local-workerd`: exit 0, verdict PASS, 34 of 37 true, the same three `NOT_ENFORCED_LOCALLY`
 CPU checks, no failures).
 
+## Restricted API key as the app session (K1–K6) — local results
+
+**Synthetic data, local only.** Spec: `kibana-apps-key-session-spec.md`; rationale:
+`kibana-apps-design.md` §3. Same stack as below (ES snapshot 9.7.0 trial license, `node scripts/kibana
+--dev --no-base-path` with `KBN_HMR=false`, local `wrangler dev`, Node 24.22.1, Playwright Chromium,
+Firefox and WebKit). Run date 2026-11-05. No Cloudflare, deploy or push.
+
+What changed: the lease, lease secret, lease caps (32/4), per-lease/per-app token buckets, operation
+counters, in-flight caps, the UI process cap, parent metadata polling, the parent idle-expiry timer and
+the transport ingress pacing are gone. Consent mints one restricted API key (`grantAsInternalUser`,
+role descriptor from the approved manifest only, 1 h); the parent holds only an AES-256-GCM handle; every
+bridge operation (ES search, Dashboard read via `selfClient`, `app.summary` → Worker → `HostEs`) runs as
+that key. Config added: `xpack.app_host.handleEncryptionKey` (required) and the dev-only
+`xpack.app_host.testOnlySkipInputSchema`. ES needed nothing extra: `xpack.security.authc.api_key.enabled`
+is on by default in the `node scripts/es snapshot` cluster (`_xpack/usage` → `api_key_service.enabled:
+true`).
+
+| Check | Result | Evidence |
+|---|---|---|
+| K1 ES enforces, not Kibana | **PASS** (9/9, Kibana restarted with `-c .local/kibana.app_host.k1.yml`) | With the input schema bypassed: superuser viewer → `.security`, `.security-7`, `.kibana` each `app_denied` with audit reason `native_denied` (an Elasticsearch 401/403, not the schema's `resource_not_granted`); `kbn-apps-prototype-viewer-only` (direct ES read as the viewer: 200) → `native_denied` for the viewer and for a superuser; the granted index still works. The superuser key's descriptor (`GET /_security/api_key?id=…`) is `indices:[{names:[kbn-apps-prototype-alerts], privileges:[read], allow_restricted_indices:false}]`, `cluster:[]`, `run_as:[]`. A direct ES probe with the same descriptor (superuser key) returned **403** on `.security/_search`. Default config: `.security` is refused by the input schema (`resource_not_granted`), so the bypass is not reachable by default; outside `--dev` the setting fails config validation (Jest). |
+| K2 viewer ∩ app | **PASS** (6/6) | `app_host_ui_no_index`: key grants the index, ES denies (`native_denied`), also on the Worker `HostEs` path; `app_host_ui_no_dashboard`: key has `feature_dashboard_v2.read`, Kibana's native feature authz denies the Dashboard read (`native_denied`); manifest without `kibana.dashboard.read` → the key has `applications: []`, superuser denied (default: `scope_not_granted`; with the K1 bypass: denied natively by Kibana, `native_denied`). The stored key = the manifest descriptor, `limited_by` = the viewer. |
+| K3 handle integrity | **PASS** (HTTP 6/6, browser 1/1 per engine ×3, Jest 3/3) | Tampered ciphertext, swapped release prefix, another user's handle with their own basic auth **and** with their own cookie (all three engines), another space → `app_denied`; no credentials → 401; expired → `app_expired` (fake clock, Jest); the parent re-mints once only inside the session this page's consent created, never after teardown (Jest). |
+| K4 key confinement | **PASS** (3 live + 1 Jest) | Across all three engines: no `ApiKey …` and no base64 prefix of `"<id>:"` (any encoding of any session key) in Kibana responses, window/port messages, frame DOM, storage, `kibana-key.log`, `kibana_debug.ndjson` (`plugins.appHost` + `plugins.security` at debug), `http_debug.ndjson` (`http.server.response` debug), the security audit log, the `app_host.bridge` audit or `wrangler.log`. The handle appears only in the session response to the parent. The key id appears only as `api_key.id` in `app_host.bridge` records. Jest: a known raw key is absent from every response, audit record and log call and reaches only the key-scoped clients. Not observed directly: the ES request header itself (no proxy). |
+| K5 revocation | **PASS** (4/4) | `ui:operator -- disable` (via `setAppEnabled(false)`): state flipped, then `DELETE /_security/api_key {name:"app:alert-digest@*"}` as `kibana_system` invalidated ≥ 1 key, errors 0; every key with the release name is `invalidated: true`; next call (after the ≤ 2 s state cache) `app_disabled`; minting refused. Re-enabling does not resurrect the old handle (ES denies). A new approved release invalidates `app:alert-digest@<old digest>`; the old handle → `app_stale`. |
+| K6 cost | **PASS** | 30 calls on one handle → exactly 1 new key (`_query/api_key` on `metadata.app`: 15 → 16 in the first run). Mint latency via `POST /internal/app_host/ui/session`, 20 mints: **p50 1013 ms, p95 1018 ms** (first run 1016/1020). Direct ES grant as `kibana_system`: default refresh (`wait_for`) p50 1003 / p95 1010 ms; `refresh=false` p50 11 / p95 22 ms. The cost is the `.security` refresh wait, not the grant itself. |
+
+**Which invalidation API works.** As `kibana_system` (Kibana's internal user) on ES 9.7: invalidation **by
+name** works, including a trailing wildcard (`app:alert-digest@*`). Listing by name is refused (`GET
+/_security/api_key?name=…` → 403) and the metadata query returns only its own keys (total 0 while the admin
+sees 101), so "query by metadata, then invalidate by id as the internal user" is **not** available to it.
+Kibana's `invalidateAsInternalUser` only takes ids, so the operator command calls the ES invalidate API by
+name directly, authenticated as `kibana_system` (`KIBANA_SYSTEM_AUTH`, local default).
+
+**Regression (default `ui:security` run, three engines, 1,202 s):** **467 PASS, 0 FAIL**, 13 NOT_VERIFIED,
+6 KNOWN_LEAK, 13 DIAGNOSTIC (`.local/ui_security-2026-11-05T12-58-01-063Z.json`). Per suite: T1 82 PASS;
+T3 87; T4 120 PASS / 11 NV / 4 KL / 3 DIAG (same channel residuals as before); T5 56 PASS / 2 KL / 4 DIAG;
+T6 21 PASS / 3 DIAG; T7 18; T8 18 + 6 Jest; T9 browser 3 PASS / 1 NV; T10 10; T11 2; T12 12; T13 3; plus K1
+(default mode) 1 PASS / 1 NV (covered by the bypass run above), K2–K6 as in the table. `seam --local-workerd`:
+exit 0, all assertions true except the three `NOT_ENFORCED_LOCALLY` CPU checks. `acceptance --local-workerd`
+(legacy mode, approval reset): verdict PASS, 34 of 37 true, the same three `NOT_ENFORCED_LOCALLY`.
+Jest 194/194 (26 suites), `type_check` exit 0, ESLint clean on `server/ public/ common/ prototype/`,
+prototype `lint` and `test` (45/45) clean.
+
+**Removed or replaced tests.** T2 (delegation matrix) → K2; T9 server (lease caps, budgets) and T14
+(cross-lease buckets, lease state) removed; Jest tests for leases, lease caps, buckets, in-flight caps,
+ingress pacing and the parent's lease expiry removed; T5 F2 now checks that after `history.back()`
+navigates the top page the frame and the handle are gone (no later execute call) instead of a revoked
+lease; T8's disable/stale steps tear the frame down on the next bridge call (the sample UI got a *Refresh
+summary* button) instead of on a poll, and the v2 consent prompt is checked after a page load.
+
+**Deviations and limits.**
+
+- Kept: the backend runner's 4-invocation process limiter and the one-`HostEs`-call-per-invocation budget
+  (M2 backend controls, not UI-cut budgets; `app_rate_limited` now only comes from the limiter); the
+  transport's "8 invalid calls terminate" misuse bound; the 5 s operation deadline.
+- Removed beyond the list: the transport ingress pacing (60/s; a rate limit, not a structural bound) and
+  the hit-index post-check of the old grant evaluator (an authorization check; ES enforces now). The
+  post-call state recheck is gone: one cached (≤ 2 s) state read per call, as specified.
+- Revocation runs only on disable/uninstall and on a new approval (spec: "disable or approval change"). An
+  unapproved drop-in release does not invalidate keys; its state is `not_approved`, so execute and minting
+  are refused by the per-call check.
+- Mint keeps ES's default refresh (`wait_for`, ~1 s) so that name-based invalidation right after a mint
+  cannot miss the new key; `refresh=false` would cut minting to ~11 ms at the cost of that race.
+- The handle AAD is `app|release|space|principal` (spec), not the Kibana session id; the release digest is
+  a plaintext handle prefix so that a release change reads `app_stale` rather than `app_denied`.
+- The direct native summary route (`GET /api/apps/{appId}/summary`, outside the bridge) still runs
+  `asCurrentUser` with the exact-index input schema.
+- "403 from ES" is shown as the bridge audit reason `native_denied` (raised only for an ES 401/403
+  response) plus the direct ES probe; the ES request header itself was not captured.
+- Not verified: other auth providers (SAML/OIDC/PKI/Kerberos/UIAM; only basic/token sessions and basic auth
+  were used), multi-node, ES API-key cache invalidation timing across nodes, and Cloudflare.
+
 ## Third-party UI cut (U1–U3) — local results
 
 **Synthetic data, local only.** Local ES snapshot 9.7.0, `node scripts/kibana --dev --no-base-path`

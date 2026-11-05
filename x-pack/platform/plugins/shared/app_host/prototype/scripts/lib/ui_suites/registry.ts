@@ -9,19 +9,24 @@ import type { SuiteContext } from './context';
 import { runT1 } from './t1_shell';
 import { runT5, runT6 } from './t5_t6_browser';
 import { runT4, runT4Tls } from './t4_channels';
+import { runK, runK1, runK2, runK3, runK4, runK5, runK6 } from './k_session';
 import { runT10, runT3, runT8, runT9Browser } from './u3_adversarial';
-import { runT11, runT12, runT13, runT14, runT2, runT7, runT9Server } from './u2_authority';
+import { runT11, runT12, runT13, runT7 } from './u2_authority';
 
-// Order matters: T9 asserts the per-principal and global lease caps, so it runs before browser
-// sessions hold leases of their own (5-minute TTL).
+// `k` runs K1–K6 (app session key); `k1` alone is meant for Kibana started with the dev-only
+// input-schema bypass config.
 export const SUITES: Record<string, (ctx: SuiteContext) => Promise<void>> = {
-  t9: runT9Server,
-  t2: runT2,
+  k: runK,
+  k1: runK1,
+  k2: runK2,
+  k3: runK3,
+  k4: runK4,
+  k5: runK5,
+  k6: runK6,
   t7: runT7,
   t11: runT11,
   t12: runT12,
   t13: runT13,
-  t14: runT14,
   t1: runT1,
   t5: runT5,
   t6: runT6,
@@ -35,4 +40,6 @@ export const SUITES: Record<string, (ctx: SuiteContext) => Promise<void>> = {
 };
 
 /** Suites run when `--suites` is omitted. */
-export const DEFAULT_SUITES = Object.keys(SUITES).filter((name) => name !== 't4tls');
+export const DEFAULT_SUITES = Object.keys(SUITES).filter(
+  (name) => name !== 't4tls' && !/^k\d$/.test(name)
+);

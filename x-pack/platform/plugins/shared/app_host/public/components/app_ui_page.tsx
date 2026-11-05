@@ -40,19 +40,16 @@ export const LOCAL_PROCESSOR_COPY = i18n.translate('xpack.appHost.ui.localProces
     'This local demo runs its app server on local Wrangler. Cloudflare is a separate, not-yet-approved remote processor.',
 });
 
-export interface LeaseHandle {
+export interface AppSession {
   readonly executor: BridgeExecutor;
-  readonly release: () => void;
-  /** Parent-clock deadline at or before the server's lease expiry; the frame is torn down then. */
-  readonly expiresAt: number;
 }
 
-/** Creates a parent-held lease for an approved release; undefined while not wired (U1). */
-export type LeaseFactory = (metadata: UiAppMetadata) => Promise<LeaseHandle | undefined>;
+/** Mints the parent-held app session for an approved release; undefined while not wired (U1). */
+export type SessionFactory = (metadata: UiAppMetadata) => Promise<AppSession | undefined>;
 
 interface PageProps {
   readonly http: HttpStart;
-  readonly createLease?: LeaseFactory;
+  readonly createSession?: SessionFactory;
 }
 
 type FrameState =
@@ -61,13 +58,13 @@ type FrameState =
   | { readonly status: 'bound' }
   | {
       readonly status: 'ended';
-      readonly reason: FrameHostEndReason | 'lease_failed';
+      readonly reason: FrameHostEndReason | 'session_failed';
       readonly detail?: string;
     };
 
 const fingerprint = (digest: string): string => digest.slice(0, 16);
 
-export const AppUiPage = ({ http, createLease }: PageProps) => {
+export const AppUiPage = ({ http, createSession }: PageProps) => {
   const { euiTheme, colorMode } = useEuiTheme();
   const [metadata, setMetadata] = useState<UiAppMetadata | undefined>();
   const [loadError, setLoadError] = useState<string | undefined>();
@@ -76,11 +73,10 @@ export const AppUiPage = ({ http, createLease }: PageProps) => {
   const [frame, setFrame] = useState<FrameState>({ status: 'none' });
   const containerRef = useRef<HTMLDivElement>(null);
   const hostRef = useRef<FrameHost | undefined>();
-  const leaseRef = useRef<LeaseHandle | undefined>();
   const themeRef = useRef<UiTheme>();
   const metadataRef = useRef<UiAppMetadata | undefined>();
   // Bumped by every teardown (Disable, unmount, release change, disable/unapproval). An async mount
-  // only proceeds if its generation is still current after the lease request settles.
+  // only proceeds if its generation is still current after the session request settles.
   const generationRef = useRef(0);
 
   themeRef.current = {
@@ -99,8 +95,6 @@ export const AppUiPage = ({ http, createLease }: PageProps) => {
     const host = hostRef.current;
     hostRef.current = undefined;
     host?.end(reason);
-    leaseRef.current?.release();
-    leaseRef.current = undefined;
   }, []);
 
   const refreshMetadata = useCallback(async () => {
@@ -128,20 +122,11 @@ export const AppUiPage = ({ http, createLease }: PageProps) => {
     }
   }, [http, unmountFrame]);
 
-  // Parent polling is UI cleanup only; the server rejects the next call authoritatively.
+  // No polling: metadata is read on load and after a server rejection that ends the frame. The
+  // server rejects the next call authoritatively; unmount or navigation just drops the handle.
   useEffect(() => {
     refreshMetadata();
-    const interval = setInterval(refreshMetadata, UI_LIMITS.pollIntervalMs);
-    window.addEventListener('focus', refreshMetadata);
-    // Closing the tab revokes the lease too (keepalive request), not only an in-app unmount.
-    const onPageHide = () => unmountFrame('unmounted');
-    window.addEventListener('pagehide', onPageHide);
-    return () => {
-      clearInterval(interval);
-      window.removeEventListener('focus', refreshMetadata);
-      window.removeEventListener('pagehide', onPageHide);
-      unmountFrame('unmounted');
-    };
+    return () => unmountFrame('unmounted');
   }, [refreshMetadata, unmountFrame]);
 
   const mountFrame = useCallback(
@@ -150,16 +135,18 @@ export const AppUiPage = ({ http, createLease }: PageProps) => {
       if (!container || hostRef.current) return;
       const generation = generationRef.current;
       setFrame({ status: 'loading' });
-      let lease: LeaseHandle | undefined;
+      let session: AppSession | undefined;
       try {
-        lease = createLease ? await createLease(current) : undefined;
+        session = createSession ? await createSession(current) : undefined;
       } catch {
-        if (generation === generationRef.current)
-          setFrame({ status: 'ended', reason: 'lease_failed' });
+        if (generation === generationRef.current) {
+          setFrame({ status: 'ended', reason: 'session_failed' });
+          refreshMetadata();
+        }
         return;
       }
-      // P1: consent was withdrawn, the page unmounted or the release changed while the lease was
-      // being created. A stale lease never mounts or binds a frame; it is released immediately.
+      // P1: consent was withdrawn, the page unmounted or the release changed while the session was
+      // being minted. A stale session never mounts or binds a frame; its handle is dropped.
       const latest = metadataRef.current;
       if (
         generation !== generationRef.current ||
@@ -170,21 +157,25 @@ export const AppUiPage = ({ http, createLease }: PageProps) => {
         !latest.approved ||
         !latest.enabled
       ) {
-        lease?.release();
         return;
       }
-      leaseRef.current = lease;
-      // Server rejection on the next call is authoritative: lifecycle codes tear the frame down.
+      // Server rejection on the next call is authoritative: lifecycle codes tear the frame down and
+      // re-read the metadata once (a new release needs a new consent prompt, S10).
       const terminal: Partial<Record<string, FrameHostEndReason>> = {
         app_disabled: 'disabled',
         app_stale: 'stale',
         app_expired: 'expired',
       };
-      const executor: BridgeExecutor | undefined = lease
+      const executor: BridgeExecutor | undefined = session
         ? async (operation, signal) => {
-            const outcome = await lease.executor(operation, signal);
+            const outcome = await session.executor(operation, signal);
             const reason = outcome.ok ? undefined : terminal[outcome.code];
-            if (reason) setTimeout(() => host.end(reason), 0);
+            if (reason) {
+              setTimeout(() => {
+                host.end(reason);
+                refreshMetadata();
+              }, 0);
+            }
             return outcome;
           }
         : undefined;
@@ -195,14 +186,9 @@ export const AppUiPage = ({ http, createLease }: PageProps) => {
         grant: { scopes: current.scopes, dashboardIds: current.dashboardIds },
         theme: () => themeRef.current as UiTheme,
         executor,
-        leaseExpiresAt: lease?.expiresAt,
         onBound: () => setFrame({ status: 'bound' }),
         onEnded: (reason, detail) => {
-          if (hostRef.current === host) {
-            hostRef.current = undefined;
-            leaseRef.current?.release();
-            leaseRef.current = undefined;
-          }
+          if (hostRef.current === host) hostRef.current = undefined;
           // A new explicit click is required after any teardown.
           setConsentedDigest(undefined);
           setFrame({ status: 'ended', reason, detail });
@@ -211,7 +197,7 @@ export const AppUiPage = ({ http, createLease }: PageProps) => {
       hostRef.current = host;
       host.start();
     },
-    [createLease, http.basePath]
+    [createSession, http.basePath, refreshMetadata]
   );
 
   const usable = metadata?.approved && metadata.enabled;

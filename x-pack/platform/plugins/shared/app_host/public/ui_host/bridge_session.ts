@@ -11,7 +11,7 @@ import { UI_LIMITS } from '../../common/ui_protocol';
 import type { BridgeExecutor, BridgeGrant } from './bridge_root';
 import { AppBridge, sanitizeBridgeError } from './bridge_root';
 import type { BridgeLifecycle } from './bridge_lifecycle';
-import type { PortLike, TokenBucket } from './port_transport';
+import type { PortLike } from './port_transport';
 import { BoundedPortTransport } from './port_transport';
 
 export interface BridgeSessionOptions {
@@ -20,11 +20,9 @@ export interface BridgeSessionOptions {
   readonly theme: () => UiTheme;
   readonly executor: BridgeExecutor | undefined;
   readonly lifecycle: BridgeLifecycle;
-  /** Called once when the session must end (protocol violation or budget breach). */
+  /** Called once when the session must end (protocol violation or structural bound breach). */
   readonly onTerminate: (reason: string) => void;
   readonly onLocalRejection?: (method: string, code: BridgeErrorCode) => void;
-  /** Ingress pacing override (tests only); defaults to 60/s, burst 16. */
-  readonly ingress?: TokenBucket;
 }
 
 export interface BridgeSession {
@@ -44,7 +42,6 @@ export const startBridgeSession = ({
   lifecycle,
   onTerminate,
   onLocalRejection,
-  ingress,
 }: BridgeSessionOptions): BridgeSession => {
   const sessionRef: { current?: RpcSession } = {};
   // P1: every capnweb import/export counts, including protocol-only growth (retained pushes,
@@ -54,12 +51,7 @@ export const startBridgeSession = ({
     const { imports, exports } = sessionRef.current.getStats();
     return imports + exports <= UI_LIMITS.liveRpcStubs;
   };
-  const transport = new BoundedPortTransport(
-    port,
-    (reason) => onTerminate(reason),
-    ingress,
-    withinStubCap
-  );
+  const transport = new BoundedPortTransport(port, (reason) => onTerminate(reason), withinStubCap);
   const bridge = new AppBridge(
     grant,
     theme,

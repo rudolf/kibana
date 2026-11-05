@@ -5,8 +5,8 @@
  * 2.0.
  */
 
-// T9 boundary tests: every parent-side budget exactly at its limit (accepted) and one past it
-// (rejected or terminated with the named reason).
+// Structural boundary tests: every parent-side bound exactly at its limit (accepted) and one past
+// it (rejected or terminated with the named reason).
 
 import { MessageChannel } from 'node:worker_threads';
 import type { UiOperation, UiTheme } from '../../common/ui_protocol';
@@ -17,7 +17,6 @@ import { startBridgeSession } from './bridge_session';
 import {
   BoundedPortTransport,
   MAX_QUEUED_FRAMES,
-  TokenBucket,
   type PortLike,
   type TerminationReason,
 } from './port_transport';
@@ -51,8 +50,8 @@ class FakePort implements PortLike {
 const fakeTransport = () => {
   const port = new FakePort();
   const reasons: TerminationReason[] = [];
-  // A bucket that never refills: nothing is dequeued, so everything stays queued.
-  const transport = new BoundedPortTransport(port, (r) => reasons.push(r), new TokenBucket(0, 0));
+  // Nobody calls receive(): nothing is dequeued, so everything stays queued.
+  const transport = new BoundedPortTransport(port, (r) => reasons.push(r));
   return { port, reasons, transport };
 };
 
@@ -71,7 +70,6 @@ const realSession = () => {
     },
     lifecycle: new BridgeLifecycle(),
     onTerminate: (reason) => ended.push(reason),
-    ingress: new TokenBucket(1_000_000, 1_000_000),
   });
   const replies: unknown[][] = [];
   channel.port2.on('message', (data: string) => replies.push(JSON.parse(data)));
@@ -171,7 +169,7 @@ describe('capnweb parse boundaries over a real MessageChannel (T9)', () => {
   });
 });
 
-describe('AppBridge budget boundaries (T9)', () => {
+describe('AppBridge invalid-call boundary (T9)', () => {
   const bridgeWith = (hooks: Partial<{ terminate: (r: string) => void }> = {}) => {
     const executed: UiOperation[] = [];
     const terminated: string[] = [];
@@ -195,34 +193,6 @@ describe('AppBridge budget boundaries (T9)', () => {
       () => 'ok',
       (error: Error) => error.message
     );
-  const summary = { method: 'GET', path: '/summary' };
-
-  it(`operations per lease: ${UI_LIMITS.operationsPerLease} accepted, the next refused`, async () => {
-    let now = 0;
-    jest.spyOn(Date, 'now').mockImplementation(() => now);
-    const { bridge, executed } = bridgeWith();
-    const codes: string[] = [];
-    for (let i = 0; i < UI_LIMITS.operationsPerLease + 1; i++) {
-      now += 1000; // refill the rate bucket so only the per-lease budget applies
-      codes.push(await outcome(bridge.callAppRoute(summary)));
-    }
-    expect(codes.slice(0, UI_LIMITS.operationsPerLease).every((c) => c === 'ok')).toBe(true);
-    expect(codes[UI_LIMITS.operationsPerLease]).toBe('app_rate_limited');
-    expect(executed).toHaveLength(UI_LIMITS.operationsPerLease);
-  });
-
-  it(`operation burst: ${UI_LIMITS.operationsBurst} accepted at one instant, the next refused`, async () => {
-    jest.spyOn(Date, 'now').mockImplementation(() => 0);
-    const { bridge, executed } = bridgeWith();
-    const codes: string[] = [];
-    for (let i = 0; i < UI_LIMITS.operationsBurst + 1; i++) {
-      codes.push(await outcome(bridge.callAppRoute(summary)));
-    }
-    expect(codes.slice(0, UI_LIMITS.operationsBurst).every((c) => c === 'ok')).toBe(true);
-    expect(codes[UI_LIMITS.operationsBurst]).toBe('app_rate_limited');
-    expect(executed).toHaveLength(UI_LIMITS.operationsBurst);
-  });
-
   it(`invalid calls: ${
     UI_LIMITS.invalidCallsBeforeTermination - 1
   } tolerated, the next terminates`, async () => {

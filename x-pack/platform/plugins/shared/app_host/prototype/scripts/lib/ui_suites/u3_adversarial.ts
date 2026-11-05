@@ -11,10 +11,11 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Frame, Page } from '@playwright/test';
-import { readConsent, writeConsent } from '../approval';
+import { approveRelease, setAppEnabled } from '../approval';
 import { LOCAL_DIR } from '../secrets';
 import { DASHBOARD_TITLE, HOSTILE_RULE } from '../ui_seed_state';
 import {
+  childFrame,
   frameStatus,
   openAndAllow,
   pollFrame,
@@ -27,14 +28,13 @@ import { ensureHostile, waitProbe } from './t5_t6_browser';
 import {
   apiHeaders,
   codeOf,
-  createLease,
+  createSession,
   dispatcherConnections,
   execute,
   httpDebugMark,
   httpDebugSince,
   readPanels,
-  revokeAll,
-  type TestLease,
+  type TestSession,
 } from './u2_authority';
 
 const AUDIT_LOG = join(LOCAL_DIR, 'logs', 'app_host_audit.ndjson');
@@ -67,16 +67,11 @@ export const POST_RECORDER = `(() => {
   MessagePort.prototype.postMessage = function (message, ...rest) { record(message); return portPost.call(this, message, ...rest); };
 })();`;
 
-/** Disable via the trusted chrome (parent revokes its lease) before reloading a page. */
+/** Disable via the trusted chrome (the parent drops its handle) before reloading a page. */
 const disableFrame = async (page: Page) => {
   const disable = page.locator('[data-test-subj="appHostDisable"]');
   if (await disable.isEnabled({ timeout: 500 }).catch(() => false)) {
-    await Promise.all([
-      page
-        .waitForResponse((r) => /\/revoke$/.test(r.url()), { timeout: 3000 })
-        .catch(() => undefined),
-      disable.click({ timeout: 1000 }).catch(() => undefined),
-    ]);
+    await disable.click({ timeout: 1000 }).catch(() => undefined);
   }
 };
 
@@ -276,7 +271,7 @@ const runBridgeCorpus = async (ctx: SuiteContext, engine: string) => {
   try {
     const executes: string[] = [];
     s.page.on('request', (request) => {
-      if (/\/leases\/[^/]+\/execute$/.test(request.url())) executes.push(request.url());
+      if (/\/internal\/app_host\/ui\/execute$/.test(request.url())) executes.push(request.url());
     });
     for (const [index, batch] of ABUSE_BATCHES.entries()) {
       if (index > 0) {
@@ -364,20 +359,33 @@ const runBridgeCorpus = async (ctx: SuiteContext, engine: string) => {
 };
 
 // ---------------------------------------------------------------- T8
-const leaseFromResponses = (page: Page) => {
-  const leases: Array<{ leaseId: string; secret: string }> = [];
+/** Handles minted by the page (the parent's session POST responses), for server-side checks. */
+const handlesFromResponses = (page: Page) => {
+  const handles: string[] = [];
   page.on('response', async (response) => {
     if (
       response.request().method() === 'POST' &&
-      /\/internal\/app_host\/ui\/leases$/.test(response.url())
+      /\/internal\/app_host\/ui\/session$/.test(response.url())
     ) {
       const body = (await response.json().catch(() => undefined)) as
-        | { leaseId?: string; secret?: string }
+        | { handle?: string }
         | undefined;
-      if (body?.leaseId && body.secret) leases.push({ leaseId: body.leaseId, secret: body.secret });
+      if (body?.handle) handles.push(body.handle);
     }
   });
-  return leases;
+  return handles;
+};
+
+/** Longer than the server's 2 s enablement/approval cache. */
+const STATE_CACHE_WAIT_MS = 2_100;
+
+/** A user-initiated call from the sample UI (its Refresh button): the next bridge call. */
+const refreshFromFrame = async (page: Page) => {
+  const child = childFrame(page);
+  await child
+    ?.locator('#refresh-summary')
+    .click({ timeout: 5000 })
+    .catch(() => undefined);
 };
 
 const kibanaRestarts = () =>
@@ -399,26 +407,28 @@ export const runT8 = async (ctx: SuiteContext) => {
       const s = await session(ctx, engine, users.viewer);
       try {
         const { page } = s;
-        const leases = leaseFromResponses(page);
+        const handles = handlesFromResponses(page);
         await openBound(page, ctx);
         await sleep(500);
-        const held = leases[leases.length - 1];
-        const heldLease: TestLease = { user: users.viewer, ...held };
-        // 1. Operator disable: the held lease fails on the next call; the frame is removed on poll.
-        const consent = readConsent();
-        if (!consent) throw new Error('no consent');
-        writeConsent({ ...consent, enabled: false });
-        const next = await execute(ctx, heldLease, { op: 'app.summary' });
+        const held: TestSession = { user: users.viewer, handle: handles[handles.length - 1] };
+        // 1. Operator disable (state flip, then key invalidation): the held handle fails on the
+        // next call and the parent tears the frame down on that rejection (no polling).
+        const revoked = await setAppEnabled(false, { esUrl: ctx.es });
+        await sleep(STATE_CACHE_WAIT_MS);
+        const next = await execute(ctx, held, { op: 'app.summary' });
+        await refreshFromFrame(page);
         await waitForStatus(page, /ended: disabled|ended: stale/, 10_000).catch(() => undefined);
         report.expect(
           T,
-          'disable: held token rejected on next call; frame removed on poll',
+          'disable: held handle rejected on next call, keys invalidated; frame removed on the next bridge call',
           engine,
           codeOf(next) === 'app_disabled' &&
+            (revoked?.invalidated ?? 0) >= 1 &&
             (await page.locator('[data-test-subj="appHostGuardianFrame"]').count()) === 0,
-          { next: codeOf(next), status: await frameStatus(page) }
+          { next: codeOf(next), invalidated: revoked?.invalidated, status: await frameStatus(page) }
         );
-        writeConsent({ ...consent, enabled: true });
+        await setAppEnabled(true, { esUrl: ctx.es });
+        await sleep(STATE_CACHE_WAIT_MS);
         // 2. Tampered UI bytes under the approved digest filename → 404, no script executes.
         const assetPath = join(ctx.packageDir, `${ctx.current?.ui.digest}.js`);
         const original = readFileSync(assetPath, 'utf8');
@@ -444,24 +454,27 @@ export const runT8 = async (ctx: SuiteContext) => {
         } finally {
           writeFileSync(assetPath, original);
         }
-        // 3. Unapproved new code (same scopes): old lease stale, no auto-mount.
+        // 3. Unapproved new code (same scopes): old handle stale, no auto-mount.
         await disableFrame(page);
         await page.reload();
         const v1Child = await openBound(page, ctx);
         await readPanels(v1Child);
-        const v1Lease: TestLease = { user: users.viewer, ...leases[leases.length - 1] };
+        const v1: TestSession = { user: users.viewer, handle: handles[handles.length - 1] };
         const restartsBefore = kibanaRestarts();
         const reloadsBefore = wranglerReloads();
         const dispatcherBefore = dispatcherConnections();
         await release(ctx, { label: 'Digest v2', serverLabel: 'Server v2', approve: false });
-        const stale = await execute(ctx, v1Lease, { op: 'app.summary' });
-        await sleep(3500);
+        await sleep(STATE_CACHE_WAIT_MS);
+        const stale = await execute(ctx, v1, { op: 'app.summary' });
+        await refreshFromFrame(page);
+        await waitForStatus(page, /ended: stale/, 10_000).catch(() => undefined);
+        await sleep(1000);
         const allowEnabled = await page
           .locator('[data-test-subj="appHostAllowVersion"]')
           .isEnabled();
         report.expect(
           T,
-          'unapproved v2 (same scopes): old lease app_stale, frame removed, not auto-mounted',
+          'unapproved v2 (same scopes): old handle app_stale, frame removed on the next call, not auto-mounted',
           engine,
           codeOf(stale) === 'app_stale' &&
             (await page.locator('[data-test-subj="appHostGuardianFrame"]').count()) === 0 &&
@@ -469,15 +482,15 @@ export const runT8 = async (ctx: SuiteContext) => {
           { stale: codeOf(stale), allowEnabled }
         );
         // 4. Operator approves v2: S10 — no v1 frame while the v2 prompt is visible; explicit click needed.
-        await (
-          await import('../approval')
-        ).approveRelease({
+        await approveRelease({
           manifest: ctx.current as never,
           esUrl: ctx.es,
           kbUrl: ctx.kibana,
           esAuth: ctx.adminAuth,
           kbAuth: ctx.adminAuth,
         });
+        // No polling: the next page load reads the new metadata.
+        await page.reload();
         await page.locator('[data-test-subj="appHostAllowVersion"]').waitFor();
         await page.waitForFunction(
           () =>
@@ -524,29 +537,28 @@ export const runT8 = async (ctx: SuiteContext) => {
             wranglerReloads: wranglerReloads() - reloadsBefore,
           }
         );
-        // 5. Logout (a principal the other suites never lease for: a logged-out lease cannot be
-        // revoked by the parent and stays until its 5-minute TTL).
+        // 5. Logout: the handle is useless without the viewer's Kibana session.
         const logoutUser = legacyReader();
         if (logoutUser) {
           const l = await session(ctx, engine, logoutUser);
           try {
-            const logoutLeases = leaseFromResponses(l.page);
+            const logoutHandles = handlesFromResponses(l.page);
             await openBound(l.page, ctx);
             await sleep(300);
-            const last = logoutLeases[logoutLeases.length - 1];
+            const last = logoutHandles[logoutHandles.length - 1];
             await l.context.request
               .get(`${ctx.kibana}/api/security/logout`, { maxRedirects: 0 })
               .catch(() => undefined);
             const afterLogout = await l.context.request.post(
-              `${ctx.kibana}/internal/app_host/ui/leases/${last.leaseId}/execute`,
+              `${ctx.kibana}/internal/app_host/ui/execute`,
               {
                 headers: { ...apiHeaders(ctx), 'content-type': 'application/json' },
-                data: { secret: last.secret, operation: { op: 'app.summary' } },
+                data: { handle: last, op: 'app.summary' },
               }
             );
             report.expect(
               T,
-              'logout: lease unusable without the Kibana session',
+              'logout: handle unusable without the Kibana session',
               engine,
               afterLogout.status() === 401,
               afterLogout.status()
@@ -561,44 +573,40 @@ export const runT8 = async (ctx: SuiteContext) => {
       }
     });
   }
-  // Lifecycle races that need a controlled clock or a held lease request run as Jest tests; this
+  // Lifecycle races that need a controlled clock or a held session request run as Jest tests; this
   // harness executes them now and records each one's actual result (never a literal PASS).
   await jestEvidence(
     ctx,
     T,
-    ['server/ui/bridge_service.test.ts', 'public/components/app_ui_page.test.tsx'],
+    [
+      'server/ui/bridge_service.test.ts',
+      'public/components/app_ui_page.test.tsx',
+      'public/ui_host/session_client.test.ts',
+    ],
     [
       [
-        'disable during a pending read: no data returned, lease revoked',
-        'T8: a release change or disable during a pending read returns no data and revokes the lease',
+        'disable / release change refused on the next call after the 2 s state cache',
+        'T8: disable or a release change is refused on the next call once the 2 s state cache expires',
       ],
       [
-        'lease expiry during a pending read: read aborted at expiry, app_expired, no data',
-        'aborts the pending read at expiry and returns app_expired instead of data',
+        'expiry / principal / space / tamper fail closed',
+        'K3: tampered, other-principal, other-space and expired handles are refused',
       ],
       [
-        'expiry / principal / space / secret mismatch fail closed',
-        'binds principal, space and secret; expiry fails closed',
+        'session resolving after Disable never mounts',
+        'a session that resolves after Disable never mounts a frame',
       ],
       [
-        'idle frame torn down and lease released at expiry (parent)',
-        'tears down an idle frame and releases the lease when the lease expires',
+        'session resolving after unmount never mounts',
+        'a session that resolves after unmount never mounts a frame',
       ],
       [
-        'lease resolving after Disable never mounts; released',
-        'a lease that resolves after Disable never mounts a frame and is released',
+        'positive control: a current session mounts exactly one frame',
+        'positive control: a session that resolves while consent is current mounts exactly one frame',
       ],
       [
-        'lease resolving after unmount never mounts; released',
-        'a lease that resolves after unmount never mounts a frame and is released',
-      ],
-      [
-        'lease resolving after a release change never mounts; released',
-        'a lease that resolves after a release change never mounts a frame and is released',
-      ],
-      [
-        'positive control: a current lease mounts exactly one frame',
-        'positive control: a lease that resolves while consent is current mounts exactly one frame',
+        'no metadata polling, no mint before consent',
+        'mints nothing before consent and never polls the metadata',
       ],
     ]
   );
@@ -612,173 +620,172 @@ export const runT10 = async (ctx: SuiteContext) => {
   const before = auditLines().length;
   const httpMark = httpDebugMark();
   const kibanaAuditBefore = auditLines(KIBANA_AUDIT_LOG).length;
-  const secrets: string[] = [];
-  const leaseIds: string[] = [];
-  try {
-    const lease = (await createLease(ctx, users.viewer2)).lease as TestLease;
-    secrets.push(lease.secret);
-    leaseIds.push(lease.leaseId);
-    await execute(
-      ctx,
-      lease,
-      { op: 'app.summary' },
-      { headers: { 'x-kbn-app-id': 'spoofed-app' } }
-    );
-    await execute(ctx, lease, {
-      op: 'kibana.dashboard.read',
-      params: { id: ctx.seed.dashboardId },
-    });
-    await execute(ctx, lease, { op: 'es.search', params: { index: '.security-7', size: 1 } });
-    const injected = `\r\n{"event":{"action":"forged"}}\u001b[31m${'x'.repeat(300)}`;
-    await execute(ctx, lease, { op: injected });
-    await execute(
-      ctx,
-      { ...lease, leaseId: 'B'.repeat(32) },
-      { op: 'app.summary' },
-      { headers: { 'x-kbn-app-id': 'spoofed-app' } }
-    );
-    // Browser session: window/port payloads must never carry the lease secret.
-    for (const engine of ctx.engines) {
-      const s = await session(ctx, engine, users.viewer2, POST_RECORDER);
-      try {
-        const leases = leaseFromResponses(s.page);
-        const child = await openBound(s.page, ctx);
-        await readPanels(child);
-        await sleep(500);
-        const frames = s.page.frames();
-        const posted: string[] = [];
-        for (const frame of frames) {
-          posted.push(
-            ...((await frame
-              .evaluate(() => (window as unknown as { __posted?: string[] }).__posted ?? [])
-              .catch(() => [])) as string[])
-          );
-        }
-        leases.forEach((l) => {
-          secrets.push(l.secret);
-          leaseIds.push(l.leaseId);
-        });
-        const leaked = posted.filter((p) => leases.some((l) => p.includes(l.secret)));
-        report.expect(
-          T,
-          'S11: lease secret never in window or port messages',
-          engine,
-          leases.length > 0 && posted.length > 0 && leaked.length === 0,
-          { messages: posted.length, leaked: leaked.length }
+  const handles: string[] = [];
+  const held = (await createSession(ctx, users.viewer2)).session as TestSession;
+  handles.push(held.handle);
+  await execute(ctx, held, { op: 'app.summary' }, { headers: { 'x-kbn-app-id': 'spoofed-app' } });
+  await execute(ctx, held, {
+    op: 'kibana.dashboard.read',
+    params: { id: ctx.seed.dashboardId },
+  });
+  await execute(ctx, held, { op: 'es.search', params: { index: '.security-7', size: 1 } });
+  const injected = `\r\n{"event":{"action":"forged"}}\u001b[31m${'x'.repeat(300)}`;
+  await execute(ctx, held, { op: injected });
+  await execute(
+    ctx,
+    held,
+    { op: 'app.summary' },
+    { handle: `${'0'.repeat(64)}.${'B'.repeat(60)}`, headers: { 'x-kbn-app-id': 'spoofed-app' } }
+  );
+  // Browser session: window/port payloads must never carry the handle.
+  for (const engine of ctx.engines) {
+    const s = await session(ctx, engine, users.viewer2, POST_RECORDER);
+    try {
+      const pageHandles = handlesFromResponses(s.page);
+      const child = await openBound(s.page, ctx);
+      await readPanels(child);
+      await sleep(500);
+      const frames = s.page.frames();
+      const posted: string[] = [];
+      for (const frame of frames) {
+        posted.push(
+          ...((await frame
+            .evaluate(() => (window as unknown as { __posted?: string[] }).__posted ?? [])
+            .catch(() => [])) as string[])
         );
-      } finally {
-        await s.close();
       }
+      handles.push(...pageHandles);
+      const leaked = posted.filter((p) =>
+        pageHandles.some((h) => p.includes(h) || p.includes(h.split('.')[1]))
+      );
+      report.expect(
+        T,
+        'S11: the session handle never in window or port messages',
+        engine,
+        pageHandles.length > 0 && posted.length > 0 && leaked.length === 0,
+        { messages: posted.length, leaked: leaked.length }
+      );
+    } finally {
+      await s.close();
     }
-    await sleep(1500);
-    const records = auditLines()
-      .slice(before)
-      .map((line) => JSON.parse(line) as Record<string, any>);
-    const raw = auditLines().slice(before).join('\n');
-    const viewerRecords = records.filter((r) => r.user?.name === users.viewer2.username);
-    const summary = viewerRecords.find(
-      (r) => r.app?.capability === 'app.summary' && r.event?.outcome === 'success'
-    );
-    report.expect(
-      T,
-      'success + denial records carry lease-derived app/release/viewer/space/capability/outcome/reason + correlation id',
-      T === 'T10' ? 'http' : 'http',
-      Boolean(summary) &&
-        summary?.app?.id === 'alert-digest' &&
-        summary?.app?.release_digest === ctx.current?.releaseDigest &&
-        summary?.kibana?.space_id === 'default' &&
-        /^[0-9a-f-]{36}$/.test(summary?.kibana?.correlation_id ?? '') &&
-        viewerRecords.some(
-          (r) =>
-            r.event?.outcome === 'failure' &&
-            r.event?.reason === 'resource_not_granted' &&
-            r.app?.capability === 'es.search'
-        ),
-      { sample: summary }
-    );
-    report.expect(
-      T,
-      'spoofed x-kbn-app-id cannot alter attribution; invalid lease has no app actor',
-      'http',
-      !raw.includes('spoofed-app') &&
-        records.some((r) => r.event?.reason === 'unknown_lease' && r.app === undefined)
-    );
-    const worker = viewerRecords.find(
-      (r) => r.app?.via === 'app.summary' && r.app?.capability === 'es.search'
-    );
-    report.expect(
-      T,
-      'S9: Worker-path HostEs read attributed with the wrapper correlation id',
-      'http',
-      Boolean(worker) && worker?.kibana?.correlation_id === summary?.kibana?.correlation_id,
-      { worker: worker?.kibana?.correlation_id, wrapper: summary?.kibana?.correlation_id }
-    );
-    const injectedRecord = records.find(
-      (r) =>
-        String(r.app?.capability ?? '').includes('event') || r.event?.reason === 'invalid_operation'
-    );
-    report.expect(
-      T,
-      'CRLF/ANSI/oversize input cannot inject records',
-      'http',
-      !raw.includes('"action":"forged"') &&
-        auditLines()
-          .slice(before)
-          .every((line) => line.startsWith('{')) &&
-        !/[\r\u001b]/.test(raw) &&
-        String(injectedRecord?.app?.capability ?? '').length <= 64,
-      { capability: injectedRecord?.app?.capability }
-    );
-    const logs = [
-      auditLines().slice(before).join('\n'),
-      httpDebugSince(httpMark).join('\n'),
-      readFileSync(join(LOCAL_DIR, 'logs', process.env.KIBANA_LOG ?? 'kibana4.log'), 'utf8'),
-      auditLines(KIBANA_AUDIT_LOG).join('\n'),
-    ];
-    const secretLeaks = secrets.filter((secret) => logs.some((log) => log.includes(secret)));
-    report.expect(
-      T,
-      'S11: lease secrets absent from audit, Kibana, security-audit and http.server.response debug logs',
-      'http',
-      secrets.length > 0 && secretLeaks.length === 0 && httpDebugSince(httpMark).length > 100,
-      {
-        secretsChecked: secrets.length,
-        leaks: secretLeaks.length,
-        httpDebugLines: httpDebugSince(httpMark).length,
-      }
-    );
-    report.expect(
-      T,
-      'no replayable lease ids, tokens, payloads or raw errors in bridge audit records',
-      'http',
-      leaseIds.every((id) => !raw.includes(id)) &&
-        !raw.includes(HOSTILE_RULE) &&
-        !raw.includes('Synthetic <b>') &&
-        !/\bat\s.+\.ts:/.test(raw)
-    );
-    const kibanaAudit = auditLines(KIBANA_AUDIT_LOG)
-      .slice(kibanaAuditBefore)
-      .map((line) => JSON.parse(line) as Record<string, any>);
-    const dashboardRecord = viewerRecords.find(
-      (r) => r.app?.capability === 'kibana.dashboard.read' && r.event?.outcome === 'success'
-    );
-    const native = kibanaAudit.find(
-      (r) =>
-        r.user?.name === users.viewer2.username && JSON.stringify(r).includes(ctx.seed.dashboardId)
-    );
-    report.expect(
-      T,
-      'Dashboard read correlates with Kibana’s own security audit (user + object + time)',
-      'http',
-      Boolean(dashboardRecord) && Boolean(native),
-      {
-        bridge: dashboardRecord?.['@timestamp'],
-        native: native ? { action: native.event?.action, at: native['@timestamp'] } : null,
-      }
-    );
-  } finally {
-    await revokeAll(ctx);
   }
+  await sleep(1500);
+  const records = auditLines()
+    .slice(before)
+    .map((line) => JSON.parse(line) as Record<string, any>);
+  const raw = auditLines().slice(before).join('\n');
+  const viewerRecords = records.filter((r) => r.user?.name === users.viewer2.username);
+  const summary = viewerRecords.find(
+    (r) => r.app?.capability === 'app.summary' && r.event?.outcome === 'success'
+  );
+  report.expect(
+    T,
+    'success + denial records carry handle-derived app/release/viewer/space/capability/outcome/reason + api_key.id + correlation id',
+    T === 'T10' ? 'http' : 'http',
+    Boolean(summary) &&
+      summary?.app?.id === 'alert-digest' &&
+      summary?.app?.release_digest === ctx.current?.releaseDigest &&
+      summary?.kibana?.space_id === 'default' &&
+      /^[0-9a-f-]{36}$/.test(summary?.kibana?.correlation_id ?? '') &&
+      typeof summary?.api_key?.id === 'string' &&
+      viewerRecords.some(
+        (r) =>
+          r.event?.outcome === 'failure' &&
+          r.event?.reason === 'resource_not_granted' &&
+          r.app?.capability === 'es.search'
+      ),
+    { sample: summary }
+  );
+  report.expect(
+    T,
+    'spoofed x-kbn-app-id cannot alter attribution; invalid handle has no app actor',
+    'http',
+    !raw.includes('spoofed-app') &&
+      records.some(
+        (r) => r.event?.reason === 'bad_handle' && r.app === undefined && r.api_key === undefined
+      )
+  );
+  const worker = viewerRecords.find(
+    (r) => r.app?.via === 'app.summary' && r.app?.capability === 'es.search'
+  );
+  report.expect(
+    T,
+    'S9: Worker-path HostEs read attributed with the wrapper correlation id',
+    'http',
+    Boolean(worker) && worker?.kibana?.correlation_id === summary?.kibana?.correlation_id,
+    { worker: worker?.kibana?.correlation_id, wrapper: summary?.kibana?.correlation_id }
+  );
+  const injectedRecord = records.find(
+    (r) =>
+      String(r.app?.capability ?? '').includes('event') || r.event?.reason === 'invalid_operation'
+  );
+  report.expect(
+    T,
+    'CRLF/ANSI/oversize input cannot inject records',
+    'http',
+    !raw.includes('"action":"forged"') &&
+      auditLines()
+        .slice(before)
+        .every((line) => line.startsWith('{')) &&
+      !/[\r\u001b]/.test(raw) &&
+      String(injectedRecord?.app?.capability ?? '').length <= 64,
+    { capability: injectedRecord?.app?.capability }
+  );
+  const logs = [
+    auditLines().slice(before).join('\n'),
+    httpDebugSince(httpMark).join('\n'),
+    readFileSync(join(LOCAL_DIR, 'logs', process.env.KIBANA_LOG ?? 'kibana4.log'), 'utf8'),
+    auditLines(KIBANA_AUDIT_LOG).join('\n'),
+    auditLines(join(LOCAL_DIR, 'logs', 'kibana_debug.ndjson')).join('\n'),
+  ];
+  const handleLeaks = handles.filter((handle) =>
+    logs.some((log) => log.includes(handle.split('.')[1]))
+  );
+  const keyLeaks = logs.filter((log) => /ApiKey [A-Za-z0-9+/=]{20,}|"api_key"\s*:\s*"/.test(log));
+  report.expect(
+    T,
+    'S11: handles and API keys absent from audit, Kibana, security-audit, kibana_debug and http.server.response debug logs',
+    'http',
+    handles.length > 0 &&
+      handleLeaks.length === 0 &&
+      keyLeaks.length === 0 &&
+      httpDebugSince(httpMark).length > 100,
+    {
+      handlesChecked: handles.length,
+      leaks: handleLeaks.length,
+      keyPatternHits: keyLeaks.length,
+      httpDebugLines: httpDebugSince(httpMark).length,
+    }
+  );
+  report.expect(
+    T,
+    'no handles, keys, tokens, payloads or raw errors in bridge audit records',
+    'http',
+    handles.every((handle) => !raw.includes(handle.split('.')[1])) &&
+      !raw.includes(HOSTILE_RULE) &&
+      !raw.includes('Synthetic <b>') &&
+      !/\bat\s.+\.ts:/.test(raw)
+  );
+  const kibanaAudit = auditLines(KIBANA_AUDIT_LOG)
+    .slice(kibanaAuditBefore)
+    .map((line) => JSON.parse(line) as Record<string, any>);
+  const dashboardRecord = viewerRecords.find(
+    (r) => r.app?.capability === 'kibana.dashboard.read' && r.event?.outcome === 'success'
+  );
+  const native = kibanaAudit.find(
+    (r) =>
+      r.user?.name === users.viewer2.username && JSON.stringify(r).includes(ctx.seed.dashboardId)
+  );
+  report.expect(
+    T,
+    'Dashboard read correlates with Kibana’s own security audit (user + object + time)',
+    'http',
+    Boolean(dashboardRecord) && Boolean(native),
+    {
+      bridge: dashboardRecord?.['@timestamp'],
+      native: native ? { action: native.event?.action, at: native['@timestamp'] } : null,
+    }
+  );
 };
 
 export { pollFrame };

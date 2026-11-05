@@ -22,7 +22,7 @@ const codeOf = async (promise: Promise<unknown>) => {
 };
 
 describe('SearchCapability', () => {
-  it('builds the search itself, as the current user, and returns bounded records', async () => {
+  it('builds the search itself with the scoped client and returns bounded records', async () => {
     const client = createScopedClient();
     client.search.mockResponse(searchResponse());
     const capability = new SearchCapability(client);
@@ -115,10 +115,15 @@ describe('SearchCapability', () => {
     expect(capability.stats.esDenied).toBe(false);
   });
 
-  it('refuses hits from any other index (alias resolution)', async () => {
+  it('K1 fault injection: anyIndex skips only the index literal; Elasticsearch decides', async () => {
     const client = createScopedClient();
-    client.search.mockResponse(searchResponse(undefined, '.kibana_1'));
-    expect(await codeOf(new SearchCapability(client).search(params))).toBe('index_not_granted');
+    client.search.mockRejectedValue(responseError(403));
+    const capability = new SearchCapability(client, { anyIndex: true });
+    expect(await codeOf(capability.search({ index: '.security', size: 1 }))).toBe('es_forbidden');
+    expect(client.search.mock.calls[0][0]).toEqual(expect.objectContaining({ index: '.security' }));
+    expect(
+      await codeOf(new SearchCapability(client, { anyIndex: true }).search({ index: 'x', size: 0 }))
+    ).toBe('invalid_search');
   });
 
   it('drops malformed records and bounds the result size', async () => {

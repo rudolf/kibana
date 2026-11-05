@@ -8,20 +8,24 @@
 // Operator commands on the local approval file (not reachable through the bridge):
 //   npm run ui:operator -- disable | enable | status | reset
 // `reset` removes the approval (uninstall); the next approval starts a new version history.
+// `disable` and `reset` flip the state first, then invalidate every app session key of the app
+// (by name, as Kibana's internal user; ES_URL, KIBANA_SYSTEM_AUTH).
 
 import { rmSync } from 'node:fs';
-import { CONSENT_FILE, readConsent, writeConsent } from './lib/approval';
+import { invalidateAppKeys, type InvalidationResult } from './lib/app_keys';
+import { CONSENT_FILE, readConsent, setAppEnabled } from './lib/approval';
 
 const [command] = process.argv.slice(2);
 const consent = readConsent();
+let revoked: InvalidationResult | undefined;
 switch (command) {
   case 'disable':
   case 'enable':
-    if (!consent) throw new Error('No approval to change');
-    writeConsent({ ...consent, enabled: command === 'enable' });
+    revoked = await setAppEnabled(command === 'enable');
     break;
   case 'reset':
     rmSync(CONSENT_FILE, { force: true });
+    if (consent) revoked = await invalidateAppKeys({ appId: consent.appId });
     break;
   case 'status':
     break;
@@ -35,5 +39,6 @@ process.stdout.write(
     consent: after
       ? { enabled: after.enabled, version: after.approvedVersion, approvedBy: after.approvedBy }
       : null,
+    revoked,
   })}\n`
 );
