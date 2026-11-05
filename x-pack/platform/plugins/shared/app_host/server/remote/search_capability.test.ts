@@ -56,8 +56,6 @@ describe('SearchCapability', () => {
     ['cross-cluster', { index: 'remote:kbn-apps-prototype-alerts', size: 1 }, 'index_not_granted'],
     ['array', { index: ['kbn-apps-prototype-alerts'], size: 1 }, 'index_not_granted'],
     ['other index', { index: '.alerts-security.alerts-default', size: 1 }, 'index_not_granted'],
-    ['size 0', { index: 'kbn-apps-prototype-alerts', size: 0 }, 'invalid_search'],
-    ['size 101', { index: 'kbn-apps-prototype-alerts', size: 101 }, 'invalid_search'],
     ['fractional size', { index: 'kbn-apps-prototype-alerts', size: 1.5 }, 'invalid_search'],
     ['string size', { index: 'kbn-apps-prototype-alerts', size: '1' }, 'invalid_search'],
     ['query DSL', { ...params, query: { match_all: {} } }, 'invalid_search'],
@@ -66,15 +64,6 @@ describe('SearchCapability', () => {
     const client = createScopedClient();
     expect(await codeOf(new SearchCapability(client).search(input))).toBe(code);
     expect(client.search).not.toHaveBeenCalled();
-  });
-
-  it('allows one callback per invocation', async () => {
-    const client = createScopedClient();
-    client.search.mockResponse(searchResponse());
-    const capability = new SearchCapability(client);
-    await capability.search(params);
-    expect(await codeOf(capability.search(params))).toBe('callback_budget');
-    expect(client.search).toHaveBeenCalledTimes(1);
   });
 
   it('rejects calls after revocation and aborts in-flight requests', async () => {
@@ -122,11 +111,13 @@ describe('SearchCapability', () => {
     expect(await codeOf(capability.search({ index: '.security', size: 1 }))).toBe('es_forbidden');
     expect(client.search.mock.calls[0][0]).toEqual(expect.objectContaining({ index: '.security' }));
     expect(
-      await codeOf(new SearchCapability(client, { anyIndex: true }).search({ index: 'x', size: 0 }))
+      await codeOf(
+        new SearchCapability(client, { anyIndex: true }).search({ index: 'x', size: 1.5 })
+      )
     ).toBe('invalid_search');
   });
 
-  it('drops malformed records and bounds the result size', async () => {
+  it('drops malformed records', async () => {
     const client = createScopedClient();
     const docs = [
       { severity: 'HIGH', rule: 'a' },
@@ -137,7 +128,6 @@ describe('SearchCapability', () => {
     client.search.mockResponse(searchResponse(docs));
     const result = await new SearchCapability(client).search(params);
     expect(result.records.every(({ severity }) => severity === 'low')).toBe(true);
-    expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(16 * 1024);
-    expect(result.records.length).toBeLessThan(100);
+    expect(result.records).toHaveLength(100);
   });
 });

@@ -15,23 +15,14 @@ export const COMPATIBILITY_DATE = '2026-11-04';
 export const APP_CPU_MS = 50;
 export const APP_SUBREQUESTS = 5;
 
-export const MAX_MANIFEST_BYTES = 16 * 1024;
-export const MAX_BUNDLE_BYTES = 64 * 1024;
-export const MAX_CALLBACK_RESULT_BYTES = 16 * 1024;
-export const MAX_CALLBACK_RECORDS = 100;
-export const MAX_APP_RESULT_BYTES = 16 * 1024;
-export const MAX_CALLBACKS_PER_INVOCATION = 1;
 export const UNAUTHENTICATED_IDLE_MS = 2000;
 export const MAX_RULE_LENGTH = 128;
 
-export const RPC_LIMITS = {
-  maxMessageSize: 256 * 1024,
-  maxDepth: 32,
-  maxBigIntDigits: 64,
-} as const;
-
-/** Upper bound on bytes buffered by a transport before the session is aborted. */
-export const MAX_QUEUED_TRANSPORT_BYTES = 4 * RPC_LIMITS.maxMessageSize;
+/**
+ * The transport's one bound: bytes of frames received but not yet read by capnweb, counted as 2
+ * bytes per UTF-16 code unit (same as Kibana's `RECEIVE_QUEUE_BYTES`). Overflow ends the session.
+ */
+export const MAX_QUEUED_TRANSPORT_BYTES = 8 * 1024 * 1024;
 
 const encoder = new TextEncoder();
 
@@ -166,12 +157,9 @@ export const parseInvokeRequest = (value: unknown): InvokeRequest => {
   if (!isPlainObject(value)) throw new ProtocolError('invalid_request', 'invoke: not an object');
   exactKeys(value, ['manifest', 'bundle', 'invocationId'], 'invoke');
   const manifest = parseManifest(value.manifest);
-  if (byteLength(JSON.stringify(manifest)) > MAX_MANIFEST_BYTES) {
-    throw new ProtocolError('invalid_manifest', 'manifest: too large');
-  }
   const { bundle, invocationId } = value;
-  if (typeof bundle !== 'string' || bundle.length === 0 || byteLength(bundle) > MAX_BUNDLE_BYTES) {
-    throw new ProtocolError('invalid_bundle', 'bundle: missing or too large');
+  if (typeof bundle !== 'string' || bundle.length === 0) {
+    throw new ProtocolError('invalid_bundle', 'bundle: missing');
   }
   boundedString(invocationId, 36, 'invocationId', INVOCATION_ID_PATTERN);
   return { manifest, bundle, invocationId: invocationId as string };
@@ -188,13 +176,8 @@ export const parseSearchParams = (value: unknown): SearchParams => {
   if (index !== SYNTHETIC_INDEX) {
     throw new ProtocolError('index_not_granted', 'search: index not granted');
   }
-  if (
-    typeof size !== 'number' ||
-    !Number.isInteger(size) ||
-    size < 1 ||
-    size > MAX_CALLBACK_RECORDS
-  ) {
-    throw new ProtocolError('invalid_search', 'search: size must be an integer 1-100');
+  if (typeof size !== 'number' || !Number.isInteger(size)) {
+    throw new ProtocolError('invalid_search', 'search: size must be an integer');
   }
   return { index, size };
 };
@@ -211,7 +194,7 @@ export const parseSearchResult = (value: unknown): SearchResult => {
   if (typeof total !== 'number' || !Number.isInteger(total) || total < 0 || total > 1_000_000_000) {
     throw new ProtocolError('invalid_result', 'search result: invalid total');
   }
-  if (!Array.isArray(records) || records.length > MAX_CALLBACK_RECORDS) {
+  if (!Array.isArray(records)) {
     throw new ProtocolError('invalid_result', 'search result: invalid records');
   }
   const parsed: SearchRecord[] = records.map((record) => {
@@ -226,17 +209,12 @@ export const parseSearchResult = (value: unknown): SearchResult => {
     const rule = boundedString(record.rule, MAX_RULE_LENGTH, 'record.rule');
     return { severity, rule };
   });
-  const result = { total, records: parsed };
-  if (byteLength(JSON.stringify(result)) > MAX_CALLBACK_RESULT_BYTES) {
-    throw new ProtocolError('invalid_result', 'search result: too large');
-  }
-  return result;
+  return { total, records: parsed };
 };
 
-/** Checks that an app result is plain JSON data within size and depth bounds. */
+/** Checks that an app result is plain JSON data. Kibana validates its exact shape. */
 export const parseAppResult = (value: unknown): unknown => {
-  const check = (node: unknown, depth: number): void => {
-    if (depth > 8) throw new ProtocolError('invalid_app_result', 'app result: too deep');
+  const check = (node: unknown): void => {
     if (node === null || typeof node === 'string' || typeof node === 'boolean') return;
     if (typeof node === 'number') {
       if (!Number.isFinite(node))
@@ -244,21 +222,17 @@ export const parseAppResult = (value: unknown): unknown => {
       return;
     }
     if (Array.isArray(node)) {
-      node.forEach((child) => check(child, depth + 1));
+      node.forEach(check);
       return;
     }
     if (isPlainObject(node)) {
-      Object.values(node).forEach((child) => check(child, depth + 1));
+      Object.values(node).forEach(check);
       return;
     }
     throw new ProtocolError('invalid_app_result', 'app result: unsupported type');
   };
-  check(value, 0);
-  const encoded = JSON.stringify(value);
-  if (encoded === undefined || byteLength(encoded) > MAX_APP_RESULT_BYTES) {
-    throw new ProtocolError('invalid_app_result', 'app result: too large');
-  }
-  return JSON.parse(encoded);
+  check(value);
+  return JSON.parse(JSON.stringify(value));
 };
 
 export const sha256Hex = async (text: string): Promise<string> => {

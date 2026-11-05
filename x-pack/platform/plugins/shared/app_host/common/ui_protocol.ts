@@ -9,7 +9,7 @@
 // Pure TypeScript: shared by the trusted parent page and the server. The server stays
 // authoritative; the parent repeats the checks only to fail early.
 
-import { INSTALLED_APP_ID } from './constants';
+import { INSTALLED_APP_ID, RECEIVE_QUEUE_BYTES } from './constants';
 
 export const UI_BRIDGE_API = 1;
 /** Protocol tag carried by every bootstrap window/port message. */
@@ -60,12 +60,8 @@ export const UI_LIMITS = {
   uiBundleBytes: 512 * 1024,
   hostScriptBytes: 256 * 1024,
   frameHeightPx: 480,
-  /**
-   * The bridge Worker's only bound: bytes of guest frames queued before capnweb reads them,
-   * counted as 2 bytes per UTF-16 code unit. Overflow ends the session and the Worker.
-   */
-  receiveQueueBytes: 8 * 1024 * 1024,
-  operationDeadlineMs: 5000,
+  /** The bridge Worker's only bound (see `RECEIVE_QUEUE_BYTES`); overflow ends the Worker. */
+  receiveQueueBytes: RECEIVE_QUEUE_BYTES,
   /** App session (restricted API key and its handle) lifetime. */
   sessionTtlMs: 60 * 60 * 1000,
   /** Maximum age of the cached enablement/approval state read on every execute. */
@@ -81,8 +77,6 @@ export const BRIDGE_ERROR_CODES = [
   'app_stale',
   'app_disabled',
   'app_expired',
-  'app_rate_limited',
-  'app_timeout',
   'app_cpu_limit',
   'bridge_invalid_request',
   'bridge_protocol_error',
@@ -204,9 +198,7 @@ export const parseUiOperation = (value: unknown): UiOperation | undefined => {
       if (!hasExactKeys(params, ['index', 'size'])) return undefined;
       const { index, size } = params;
       if (typeof index !== 'string' || index.length > 255) return undefined;
-      if (typeof size !== 'number' || !Number.isInteger(size) || size < 1 || size > 100) {
-        return undefined;
-      }
+      if (typeof size !== 'number' || !Number.isInteger(size)) return undefined;
       return { op: 'es.search', params: { index, size } };
     }
     case 'kibana.dashboard.read': {

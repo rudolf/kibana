@@ -42,9 +42,7 @@ describe('toSummaryResponse', () => {
   });
 
   it.each<[SummaryOutcome, number, boolean]>([
-    [{ status: 'busy' }, 429, false],
     [{ status: 'invalid_package', code: 'digest_mismatch' }, 500, false],
-    [{ status: 'deadline' }, 504, true],
     [{ status: 'remote_error', code: 'app_cpu_limit' }, 502, true],
     [{ status: 'invalid_output' }, 502, true],
   ])('maps %p to %s (dispatcher entry: %s)', (outcome, statusCode, reached) => {

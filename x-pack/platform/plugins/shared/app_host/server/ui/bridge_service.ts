@@ -67,8 +67,6 @@ const STATUS: Record<BridgeErrorCode, number> = {
   app_disabled: 403,
   // Never 401: Kibana's browser client treats 401 as an expired *Kibana* session.
   app_expired: 403,
-  app_rate_limited: 429,
-  app_timeout: 504,
   app_cpu_limit: 502,
   bridge_invalid_request: 400,
   bridge_protocol_error: 400,
@@ -107,11 +105,8 @@ const summaryOutcome = (outcome: SummaryOutcome): OperationOutcome => {
       return { ok: true, result: { ...outcome.body } };
     case 'es_forbidden':
       return { ok: false, code: 'app_denied', reason: 'native_denied' };
-    case 'deadline':
     case 'aborted':
-      return { ok: false, code: 'app_timeout', reason: 'deadline' };
-    case 'busy':
-      return { ok: false, code: 'app_rate_limited', reason: 'process_limit' };
+      return { ok: false, code: 'app_unavailable', reason: 'aborted' };
     case 'release_mismatch':
       return { ok: false, code: 'app_stale', reason: 'stale_release' };
     case 'remote_error':
@@ -238,7 +233,7 @@ export class BridgeService {
             return { ok: false, code: 'app_denied', reason: 'resource_not_granted' };
           }
           if (error.code === 'host_revoked') {
-            return { ok: false, code: 'app_timeout', reason: 'deadline' };
+            return { ok: false, code: 'app_unavailable', reason: 'aborted' };
           }
         }
         return { ok: false, code: 'app_unavailable', reason: 'native_failed' };
@@ -475,39 +470,20 @@ export class BridgeService {
     }
     const handler = this.#registry.get(operation.op);
     if (!handler) return deny('bridge_invalid_request', 'invalid_operation');
-    // 4. Run as the key: request abort or the 5 s deadline aborts the operation.
-    const controller = new AbortController();
-    const abort = () => controller.abort();
-    caller.requestAborted.addEventListener('abort', abort, { once: true });
-    if (caller.requestAborted.aborted) abort();
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      const timedOut = new Promise<OperationOutcome>((resolve) => {
-        timer = setTimeout(() => {
-          abort();
-          resolve({ ok: false, code: 'app_timeout', reason: 'deadline' });
-        }, UI_LIMITS.operationDeadlineMs);
-      });
-      const outcome = await Promise.race([
-        handler({
-          operation,
-          session,
-          app: sessionApp,
-          clients: caller.asKey({ id: session.id, apiKey: session.apiKey }),
-          caller,
-          signal: controller.signal,
-          correlationId,
-        }).catch(
-          (): OperationOutcome => ({ ok: false, code: 'app_unavailable', reason: 'native_failed' })
-        ),
-        timedOut,
-      ]);
-      if (!outcome.ok) return deny(outcome.code, outcome.reason);
-      this.#record(sessionApp, caller, operation.op, 'success', 'ok', correlationId);
-      return { status: 200, body: { ok: true, result: outcome.result } };
-    } finally {
-      if (timer) clearTimeout(timer);
-      caller.requestAborted.removeEventListener('abort', abort);
-    }
+    // 4. Run as the key; a request abort (client gone) aborts the operation.
+    const outcome = await handler({
+      operation,
+      session,
+      app: sessionApp,
+      clients: caller.asKey({ id: session.id, apiKey: session.apiKey }),
+      caller,
+      signal: caller.requestAborted,
+      correlationId,
+    }).catch(
+      (): OperationOutcome => ({ ok: false, code: 'app_unavailable', reason: 'native_failed' })
+    );
+    if (!outcome.ok) return deny(outcome.code, outcome.reason);
+    this.#record(sessionApp, caller, operation.op, 'success', 'ok', correlationId);
+    return { status: 200, body: { ok: true, result: outcome.result } };
   }
 }

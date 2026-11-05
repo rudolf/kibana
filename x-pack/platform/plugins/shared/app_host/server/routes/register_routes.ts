@@ -84,11 +84,8 @@ const nativeReason = (outcome: SummaryOutcome): AuditReason => {
       return 'ok';
     case 'es_forbidden':
       return 'native_denied';
-    case 'deadline':
     case 'aborted':
-      return 'deadline';
-    case 'busy':
-      return 'process_limit';
+      return 'aborted';
     case 'release_mismatch':
       return 'stale_release';
     default:

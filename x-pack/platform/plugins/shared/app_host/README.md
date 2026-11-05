@@ -13,21 +13,23 @@ saved objects or tasks. App-authored browser code never runs in Kibana's origin.
 ## What it does
 
 - `GET /api/apps/{appId}/summary` (public, requires `read_app_host` **and** `read_app_alert_digest`):
-  1. limits in-flight invocations to four per Kibana process (excess → `429`);
-  2. reads `manifest.json` from `xpack.app_host.packagePath` **on every request**, then
-     `<digest>.js`, and verifies the SHA-256 digest (bounded: manifest 16 KiB, bundle 64 KiB).
-     An invalid package fails closed with `500` before any remote call;
-  3. opens a **fresh** WebSocket to the dispatcher, sends the caller token to `authenticate`, and
+  1. reads `manifest.json` from `xpack.app_host.packagePath` **on every request** (regular files
+     only, no symlinks), parses it against the schema, then reads `<digest>.js` and verifies the
+     SHA-256 digest. An invalid package fails closed with `500` before any remote call. There is no
+     size cap of the host's own; Cloudflare enforces its script size limits;
+  2. opens a **fresh** WebSocket to the dispatcher, sends the caller token to `authenticate`, and
      only then calls `invoke({manifest, bundle, invocationId}, host)`. Nothing on the Node side is
      reachable before authentication;
-  4. `host` is a fresh `@remotable` `HostEs` facade exposed with `@kbn/core-remote-common`'s
-     `expose`. Its only method is `search({index, size})`: exact index `kbn-apps-prototype-alerts`,
-     integer size 1–100, one call per invocation, run with the route's `asCurrentUser` client.
-     Results are `{total, records: [{severity, rule}]}`, at most 100 records and 16 KiB;
-  5. enforces a 5 s deadline (`504`). In `finally`, it revokes the capability, aborts in-flight
-     Elasticsearch work, closes the socket and disposes stubs. Request abort revokes immediately.
-     Nothing is replayed;
-  6. validates the app output as exactly `{label, counts: {high, low}}`, and returns host-owned JSON
+  3. `host` is a fresh `@remotable` `HostEs` facade exposed with `@kbn/core-remote-common`'s
+     `expose`. Its only method is `search({index, size})`: exact index `kbn-apps-prototype-alerts`
+     and an integer size (Elasticsearch applies its own limits), run with the route's
+     `asCurrentUser` client. Results are `{total, records: [{severity, rule}]}`;
+  4. has no invocation limiter, callback budget or host deadline: like any API client, an app gets
+     Kibana's and Elasticsearch's own limits; the Dynamic Worker keeps Cloudflare's CPU and
+     subrequest limits. In `finally`, and immediately on request abort or a dispatcher disconnect,
+     it revokes the capability, aborts in-flight Elasticsearch work, closes the socket and disposes
+     stubs. Nothing is replayed;
+  5. validates the app output as exactly `{label, counts: {high, low}}`, and returns host-owned JSON
      `{appId, version, label, counts}`. An Elasticsearch authorization failure is a `403`, whatever
      the app returned. Other remote failures are a sanitized `502`.
 - Responses that reached the dispatcher carry a host-owned `x-app-host-timing` header. It starts
@@ -168,18 +170,18 @@ U2 — delegation and consent:
     formats included; `server/ui/data_views.ts`; redirects and non-200 fail closed). Data view ids are
     `[A-Za-z0-9_][A-Za-z0-9_.:*-]*`, ≤ 128 characters;
   - `es.esql` via `esql.query` on the key-scoped ES client (`server/ui/esql.ts`): any non-empty query,
-    no command allowlist, `maxRetries: 0`, 5 s request timeout; the response's `columns` and `values`
+    no command allowlist, `maxRetries: 0`, the ES client's own request timeout; the response's `columns` and `values`
     as Elasticsearch sent them. Row limits are Elasticsearch's (the query's `LIMIT` and the cluster's
     ES|QL limits);
   - `app.summary` → backend Worker → `HostEs` callbacks with the same key-scoped client.
 
-  No result size caps. 5 s deadline. Native refusals map
+  No result size caps and no host deadline; a request abort aborts the operation. Native refusals map
   to `app_denied`, with the audit reason `native_denied` for a 401/403/404 and `native_rejected` for a
   400: ES|QL reports an index the key may not read exactly like a missing one (`400 Unknown index`), and
   the Data Views API reports an unauthorized saved-object read as `400 Unable to bulk_get
   index-pattern`. Errors are fixed codes only (`app_denied`, `app_unavailable`,
-  `app_stale`, `app_disabled`, `app_expired`, `app_rate_limited` (backend invocation limiter only),
-  `app_timeout`, `app_cpu_limit`, `bridge_invalid_request`, `bridge_protocol_error`).
+  `app_stale`, `app_disabled`, `app_expired`, `app_cpu_limit`, `bridge_invalid_request`,
+  `bridge_protocol_error`).
 - **Revocation.** The operator command replaces the generation and persists the state first
   (`ui:operator -- disable|reset`, or a new approval). From then on every earlier handle is refused
   (`app_stale`), also after a re-enable, whether or not the key's invalidation succeeded. It then
@@ -192,7 +194,8 @@ U2 — delegation and consent:
   Restoring the exact approved release while the app stays enabled (no disable, uninstall or new
   approval in between) keeps the generation, so unexpired handles for it work again. Unmount or
   navigation terminates the bridge Worker and with it the handle; no server call.
-- There are no rate limits, budgets, operation counters or in-flight caps on the UI path. Abuse
+- There are no rate limits, budgets, deadlines, operation counters or in-flight caps, on the UI or
+  the backend path. Abuse
   is handled by audit plus disable; ES-native protections (search timeouts,
   `search.max_buckets`, circuit breakers) cover node safety.
 - A closed capability registry (`server/ui/capability_registry.ts`) refuses credential-minting, deferred,
@@ -240,12 +243,13 @@ key. Note that `feature_dashboard_v2.read` also grants `index-pattern` read, so 
 `kibana.dashboard.read` but drops `kibana.dataViews.read` is refused data views only by the server's
 scope check, not by Kibana.
 
-Backend (Node ↔ dispatcher) capnweb sessions use `maxMessageSize: 256 KiB`, `maxDepth: 32` and `maxBigIntDigits: 64`, plus a
-transport that rejects binary frames, frames over 256 KiB and a receive queue over 1 MiB before
-parsing. Both caps count **UTF-8 bytes** (capnweb's own `maxMessageSize` counts UTF-16 code units).
-Node's built-in WebSocket cannot cap `maxPayload`, so one oversized frame is still buffered before it
-is rejected. Errors sent to the dispatcher are replaced with a stackless `app_host:<code>` error, so
-no host stack or source path crosses the wire.
+Backend (Node ↔ dispatcher) capnweb sessions use capnweb's default deserialization limits. Each
+side's transport has one bound, the same as the UI Worker's: a receive queue of 8 MiB
+(`RECEIVE_QUEUE_BYTES`, 2 bytes per UTF-16 code unit) of frames not yet read by capnweb. Overflow or
+a binary frame closes the socket (1009) before capnweb parses anything. Node's built-in WebSocket
+cannot cap `maxPayload`, so a frame is buffered before the bound sees it. Errors sent to the
+dispatcher are replaced with a stackless `app_host:<code>` error, so no host stack or source path
+crosses the wire.
 
 The Cloudflare dispatcher, sample app, fixtures and all demo tooling live in the isolated
 [`prototype/`](./prototype/README.md) tool package.

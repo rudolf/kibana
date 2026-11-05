@@ -7,10 +7,8 @@
 
 export type PackageErrorCode =
   | 'package_unavailable'
-  | 'manifest_too_large'
   | 'manifest_invalid'
   | 'bundle_unavailable'
-  | 'bundle_too_large'
   | 'digest_mismatch'
   | 'ui_invalid'
   | 'release_digest_mismatch'

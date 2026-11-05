@@ -84,7 +84,7 @@ test('rejects unknown fields, grants, routes and host API', () => {
   );
 });
 
-test('bounds the bundle and invocation id', () => {
+test('validates the bundle and invocation id', () => {
   const ok = {
     manifest: manifest(),
     bundle: 'export default {}',
@@ -92,7 +92,7 @@ test('bounds the bundle and invocation id', () => {
   };
   assert.equal(parseInvokeRequest(ok).bundle, ok.bundle);
   assert.equal(
-    code(() => parseInvokeRequest({ ...ok, bundle: 'a'.repeat(64 * 1024 + 1) })),
+    code(() => parseInvokeRequest({ ...ok, bundle: '' })),
     'invalid_bundle'
   );
   assert.equal(
@@ -105,7 +105,7 @@ test('bounds the bundle and invocation id', () => {
   );
 });
 
-test('search params require the exact index and a bounded integer size', () => {
+test('search params require the exact index and an integer size', () => {
   assert.deepEqual(parseSearchParams({ index: SYNTHETIC_INDEX, size: 100 }), {
     index: SYNTHETIC_INDEX,
     size: 100,
@@ -121,7 +121,7 @@ test('search params require the exact index and a bounded integer size', () => {
       'index_not_granted'
     );
   }
-  for (const size of [0, 101, 1.5, '1']) {
+  for (const size of [1.5, '1']) {
     assert.equal(
       code(() => parseSearchParams({ index: SYNTHETIC_INDEX, size })),
       'invalid_search'
@@ -133,40 +133,17 @@ test('search params require the exact index and a bounded integer size', () => {
   );
 });
 
-test('search results are bounded in records and bytes', () => {
+test('search results have the exact record shape', () => {
   const record = { severity: 'high', rule: 'r' };
   assert.equal(parseSearchResult({ total: 1, records: [record] }).records.length, 1);
-  assert.equal(
-    code(() => parseSearchResult({ total: 1, records: Array(101).fill(record) })),
-    'invalid_result'
-  );
-  assert.equal(
-    code(() =>
-      parseSearchResult({
-        total: 1,
-        records: Array(100).fill({ severity: 'high', rule: 'é'.repeat(128) }),
-      })
-    ),
-    'invalid_result'
-  );
   assert.equal(
     code(() => parseSearchResult({ total: 1, records: [{ ...record, extra: 1 }] })),
     'invalid_result'
   );
 });
 
-test('app results must be plain bounded JSON', () => {
+test('app results must be plain JSON', () => {
   assert.deepEqual(parseAppResult({ a: [1, 'x', null] }), { a: [1, 'x', null] });
-  assert.equal(
-    code(() => parseAppResult({ a: 'x'.repeat(17 * 1024) })),
-    'invalid_app_result'
-  );
-  let deep: unknown = 1;
-  for (let i = 0; i < 10; i++) deep = [deep];
-  assert.equal(
-    code(() => parseAppResult(deep)),
-    'invalid_app_result'
-  );
   assert.equal(
     code(() => parseAppResult(new Map())),
     'invalid_app_result'

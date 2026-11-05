@@ -5,7 +5,7 @@
  * 2.0.
  */
 
-import { LIMITS, SYNTHETIC_INDEX } from '../common';
+import { SYNTHETIC_INDEX } from '../common';
 
 export type SearchInput =
   | { readonly ok: true; readonly index: string; readonly size: number }
@@ -19,8 +19,9 @@ const isPlainObject = (value: unknown): value is Record<string, unknown> =>
 
 /**
  * Input schema for every host-built search (Worker `HostEs` callback and UI bridge): exactly
- * `{index, size}`, the synthetic index literal and an integer size 1–100. It is input validation
- * only, not an authorizer: Elasticsearch enforces what the app session key may read.
+ * `{index, size}`, the synthetic index literal and an integer size (Elasticsearch applies its own
+ * limits). It is input validation only, not an authorizer: Elasticsearch enforces what the app
+ * session key may read.
  * `anyIndex` (K1 fault injection, dev-only config) accepts any bounded index string.
  */
 export const parseSearchInput = (params: unknown, { anyIndex = false } = {}): SearchInput => {
@@ -34,9 +35,8 @@ export const parseSearchInput = (params: unknown, { anyIndex = false } = {}): Se
     return { ok: false, reason: 'index_not_granted' };
   }
   if (!anyIndex && index !== SYNTHETIC_INDEX) return { ok: false, reason: 'index_not_granted' };
-  if (typeof size !== 'number' || !Number.isInteger(size) || size < 1) {
+  if (typeof size !== 'number' || !Number.isInteger(size)) {
     return { ok: false, reason: 'invalid_search' };
   }
-  if (size > LIMITS.callbackRecords) return { ok: false, reason: 'invalid_search' };
   return { ok: true, index, size };
 };

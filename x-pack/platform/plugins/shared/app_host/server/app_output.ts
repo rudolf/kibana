@@ -25,7 +25,7 @@ const hasExactKeys = (value: Record<string, unknown>, keys: readonly string[]): 
 };
 
 const isCount = (value: unknown): value is number =>
-  typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= LIMITS.maxCount;
+  typeof value === 'number' && Number.isInteger(value) && value >= 0;
 
 /** Strictly validates app output `{label, counts:{high, low}}`; returns undefined when invalid. */
 export const parseAppOutput = (value: unknown): AppOutput | undefined => {

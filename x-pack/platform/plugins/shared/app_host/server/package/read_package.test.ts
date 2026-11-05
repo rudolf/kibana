@@ -87,23 +87,14 @@ describe('readPackage', () => {
     expect(await codeOf(readPackage(dir))).toBe('manifest_invalid');
   });
 
-  it('rejects an oversized manifest before parsing', async () => {
-    await write({ ...manifest(), padding: 'x'.repeat(16 * 1024) });
-    expect(await codeOf(readPackage(dir))).toBe('manifest_too_large');
-  });
-
   it('rejects a digest mismatch', async () => {
     await write(manifest(), `${bundle}// tampered`);
     expect(await codeOf(readPackage(dir))).toBe('digest_mismatch');
   });
 
-  it('rejects a missing or oversized bundle', async () => {
+  it('rejects a missing bundle', async () => {
     await write(manifest(), bundle, 'other.js');
     expect(await codeOf(readPackage(dir))).toBe('bundle_unavailable');
-    const big = 'a'.repeat(64 * 1024 + 1);
-    const bigDigest = createHash('sha256').update(big).digest('hex');
-    await write(manifest({ digest: bigDigest }), big, `${bigDigest}.js`);
-    expect(await codeOf(readPackage(dir))).toBe('bundle_too_large');
   });
 
   it('does not follow symlinks', async () => {

@@ -21,22 +21,15 @@ export const summaryPath = (appId: string): string =>
   `/api/apps/${encodeURIComponent(appId)}/summary`;
 
 export const LIMITS = {
-  manifestBytes: 16 * 1024,
-  bundleBytes: 64 * 1024,
   titleLength: 80,
   versionLength: 32,
   labelLength: 80,
-  callbackResultBytes: 16 * 1024,
-  callbackRecords: 100,
   ruleLength: 128,
-  callbacksPerInvocation: 1,
-  concurrentInvocations: 4,
-  deadlineMs: 5000,
-  maxCount: 100,
 } as const;
 
-export const RPC_LIMITS = {
-  maxMessageSize: 256 * 1024,
-  maxDepth: 32,
-  maxBigIntDigits: 64,
-} as const;
+/**
+ * The one bound on every bridge transport (backend dispatcher session and UI Worker): bytes of
+ * frames received but not yet read by capnweb, counted as 2 bytes per UTF-16 code unit. Overflow
+ * ends the session, so a hostile peer cannot exhaust memory.
+ */
+export const RECEIVE_QUEUE_BYTES = 8 * 1024 * 1024;

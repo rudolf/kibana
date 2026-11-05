@@ -6,19 +6,18 @@
  */
 
 import type { HttpSelfScopedClient } from '@kbn/core/server';
-import { UI_LIMITS } from '../../common/ui_protocol';
 
 export const KIBANA_API_VERSION = '2023-10-31';
 
 export interface NativeFailure {
   readonly ok: false;
-  readonly code: 'app_denied' | 'app_unavailable' | 'app_timeout';
+  readonly code: 'app_denied' | 'app_unavailable';
   readonly reason:
     | 'native_denied'
     | 'native_rejected'
     | 'native_failed'
     | 'invalid_result'
-    | 'deadline';
+    | 'aborted';
 }
 
 export type NativeOutcome =
@@ -49,7 +48,6 @@ export const selfGetJson = async (
       method: 'GET',
       access: 'public',
       version: KIBANA_API_VERSION,
-      timeout: UI_LIMITS.operationDeadlineMs,
       signal,
       asResponse: true,
       rawResponse: true,

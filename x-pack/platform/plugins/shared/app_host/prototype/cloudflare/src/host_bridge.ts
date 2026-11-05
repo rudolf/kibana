@@ -7,7 +7,6 @@
 
 import { RpcTarget } from 'capnweb';
 import {
-  MAX_CALLBACKS_PER_INVOCATION,
   parseSearchParams,
   parseSearchResult,
   stacklessError,
@@ -23,7 +22,6 @@ import type { HostStub } from './env';
  */
 export class HostBridge extends RpcTarget {
   #host: HostStub | undefined;
-  #calls = 0;
 
   constructor(host: HostStub) {
     super();
@@ -38,10 +36,6 @@ export class HostBridge extends RpcTarget {
   async search(params: unknown): Promise<SearchResult> {
     const host = this.#host;
     if (!host) throw stacklessError('app_host:host_revoked');
-    this.#calls += 1;
-    if (this.#calls > MAX_CALLBACKS_PER_INVOCATION) {
-      throw stacklessError('app_host:callback_budget');
-    }
     try {
       const request = parseSearchParams(params);
       const result = await host.search(request);

@@ -8,7 +8,6 @@
 /** Fixed error codes that may cross the RPC boundary. Nothing else is sent to the dispatcher. */
 export type HostErrorCode =
   | 'host_revoked'
-  | 'callback_budget'
   | 'invalid_search'
   | 'index_not_granted'
   | 'es_forbidden'

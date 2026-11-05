@@ -21,7 +21,6 @@ describe('parseAppOutput', () => {
     ['long label', { label: 'x'.repeat(81), counts: { high: 0, low: 0 } }],
     ['empty label', { label: '', counts: { high: 0, low: 0 } }],
     ['negative count', { label: 'x', counts: { high: -1, low: 0 } }],
-    ['too large count', { label: 'x', counts: { high: 101, low: 0 } }],
     ['fractional count', { label: 'x', counts: { high: 1.5, low: 0 } }],
     ['string count', { label: 'x', counts: { high: '1', low: 0 } }],
     ['number', 42],

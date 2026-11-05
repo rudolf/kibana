@@ -5,7 +5,7 @@
  * 2.0.
  */
 
-// Infinite CPU loop; must be bounded by the Dynamic Worker CPU limit or the host deadline.
+// Infinite CPU loop; must be bounded by the Dynamic Worker CPU limit.
 
 import { WorkerEntrypoint } from 'cloudflare:workers';
 

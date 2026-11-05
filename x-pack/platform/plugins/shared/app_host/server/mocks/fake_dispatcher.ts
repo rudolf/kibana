@@ -6,7 +6,6 @@
  */
 
 import { RpcSession } from 'capnweb';
-import { RPC_LIMITS } from '../../common';
 import { BoundedWebSocketTransport, type MinimalWebSocket } from '../remote/bounded_transport';
 import { FakeRoot } from './fake_root';
 import { FakeSocket } from './fake_socket';
@@ -26,8 +25,7 @@ export const createFakeDispatcher = (options: FakeDispatcherOptions) => {
     const connection = { client, server, authenticated: false, invocations: 0 } as FakeConnection;
     const session = new RpcSession(
       new BoundedWebSocketTransport(server),
-      new FakeRoot(connection, options),
-      { limits: RPC_LIMITS }
+      new FakeRoot(connection, options)
     );
     Object.assign(connection, { session });
     connections.push(connection);

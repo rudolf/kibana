@@ -9,11 +9,11 @@ Cloudflare account, deploy, secret write or push. Reports and screenshots are gi
 
 | Question | Result |
 |---|---|
-| Full `ui:security` (K, T, D and W suites), three engines | **PASS**: 540 PASS, 0 FAIL, 12 NOT_VERIFIED, 6 KNOWN_LEAK, 19 DIAGNOSTIC, 1196 s (`.local/ui_security-2026-11-05T23-06-17-800Z.json`) |
+| Full `ui:security` (K, T, D and W suites), three engines | **PASS**: 540 PASS, 0 FAIL, 12 NOT_VERIFIED, 6 KNOWN_LEAK, 19 DIAGNOSTIC, 1189 s (`.local/ui_security-2026-11-05T23-44-14-929Z.json`) |
 | Bridge Worker (W1, W2), three engines | **PASS**: 31 PASS, 0 FAIL, 3 DIAGNOSTIC (inside the full run) |
 | K1 with the dev-only input-schema bypass (Kibana restarted with `-c .local/kibana.app_host.k1.yml`) | **PASS** 9/9 (`--suites k1`) |
-| Backend `seam` and `acceptance` (local workerd) | **PASS**: `seam` exit 0, 24 assertions true, the 3 CPU-loop checks `NOT_ENFORCED_LOCALLY`; `acceptance` exit 0, verdict PASS, 34 of 37 true, the 3 CPU checks `NOT_ENFORCED_LOCALLY`, no failures |
-| Jest, `type_check`, ESLint, prototype `lint` and `test` | **PASS**: Jest 190/190 (22 suites); `type_check --project …/app_host/tsconfig.json` exit 0; ESLint/oxlint clean on the changed TypeScript files; prototype `lint` (three `tsc` projects + Kibana lint of `prototype/`) clean; prototype `test` 53/53 |
+| Backend `seam` and `acceptance` (local workerd) | **PASS**: `seam` exit 0, 16 assertions true, the 2 CPU-loop checks `NOT_ENFORCED_LOCALLY`; `acceptance` exit 0, verdict PASS, 25 of 27 true, the 2 CPU checks `NOT_ENFORCED_LOCALLY`, no failures |
+| Jest, `type_check`, ESLint, prototype `lint` and `test` | **PASS**: Jest 174/174 (22 suites); `type_check --project …/app_host/tsconfig.json` exit 0; ESLint/oxlint clean on the changed TypeScript files; prototype `lint` (three `tsc` projects + Kibana lint of `prototype/`) clean; prototype `test` 50/50 |
 | SameSite=None HTTPS fixture (`--suites t4tls`) | **NOT RUN** for this state (needs Kibana restarted over TLS) |
 | Cloudflare remote run (CPU limits, latency) | **NOT RUN** (needs separate approval) |
 | Zero egress (DNS, WebRTC, timing) | **NOT VERIFIED** (no DNS/UDP observer); not a containment claim |
@@ -37,17 +37,17 @@ chain on the Kibana page's main thread, in ms.
 |---|---|---|---|
 | Worker loads from the host asset; its response CSP is Core's policy plus `default-src 'none'; script-src <host-capnweb.js>; connect-src <session> <execute>` (headers as seen by the browser) | **PASS** | **PASS** | **PASS** |
 | Worker CSP enforced (code evaluated in the Worker): `POST /internal/app_host/ui/execute` answers 400 (control); `GET /api/status`, a fetch to the local receiver (0 receiver hits) and `importScripts(host-guardian.js)` blocked | **PASS** | **PASS** | **PASS** |
-| Sampler positive control: a 300 ms busy loop on the page → max delay | **PASS** 291 | **PASS** 294 | **PASS** 296 |
-| Idle control (frame bound, 4 s): p50 / p95 / max | 2 / 2 / 3 | 3 / 6 / 6 | 3 / 6 / 6 |
-| Flood (4 s; bursts of 8 calls with a 256 KiB argument that the Worker parses and refuses plus 8 valid calls; every call answered): p50 / p95 / max; calls | **PASS** 0 / 1 / 4; 88,384 | **PASS** 3 / 6 / 8; 33,376 | **PASS** 2 / 3 / 11; 81,024 |
+| Sampler positive control: a 300 ms busy loop on the page → max delay | **PASS** 290 | **PASS** 299 | **PASS** 301 |
+| Idle control (frame bound, 4 s): p50 / p95 / max | 2 / 2 / 2 | 3 / 6 / 7 | 3 / 6 / 6 |
+| Flood (4 s; bursts of 8 calls with a 256 KiB argument that the Worker parses and refuses plus 8 valid calls; every call answered): p50 / p95 / max; calls | **PASS** 0 / 1 / 3; 88,816 | **PASS** 4 / 6 / 8; 31,984 | **PASS** 2 / 4 / 20; 78,368 |
 | One 10 MiB frame (past the queue bound): status `ended: protocol_error (queue_overflow)`, the Worker closed, the guardian removed; max delay meanwhile | **PASS** 3 | **PASS** 10 | **PASS** 6 |
 | After the overflow: `GET /api/status` from the page 200, a new consent binds a fresh Worker and frame | **PASS** | **PASS** | **PASS** |
 | W2 control: the Worker's session response carried a handle | **PASS** | **PASS** | **PASS** |
-| W2 no handle in any window, port or Worker message (recorded in every frame: window/port/Worker sends, port `onmessage` receipts including the guest's end of the bridge, Worker → page notices) | **PASS** (54 messages) | **PASS** (58) | **PASS** (58) |
+| W2 no handle in any window, port or Worker message (recorded in every frame: window/port/Worker sends, port `onmessage` receipts including the guest's end of the bridge, Worker → page notices) | **PASS** (54 messages) | **PASS** (54) | **PASS** (60) |
 | W2 scanner positive control: a value hidden in a DOM expando is found | **PASS** | **PASS** | **PASS** |
-| W2 no handle in the page's JS-visible state in any frame (breadth-first over own data properties from `window` and every element, including React fibers and state; storage, cookies, markup) | **PASS** (94,094 objects) | **PASS** (91,028) | **PASS** (91,788) |
+| W2 no handle in the page's JS-visible state in any frame (breadth-first over own data properties from `window` and every element, including React fibers and state; storage, cookies, markup) | **PASS** (94,094 objects) | **PASS** (91,097) | **PASS** (91,746) |
 | W2 heap snapshot of the page's main isolate (CDP, 678 MB): positive control found, no handle | **PASS** | — | — |
-| DIAGNOSTIC: a 2 s CPU-busy loop in the app frame itself → Kibana main-thread max delay | **1990 (blocks)** | **1997 (blocks)** | **1998 (blocks)** |
+| DIAGNOSTIC: a 2 s CPU-busy loop in the app frame itself → Kibana main-thread max delay | **1993 (blocks)** | **1989 (blocks)** | **1994 (blocks)** |
 
 The flood is answered entirely off the main thread: in every engine the delay during the flood stays
 within the idle control. A CPU-busy loop in the **app frame itself** still blocks the Kibana page for its
@@ -120,7 +120,7 @@ only, 1 h, `refresh=false`); only the bridge Worker holds the AES-256-GCM handle
 | K3 handle integrity | **PASS** (HTTP 8, browser 1 per engine, Jest 3) | Tampered ciphertext, GCM tag, release digest and generation (each a well-formed, canonical token differing only in that field) → `app_denied`, audit `bad_handle`, before any key-scoped request; another user's handle with their own basic auth and own cookie, another space → `app_denied`; no credentials → 401; expired → `app_expired` and a single re-mint inside the bridge Worker started by this consent (Jest). |
 | K4 key confinement | **PASS** (10) | Known key through the real clients and loggers (es.search, Dashboard read, Worker-path `app.summary`, a native 403), with fresh `elasticsearch.query` entries and `[REDACTED]` authorization; no secret encoding in responses or logs; negative controls FAIL/NOT_VERIFIED as designed (also node:test `leak_scan_test.ts`). Kibana-minted keys in three engines: no key encoding in responses, window/port/Worker messages, frame DOM or logs; the handle appears only in the session response to the bridge Worker. |
 | K5 revocation | **PASS** (10) + 1 DIAGNOSTIC | Disable (keys invalidated by name, next call `app_disabled`, re-enable → `app_stale`); mint → immediate disable → enable (name invalidation can miss the unrefreshed key; the handle is dead anyway); partial invalidation (HTTP 200, `error_count: 1`) reported and recoverable; operator CLI HTTP failure exits 1; a 6-run mint/disable race (only current-generation handles work); a release change (`app_stale`, old-release keys invalidated); reset + re-approval of the same release with a frozen and a backward operator clock (old handle `app_stale`, new handle works). |
-| K6 cost | **PASS** (2) + 2 DIAGNOSTIC | 30 calls on one handle → exactly 1 new key. Mint latency through `POST /internal/app_host/ui/session`: p50 12 ms, p95 15 ms (20 mints); a direct ES grant as `kibana_system` takes p50 12 ms with `refresh=false` and p50 1,001 ms with the default refresh. |
+| K6 cost | **PASS** (2) + 2 DIAGNOSTIC | 30 calls on one handle → exactly 1 new key. Mint latency through `POST /internal/app_host/ui/session`: p50 13 ms, p95 18 ms (20 mints); a direct ES grant as `kibana_system` takes p50 11 ms with `refresh=false` and p50 1,005 ms with the default refresh. |
 
 Invalidation as `kibana_system` on ES 9.7: by **name** works, including a trailing wildcard
 (`app:alert-digest@*`); listing by name is refused (403) and a metadata query returns only its own keys,
@@ -128,12 +128,11 @@ so query-then-invalidate-by-id is not available to it.
 
 Limits:
 
-- Kept from the backend (not part of the UI path): the 4-invocation process limiter and the
-  one-`HostEs`-call budget per backend Worker invocation (`app_rate_limited` comes only from the
-  limiter); the backend transport's bounds (256 KiB frames, 1 MiB queue, depth 32, BigInt 64, 8 invalid
-  calls); the 5 s deadline. There are no UI-path rate limits or budgets.
+- There are no rate limits, invocation limiters, callback budgets, host deadlines or result caps on the
+  UI or the backend path. Each transport (UI Worker, Kibana ↔ dispatcher, dispatcher ↔ Kibana) has
+  one bound, an 8 MiB receive queue. The Dynamic Worker keeps Cloudflare's CPU and subrequest limits.
 - Within the 2 s state cache an execute may still be accepted after a disable (refusals always use a
-  fresh read); a read authorized before a disable can finish within its deadline.
+  fresh read); a read authorized before a disable runs to completion.
 - Name invalidation can miss a key minted less than one `.security` refresh (~1 s) earlier; the
   approval generation makes its handle useless. Restoring the exact approved release while the app
   stays enabled revives unexpired handles for it (not a revocation path).
@@ -309,19 +308,18 @@ and `report-sample` (here pointing at the harness's synthetic local collector).
 | CPU-limit gate (`app_host:app_cpu_limit`) | **NOT RUN** remotely; `NOT_ENFORCED_LOCALLY` on OSS workerd |
 | Latency decision (p95 ≤ 2 s) | **NO DECISION**: local numbers say nothing about the remote topology |
 
-`seam --url ws://127.0.0.1:8787/rpc --local-workerd`: exit 0, 24 required assertions true, `loopCpuLimited`, `loopWallBounded` and `loopRecovered` `NOT_ENFORCED_LOCALLY` (OSS workerd ignores Dynamic Worker `limits.cpuMs`; the loop fixture is not run), no failures. Required assertions cover `result:42`,
+`seam --url ws://127.0.0.1:8787/rpc --local-workerd`: exit 0, 16 required assertions true, `loopCpuLimited` and `loopRecovered` `NOT_ENFORCED_LOCALLY` (OSS workerd ignores Dynamic Worker `limits.cpuMs`; the loop fixture is not run), no failures. Required assertions cover `result:42`,
 one callback, authentication (wrong, missing token, idle unauthenticated close), replay, egress
-(`fetch`/`connect` blocked by workerd's `globalOutbound: null` policy), seven misuse cases each in a
-fresh invocation with no Node handler call, the one-call budget, receiver-side transport limits (1009 for a
-257 KiB ASCII frame and for 270,000 UTF-8 bytes in 90,000 code units; `app_host:rpc_limit` / 1011 for
-depth 40, each with a control), fresh module state, concurrency, disconnect and reconnect.
+(`fetch`/`connect` blocked by workerd's `globalOutbound: null` policy), the digest check, six misuse
+cases each in a fresh invocation with their contract error and no Node handler call, fresh module
+state, concurrency, disconnect and reconnect.
 
 `acceptance --kibana http://localhost:5601 --rpc ws://127.0.0.1:8787/rpc --wrangler-log <abs> --local-workerd`
-(approval reset first): exit 0, verdict **PASS**, 34 of 37 assertions true, `notVerified: []`, `notEnforcedLocally: [cpuLimitEnforced, cpuLoopWallBounded, cpuLoopRecovery]`. It verifies the dispatcher fingerprint from `x-app-host-timing`,
+(approval reset first): exit 0, verdict **PASS**, 25 of 27 assertions true, `notVerified: []`, `notEnforcedLocally: [cpuLimitEnforced, cpuLoopRecovery]`. It verifies the dispatcher fingerprint from `x-app-host-timing`,
 route authz, ES denial for a no-index user, package failures (digest mismatch, hostApi, unknown field,
-wildcard grant, oversized manifest and bundle, each with a no-invocation assertion), forbidden index,
-unknown method and callback budget, invalid and oversized app output, the 5 s deadline, the 4-invocation
-limiter and abort handling, and an external release served without restart.
+wildcard grant, each with a no-invocation assertion), forbidden index, unknown method, invalid app
+output, client abort followed by four successful invocations, and an external release served without
+restart.
 
 Benchmark (`benchmark --samples 20 --local-workerd`, 2026-11-04): Kibana end-to-end p50 11.1 ms / p95 14.6 ms, raw seam p50 4 / p95 6 ms. Fresh-invocation
 timings on loopback; not cold-isolate or remote measurements. Published creation pricing is about $2

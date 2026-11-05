@@ -7,7 +7,6 @@
 
 import type { ElasticsearchClient } from '@kbn/core/server';
 import { isRequestAbortedError, isResponseError } from '@kbn/es-errors';
-import { UI_LIMITS } from '../../common/ui_protocol';
 import type { NativeOutcome } from './data_views';
 
 /**
@@ -16,8 +15,8 @@ import type { NativeOutcome } from './data_views';
  * Elasticsearch enforces, so `FROM` outside the grant, `ENRICH` and explicit inference commands are refused
  * natively. A `MATCH` on a granted index's `semantic_text` field still triggers that field's configured
  * inference endpoint (ES runs it on an internal origin); that is part of reading the granted index.
- * Row limits are Elasticsearch's own (the query's `LIMIT` and the cluster's ES|QL limits); the host
- * adds only the operation deadline. Returns the response's `columns` and `values` as Elasticsearch
+ * Row limits and timeouts are Elasticsearch's and the ES client's own; a request abort aborts the
+ * query. Returns the response's `columns` and `values` as Elasticsearch
  * sent them.
  */
 export const runEsql = async (
@@ -32,12 +31,11 @@ export const runEsql = async (
       {
         signal,
         maxRetries: 0,
-        requestTimeout: UI_LIMITS.operationDeadlineMs,
       }
     )) as unknown as { columns?: unknown; values?: unknown };
   } catch (error) {
     if (isRequestAbortedError(error) || signal.aborted) {
-      return { ok: false, code: 'app_timeout', reason: 'deadline' };
+      return { ok: false, code: 'app_unavailable', reason: 'aborted' };
     }
     if (isResponseError(error)) {
       if (error.statusCode === 401 || error.statusCode === 403) {

@@ -7,13 +7,11 @@
 
 import type { ElasticsearchClient, Logger } from '@kbn/core/server';
 import type { AppSummaryResponse } from '../common';
-import { INSTALLED_APP_ID, LIMITS } from '../common';
+import { INSTALLED_APP_ID } from '../common';
 import { parseAppOutput } from './app_output';
-import { InvocationLimiter } from './invocation_limiter';
 import { PackageError, type PackageErrorCode } from './package/package_error';
 import { readPackage } from './package/read_package';
 import type { MinimalWebSocket } from './remote/bounded_transport';
-import { createDeadline } from './remote/deadline';
 import { describeDispatcher } from './remote/dispatcher_endpoint';
 import { InvokeError, invokeApp, type InvokeErrorCode } from './remote/invoke_app';
 import { SearchCapability, type SearchObserver } from './remote/search_capability';
@@ -22,8 +20,6 @@ export interface AppRunnerConfig {
   readonly packagePath: string;
   readonly dispatcherUrl: string;
   readonly callerToken: string;
-  readonly deadlineMs?: number;
-  readonly maxConcurrent?: number;
   readonly createSocket?: (url: string) => MinimalWebSocket;
 }
 
@@ -44,10 +40,8 @@ export interface SummaryTimings {
 export type SummaryOutcome =
   | { readonly status: 'ok'; readonly body: AppSummaryResponse; readonly timings: SummaryTimings }
   | { readonly status: 'not_found' }
-  | { readonly status: 'busy' }
   | { readonly status: 'invalid_package'; readonly code: PackageErrorCode }
   | { readonly status: 'es_forbidden' }
-  | { readonly status: 'deadline' }
   | { readonly status: 'aborted' }
   | { readonly status: 'remote_error'; readonly code: string }
   | { readonly status: 'invalid_output' }
@@ -62,18 +56,16 @@ export interface RunSummaryOptions {
   readonly searchObserver?: SearchObserver;
 }
 
-/** Orchestrates one summary invocation: limit, verify package, invoke remotely, validate output. */
+/** Orchestrates one summary invocation: verify package, invoke remotely, validate output. */
 export class AppRunner {
   readonly #config: AppRunnerConfig;
   readonly #logger: Logger;
-  readonly #limiter: InvocationLimiter;
   /** Host-owned description of the dispatcher endpoint every invocation uses (see `describeDispatcher`). */
   readonly dispatcher: string;
 
   constructor(config: AppRunnerConfig, logger: Logger) {
     this.#config = config;
     this.#logger = logger;
-    this.#limiter = new InvocationLimiter(config.maxConcurrent ?? LIMITS.concurrentInvocations);
     this.dispatcher = describeDispatcher(config.dispatcherUrl);
   }
 
@@ -84,11 +76,7 @@ export class AppRunner {
     options: RunSummaryOptions = {}
   ): Promise<SummaryOutcome> {
     if (appId !== INSTALLED_APP_ID) return { status: 'not_found' };
-    const release = this.#limiter.tryAcquire();
-    if (!release) return { status: 'busy' };
     const started = performance.now();
-    const deadline = createDeadline(requestAborted, this.#config.deadlineMs ?? LIMITS.deadlineMs);
-    const { signal } = deadline;
     let capability: SearchCapability | undefined;
     try {
       const pkg = await readPackage(this.#config.packagePath);
@@ -108,7 +96,7 @@ export class AppRunner {
         callerToken: this.#config.callerToken,
         pkg,
         capability,
-        signal,
+        signal: requestAborted,
         createSocket: this.#config.createSocket,
       });
       const stats = capability.stats;
@@ -137,8 +125,6 @@ export class AppRunner {
       return this.#failure(error, capability);
     } finally {
       capability?.revoke();
-      deadline.dispose();
-      release();
     }
   }
 
@@ -150,7 +136,6 @@ export class AppRunner {
     if (capability?.stats.esDenied) return { status: 'es_forbidden' };
     if (error instanceof InvokeError) {
       const mapped: Record<InvokeErrorCode, SummaryOutcome> = {
-        deadline: { status: 'deadline' },
         aborted: { status: 'aborted' },
         disconnected: { status: 'remote_error', code: 'disconnected' },
         dispatcher_unauthorized: { status: 'remote_error', code: 'dispatcher_unauthorized' },

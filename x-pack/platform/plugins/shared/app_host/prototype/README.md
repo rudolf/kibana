@@ -19,7 +19,7 @@ the remote steps.
 | `ui:seed` | UI cut seed on top of `seed`: hostile `medium` record, a viewer-only index `kbn-apps-prototype-viewer-only` (K1), granted + ungranted synthetic dashboards, empty space `app-host-empty`, Mini Discover data (`kbn-apps-demo-logs-a`/`-b`: 240 docs each over 24 h with `@timestamp`, `log.level`, `service.name`, `message`, three attacker-style messages; `kbn-apps-other-secret`: 5 docs outside the grant; data views `kbn-apps-demo-logs`, with one runtime field `event.hour` and its field format, and `kbn-apps-other-secret`), viewer matrix (`.local/ui_users.json`, never printed): viewer with demo/secret index read and the data view feature, no-index, no-dashboard, no-data-views, global-only, superuser |
 | `ui:operator` | Operator `disable` / `enable` / `status` / `reset` of the approval file (never reachable through the bridge). `disable` replaces the approval generation and `reset` deletes the record, so the next approval writes a new one (old handles are refused for good), then invalidate the app's session keys by name as `kibana_system` (`KIBANA_SYSTEM_AUTH`, local default `kibana_system:changeme`); a failed or partial invalidation is reported and exits 1 |
 | `ui:security` | K1–K6 (app session key), D1–D5 (`--suites discover`, Mini Discover; screenshots `.local/discover-<engine>.png`), W1/W2 (`--suites w`, the bridge Worker: main-thread responsiveness under a bridge flood, queue overflow, the Worker's CSP, handle confinement incl. a Chromium heap snapshot, and the frame-CPU diagnostic) and the T-suites, Playwright/API harness in Chromium/Firefox/WebKit; JSON report in `.local/ui_security-*.json`. `--suites t4tls --tls DIR` runs the SameSite=None HTTPS cookie fixture against Kibana started with `kibana:config -- --tls DIR` (see below) |
-| `acceptance` | Kibana-level M2/M3 assertions (authz, ES denial, package failures, limits, deadline, ...) |
+| `acceptance` | Kibana-level M2/M3 assertions (authz, ES denial, package failures, host contract, abort, ...) |
 | `ui-check` | Page check of `/app/appHost` v1 → v2 via Refresh (uses the Kibana workspace's Playwright) |
 | `benchmark` | Fresh-invocation latency sample through Kibana (and optionally the raw seam) |
 | `test` | `tsc` for Node and Workers code, then `node:test` unit tests |
@@ -41,17 +41,13 @@ npm --prefix "$P/prototype" run seam -- --url ws://127.0.0.1:8787/rpc --probe-ur
 
 `seam` prints one JSON object and exits 0 only when every required assertion holds. Remote mode
 (no flag) needs a non-loopback `wss://` URL and runs the CPU gate **first, isolated**: the loop
-fixture must fail with `app_host:app_cpu_limit` (`loopCpuLimited`). The 5 s client deadline is a
-separate wall-clock assertion (`loopWallBounded`) and never satisfies the CPU gate; a deadline or a
-generic error is a failure, and the run stops before any other invocation. Then: `result:42`,
+fixture must fail with `app_host:app_cpu_limit` (`loopCpuLimited`); the harness timeout or a generic
+error is a failure, and the run stops before any other invocation. Then: `result:42`,
 `callbackCount:1`, `unauthenticatedInvokeDenied`, `wrongTokenDenied`, `idleUnauthClosed`,
 `fetchBlocked`/`connectBlocked` (workerd's `globalOutbound: null` policy message, not a DNS or
-network failure), replay and digest checks, seven misuse cases **each in a fresh invocation** with
-its specific contract error and no Node handler call, the one-call budget (`app_host:callback_budget`),
-receiver-side transport limits (socket closed `1009` for a 257 KiB ASCII frame and for a
-270,000-UTF-8-byte / 90,000-code-unit frame; `app_host:rpc_limit` and close `1011` for a depth-40
-message or callback result, each with a control that hits the ordinary validator instead), fresh
-module state, concurrency, disconnect and reconnect.
+network failure), replay and digest checks, six misuse cases **each in a fresh invocation** with
+its specific contract error and no Node handler call, fresh module state, concurrency, disconnect
+and reconnect.
 
 `--local-workerd` is accepted only for a loopback URL. OSS workerd (used by `wrangler dev`) does not
 enforce Dynamic Worker `limits.cpuMs`: an infinite loop pins the local runtime until it is restarted.
@@ -94,14 +90,16 @@ The total stays under 200 fresh invocations (~87). Cleanup (also needs approval)
 
 - **An authenticated dispatcher socket has no idle or operation timeout.** Unauthenticated sockets
   are closed after 2 s, but once `authenticate` succeeds the dispatcher keeps the socket open until
-  the client closes it. Kibana's caller has a 5 s deadline and closes its single-use socket in
-  `finally`, and no capability or fresh Worker exists until `invoke`, but any client holding the
+  the client closes it. Kibana's caller closes its single-use socket in `finally` (and on request
+  abort), and no capability or fresh Worker exists until `invoke`, but any client holding the
   caller token could keep an unused (or used) authenticated socket open. A dispatcher-side
   post-auth/operation timeout is later hardening, not production-ready behaviour.
 - Closing a socket does not prove an isolate was terminated; only the managed runtime's CPU-limit
   error (`app_host:app_cpu_limit`) is accepted as CPU-enforcement evidence. The dispatcher maps the
   runtime's CPU-limit message by pattern (`errors.ts`); that mapping is unverified until the remote run.
-- Node's built-in WebSocket buffers one complete frame before the transport rejects it.
+- Node's built-in WebSocket buffers one complete frame before the transport's queue bound sees it.
+- A remote app that never returns holds its invocation until the client aborts the request; there is
+  no host deadline (Cloudflare's CPU limit bounds CPU, not waiting).
 
 ## Layout
 
@@ -131,7 +129,7 @@ NODE_EXTRA_CA_CERTS="$PWD/.local/tls/cert.pem" npm run ui:security -- --kibana h
 ```
 
 The certificate and key are local, self-signed and git-ignored; browsers trust them per context only.
-- `fixtures/` adversarial seam apps (egress, loop, misuse, budget, sentinel, echo, env probe).
+- `fixtures/` adversarial seam apps (egress, loop, misuse, sentinel, echo, env probe).
 - `scripts/` Node tools run with the pinned `tsx`; `test/` node:test unit tests.
 
 ## Lint and type check

@@ -8,11 +8,9 @@
 import { randomUUID } from 'node:crypto';
 import { RpcSession } from 'capnweb';
 import { expose } from '@kbn/core-remote-common';
-import { RPC_LIMITS } from '../../common';
 import { projectWorkerManifest } from '../package/manifest_schema';
 import type { AppPackage } from '../package/read_package';
 import { BoundedWebSocketTransport, type MinimalWebSocket } from './bounded_transport';
-import { isDeadlineReason } from './deadline';
 import { sanitizeOutboundError } from './host_error';
 import { HostEs } from './host_es';
 import type { SearchCapability } from './search_capability';
@@ -29,7 +27,6 @@ interface DispatcherRoot extends Disposable {
 
 export type InvokeErrorCode =
   | 'aborted'
-  | 'deadline'
   | 'disconnected'
   | 'dispatcher_unauthorized'
   | 'remote_error';
@@ -60,7 +57,7 @@ export interface InvokeAppOptions {
   readonly callerToken: string;
   readonly pkg: AppPackage;
   readonly capability: SearchCapability;
-  /** Aborts on request abort or deadline (see `createDeadline`). */
+  /** Aborts when the request is aborted. */
   readonly signal: AbortSignal;
   readonly createSocket?: (url: string) => MinimalWebSocket;
 }
@@ -72,9 +69,6 @@ const remoteCodeOf = (error: unknown): string | undefined => {
   const match = message?.match(/^app_host:([a-z_]+)$/);
   return match ? match[1] : undefined;
 };
-
-const abortCode = (signal: AbortSignal): InvokeErrorCode =>
-  isDeadlineReason(signal.reason) ? 'deadline' : 'aborted';
 
 /**
  * Runs one invocation on a fresh WebSocket: authenticate, then invoke with a freshly exposed
@@ -102,7 +96,7 @@ export const invokeApp = async ({
     requestBytes: Buffer.byteLength(JSON.stringify(request)),
     responseBytes: 0,
   };
-  if (signal.aborted) throw new InvokeError(abortCode(signal));
+  if (signal.aborted) throw new InvokeError('aborted');
 
   const socket = createSocket(dispatcherUrl);
   socket.addEventListener('open', () => {
@@ -110,14 +104,13 @@ export const invokeApp = async ({
   });
   // No local main capability: nothing on the Node side is reachable before authentication.
   const session = new RpcSession(new BoundedWebSocketTransport(socket), undefined, {
-    limits: RPC_LIMITS,
     onSendError: sanitizeOutboundError,
   });
   const root = session.getRemoteMain() as unknown as DispatcherRoot;
 
   let onAbort: (() => void) | undefined;
   const stopped = new Promise<never>((_, reject) => {
-    onAbort = () => reject(new InvokeError(abortCode(signal)));
+    onAbort = () => reject(new InvokeError('aborted'));
     signal.addEventListener('abort', onAbort, { once: true });
     socket.addEventListener('close', () => reject(new InvokeError('disconnected')));
   });
@@ -137,7 +130,7 @@ export const invokeApp = async ({
     return { value, timings };
   } catch (error) {
     if (error instanceof InvokeError) throw error;
-    if (signal.aborted) throw new InvokeError(abortCode(signal));
+    if (signal.aborted) throw new InvokeError('aborted');
     const remoteCode = remoteCodeOf(error);
     if (phase === 'auth' && remoteCode === 'unauthorized') {
       throw new InvokeError('dispatcher_unauthorized', remoteCode);

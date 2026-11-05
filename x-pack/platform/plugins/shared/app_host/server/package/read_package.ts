@@ -8,7 +8,6 @@
 import { createHash } from 'node:crypto';
 import { constants, promises as fs } from 'node:fs';
 import { join } from 'node:path';
-import { LIMITS } from '../../common';
 import { UI_LIMITS } from '../../common/ui_protocol';
 import { SCOPE_MAP_DIGEST_V1, computeReleaseDigest } from '../ui/contract';
 import {
@@ -26,15 +25,11 @@ export interface AppPackage {
 
 const MANIFEST_FILE = 'manifest.json';
 
-/**
- * Reads at most `maxBytes + 1` bytes from a regular, non-symlink file so that oversized files are
- * detected without buffering them.
- */
-const readBounded = async (
+/** Reads a regular, non-symlink file; with `bounds`, reads at most `maxBytes` (else `tooLarge`). */
+const readRegularFile = async (
   path: string,
-  maxBytes: number,
   unavailable: PackageErrorCode,
-  tooLarge: PackageErrorCode
+  bounds?: { readonly maxBytes: number; readonly tooLarge: PackageErrorCode }
 ): Promise<Buffer> => {
   let handle: fs.FileHandle | undefined;
   try {
@@ -46,6 +41,8 @@ const readBounded = async (
   try {
     const stat = await handle.stat();
     if (!stat.isFile()) throw new PackageError(unavailable);
+    if (!bounds) return await handle.readFile();
+    const { maxBytes, tooLarge } = bounds;
     if (stat.size > maxBytes) throw new PackageError(tooLarge);
     const buffer = Buffer.alloc(maxBytes + 1);
     const { bytesRead } = await handle.read(buffer, 0, maxBytes + 1, 0);
@@ -58,12 +55,7 @@ const readBounded = async (
 
 /** Reads the manifest only; used by the app list. */
 export const readManifest = async (packagePath: string): Promise<AppManifest> => {
-  const raw = await readBounded(
-    join(packagePath, MANIFEST_FILE),
-    LIMITS.manifestBytes,
-    'package_unavailable',
-    'manifest_too_large'
-  );
+  const raw = await readRegularFile(join(packagePath, MANIFEST_FILE), 'package_unavailable');
   let parsed: unknown;
   let manifest: AppManifest;
   try {
@@ -113,12 +105,10 @@ export const isUiManifest = (manifest: AppManifest): manifest is UiAppManifest =
  */
 export const readUiBundle = async (packagePath: string, uiDigest: string): Promise<Buffer> => {
   if (!/^[0-9a-f]{64}$/.test(uiDigest)) throw new PackageError('ui_bundle_unavailable');
-  const raw = await readBounded(
-    join(packagePath, `${uiDigest}.js`),
-    UI_LIMITS.uiBundleBytes,
-    'ui_bundle_unavailable',
-    'ui_bundle_too_large'
-  );
+  const raw = await readRegularFile(join(packagePath, `${uiDigest}.js`), 'ui_bundle_unavailable', {
+    maxBytes: UI_LIMITS.uiBundleBytes,
+    tooLarge: 'ui_bundle_too_large',
+  });
   if (createHash('sha256').update(raw).digest('hex') !== uiDigest) {
     throw new PackageError('ui_digest_mismatch');
   }
@@ -132,11 +122,9 @@ export const readUiBundle = async (packagePath: string, uiDigest: string): Promi
 export const readPackage = async (packagePath: string): Promise<AppPackage> => {
   const manifest = await readManifest(packagePath);
   // The digest is validated as 64 lowercase hex characters, so it cannot escape the directory.
-  const raw = await readBounded(
+  const raw = await readRegularFile(
     join(packagePath, `${manifest.digest}.js`),
-    LIMITS.bundleBytes,
-    'bundle_unavailable',
-    'bundle_too_large'
+    'bundle_unavailable'
   );
   const actual = createHash('sha256').update(raw).digest('hex');
   if (actual !== manifest.digest) throw new PackageError('digest_mismatch');

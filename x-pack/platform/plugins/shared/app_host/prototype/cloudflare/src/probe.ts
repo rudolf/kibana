@@ -10,7 +10,6 @@
 
 import { RpcSession } from 'capnweb';
 import { BoundedWebSocketTransport } from '../../shared/bounded_transport';
-import { RPC_LIMITS } from '../../shared/protocol';
 import type { Env } from './env';
 import { ProbeRoot } from './probe_root';
 import type { ProbeContext } from './probe_target';
@@ -24,9 +23,7 @@ export default {
     }
     const [client, server] = Object.values(new WebSocketPair());
     server.accept();
-    new RpcSession(new BoundedWebSocketTransport(server), new ProbeRoot(env, ctx as ProbeContext), {
-      limits: RPC_LIMITS,
-    });
+    new RpcSession(new BoundedWebSocketTransport(server), new ProbeRoot(env, ctx as ProbeContext));
     return new Response(null, { status: 101, webSocket: client });
   },
 } satisfies ExportedHandler<Env>;

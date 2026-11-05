@@ -98,7 +98,7 @@ for (let i = 0; i < samples; i++) {
     const header = result.headers.get(TIMING_HEADER);
     const verification = verifyDispatcher(target, header);
     if (verification.observed === null && result.status !== 200) {
-      // Failed before reaching the dispatcher (e.g. 429/500): no target evidence either way.
+      // Failed before reaching the dispatcher (e.g. 500): no target evidence either way.
       markInvalid(`status ${result.status} (no dispatcher evidence)`);
       continue;
     }

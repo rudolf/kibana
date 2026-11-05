@@ -98,7 +98,7 @@ test('control: an unsanitized replacement Error puts its stack on the wire', asy
 for (const [name, thrown, expected] of [
   ['unknown error', pathy, 'app_host:app_failed'],
   ['protocol error', () => new ProtocolError('digest_mismatch', 'x'), 'app_host:digest_mismatch'],
-  ['coded error', () => new Error('app_host:callback_budget'), 'app_host:callback_budget'],
+  ['coded error', () => new Error('app_host:index_not_granted'), 'app_host:index_not_granted'],
   ['CPU limit', () => new Error('Worker exceeded CPU time limit.'), 'app_host:app_cpu_limit'],
   ['CPU outcome', () => new Error('exceededCpu'), 'app_host:app_cpu_limit'],
   [

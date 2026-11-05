@@ -6,7 +6,7 @@
  */
 
 import type { RpcTransport } from 'capnweb';
-import { RPC_LIMITS } from '../../common';
+import { RECEIVE_QUEUE_BYTES } from '../../common';
 
 export interface WebSocketEventLike {
   readonly data?: unknown;
@@ -25,33 +25,26 @@ export interface MinimalWebSocket {
 }
 
 const CONNECTING = 0;
-const MAX_QUEUED_BYTES = 4 * RPC_LIMITS.maxMessageSize;
-
-/** UTF-8 byte length of a frame. A UTF-16 code unit never encodes to fewer than one UTF-8 byte. */
-export const frameBytes = (data: string): number => Buffer.byteLength(data, 'utf8');
-
-interface QueuedFrame {
-  readonly data: string;
-  readonly bytes: number;
-}
 
 /**
- * capnweb string transport that rejects binary frames, oversized frames and unbounded receive
- * queues before JSON parsing. Frame and queue limits count UTF-8 bytes, not UTF-16 code units
- * (capnweb's own `maxMessageSize` counts code units, so it would let a multibyte frame through). Node's built-in WebSocket cannot cap the frame size it buffers
- * (`maxPayload`), so a single oversized frame is still received before it is rejected here.
+ * capnweb string transport over the dispatcher WebSocket. Its one bound is the receive queue:
+ * frames received but not yet read by capnweb, counted as 2 bytes per UTF-16 code unit
+ * (`RECEIVE_QUEUE_BYTES`). Overflow or a binary frame closes the socket (1009) and fails the
+ * session before capnweb parses anything.
  */
 export class BoundedWebSocketTransport implements RpcTransport {
   readonly #socket: MinimalWebSocket;
+  readonly #maxQueuedBytes: number;
   #sendQueue: string[] | undefined;
-  #receiveQueue: QueuedFrame[] = [];
+  #receiveQueue: string[] = [];
   #queuedBytes = 0;
   #resolve: ((value: string) => void) | undefined;
   #reject: ((reason: unknown) => void) | undefined;
   #error: unknown;
 
-  constructor(socket: MinimalWebSocket) {
+  constructor(socket: MinimalWebSocket, maxQueuedBytes: number = RECEIVE_QUEUE_BYTES) {
     this.#socket = socket;
+    this.#maxQueuedBytes = maxQueuedBytes;
     if (socket.readyState === CONNECTING) {
       this.#sendQueue = [];
       socket.addEventListener('open', () => this.#flush());
@@ -73,15 +66,11 @@ export class BoundedWebSocketTransport implements RpcTransport {
   }
 
   receive(): Promise<string> {
-    const next = this.#receiveQueue.shift();
-    if (next !== undefined) {
-      this.#queuedBytes -= next.bytes;
-      return Promise.resolve(next.data);
-    }
     if (this.#error) return Promise.reject(this.#error);
     return new Promise((resolve, reject) => {
       this.#resolve = resolve;
       this.#reject = reject;
+      this.#pump();
     });
   }
 
@@ -100,31 +89,30 @@ export class BoundedWebSocketTransport implements RpcTransport {
     }
   }
 
+  #pump(): void {
+    const resolve = this.#resolve;
+    if (this.#error || !resolve) return;
+    const next = this.#receiveQueue.shift();
+    if (next === undefined) return;
+    this.#queuedBytes -= next.length * 2;
+    this.#resolve = undefined;
+    this.#reject = undefined;
+    resolve(next);
+  }
+
   #onMessage(data: unknown): void {
     if (this.#error) return;
     if (typeof data !== 'string') {
       this.#rejectFrame('Binary frames are not accepted.');
       return;
     }
-    // Cheap pre-check first: more code units than the byte cap is always over it.
-    const bytes = data.length > RPC_LIMITS.maxMessageSize ? data.length : frameBytes(data);
-    if (bytes > RPC_LIMITS.maxMessageSize) {
-      this.#rejectFrame('Incoming frame exceeds the message size limit.');
-      return;
-    }
-    if (this.#resolve) {
-      const resolve = this.#resolve;
-      this.#resolve = undefined;
-      this.#reject = undefined;
-      resolve(data);
-      return;
-    }
-    this.#queuedBytes += bytes;
-    if (this.#queuedBytes > MAX_QUEUED_BYTES) {
+    this.#queuedBytes += data.length * 2;
+    if (this.#queuedBytes > this.#maxQueuedBytes) {
       this.#rejectFrame('Receive queue exceeded its bound.');
       return;
     }
-    this.#receiveQueue.push({ data, bytes });
+    this.#receiveQueue.push(data);
+    this.#pump();
   }
 
   #rejectFrame(message: string): void {

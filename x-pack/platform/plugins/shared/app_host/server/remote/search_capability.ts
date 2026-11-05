@@ -47,8 +47,8 @@ export interface SearchCapabilityOptions {
 
 /**
  * Request-scoped Elasticsearch capability behind the exposed `HostEs` facade. Holds a scoped
- * client (the app session key on the bridge path, `asCurrentUser` on the native route), a one-call
- * budget and an abort signal; never exposed. Elasticsearch decides what the client may read.
+ * client (the app session key on the bridge path, `asCurrentUser` on the native route) and an abort
+ * signal; never exposed. Elasticsearch decides what the client may read.
  */
 export class SearchCapability {
   readonly #client: ElasticsearchClient;
@@ -105,7 +105,6 @@ export class SearchCapability {
   async #search(params: unknown): Promise<HostEsSearchResult> {
     if (!this.#active) throw new HostError('host_revoked');
     this.#calls += 1;
-    if (this.#calls > LIMITS.callbacksPerInvocation) throw new HostError('callback_budget');
     this.#requestBytes += Buffer.byteLength(JSON.stringify(params) ?? '');
     const input = parseSearchInput(params, { anyIndex: this.#anyIndex });
     if (!input.ok) throw new HostError(input.reason);
@@ -141,17 +140,13 @@ export class SearchCapability {
     hits: Array<{ _source?: AlertSource }>;
   }): HostEsSearchResult {
     const records: HostEsRecord[] = [];
-    let bytes = 0;
-    for (const hit of hits.hits.slice(0, LIMITS.callbackRecords)) {
+    for (const hit of hits.hits) {
       const { severity, rule } = hit._source ?? {};
       if (typeof severity !== 'string' || !SEVERITY_PATTERN.test(severity)) continue;
       if (typeof rule !== 'string' || rule.length === 0 || rule.length > LIMITS.ruleLength) {
         continue;
       }
-      const record = { severity, rule };
-      bytes += Buffer.byteLength(JSON.stringify(record)) + 1;
-      if (bytes > LIMITS.callbackResultBytes - 64) break;
-      records.push(record);
+      records.push({ severity, rule });
     }
     const total = typeof hits.total === 'number' ? hits.total : hits.total?.value ?? records.length;
     return { total, records };

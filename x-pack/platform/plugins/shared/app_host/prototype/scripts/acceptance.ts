@@ -159,20 +159,17 @@ const run = async (): Promise<string | undefined> => {
   );
   details.readerV1Timing = v1.headers.get(TIMING_HEADER);
 
-  // 1. CPU gate, isolated: the managed runtime must terminate the loop with its CPU limit. A 504
-  //    (deadline) or a generic 502 is not a pass; the wall-clock bound is a separate assertion.
+  // 1. CPU gate, isolated: the managed runtime must terminate the loop with its CPU limit; a
+  //    generic 502 is not a pass.
   if (verifiedMode === 'local') {
     const why =
       'Verified loopback dispatcher (local workerd): OSS workerd ignores Dynamic Worker ' +
       'limits.cpuMs and a loop pins it until restart, so the loop fixture is not run.';
     markNotEnforcedLocally('cpuLimitEnforced', why);
-    markNotEnforcedLocally('cpuLoopWallBounded', why);
     markNotEnforcedLocally('cpuLoopRecovery', why);
   } else {
     await release(await buildVariant('loop', '9.0.0-loop'));
-    const loopStart = performance.now();
     const loopResult = await summary(reader);
-    const loopMs = Math.round(performance.now() - loopStart);
     const loopTarget = verifyDispatcher(target, loopResult.headers.get(TIMING_HEADER));
     assert(
       'cpuLimitEnforced',
@@ -183,14 +180,10 @@ const run = async (): Promise<string | undefined> => {
         dispatcherVerified: loopTarget.verified,
       }
     );
-    assert('cpuLoopWallBounded', [502, 504].includes(loopResult.status) && loopMs < 6500, {
-      status: loopResult.status,
-      ms: loopMs,
-    });
     await release(await buildApp('1.0.0', 'Digest v1'));
     const loopRecovery = await summary(reader);
     assert('cpuLoopRecovery', loopRecovery.status === 200, loopRecovery.status);
-    const gate = ['cpuLimitEnforced', 'cpuLoopWallBounded', 'cpuLoopRecovery'];
+    const gate = ['cpuLimitEnforced', 'cpuLoopRecovery'];
     if (gate.some((name) => failures.includes(name))) {
       return 'CPU gate failed; no further invocations were run';
     }
@@ -283,26 +276,6 @@ const run = async (): Promise<string | undefined> => {
         ),
       'manifest_invalid',
     ],
-    [
-      'oversizedManifest',
-      () =>
-        writeRawManifest(
-          packageDir,
-          JSON.stringify({ ...good.manifest, title: 'x'.repeat(17 * 1024) })
-        ),
-      'manifest_too_large',
-    ],
-    [
-      'oversizedBundle',
-      async () => {
-        const bundle = `${good.bundle}\n//${'a'.repeat(70 * 1024)}`;
-        const digest = await sha256Hex(bundle);
-        junk.push(`${digest}.js`);
-        await writeRawFile(packageDir, `${digest}.js`, bundle);
-        await writeRawManifest(packageDir, JSON.stringify({ ...good.manifest, digest }));
-      },
-      'bundle_too_large',
-    ],
   ];
   for (const [name, mutate, expected] of packageCases) {
     await mutate();
@@ -340,16 +313,6 @@ const run = async (): Promise<string | undefined> => {
     { status: unknownMethod.status, label: unknownLabel, callbacks: callbacksOf(unknownMethod) }
   );
 
-  await release(await buildVariant('double_callback', '9.0.0-double'));
-  const double = await summary(reader);
-  assert(
-    'callbackBudgetOne',
-    bodyOf(double)?.label === 'second-callback-denied:app_host:callback_budget' &&
-      JSON.stringify(bodyOf(double)?.counts) === JSON.stringify({ high: 2, low: 1 }) &&
-      callbacksOf(double) === 1,
-    { body: double.body, callbacks: callbacksOf(double) }
-  );
-
   await release(await buildVariant('bad_output', '9.0.0-bad'));
   const badOutput = await summary(reader);
   assert(
@@ -358,42 +321,7 @@ const run = async (): Promise<string | undefined> => {
     { status: badOutput.status, code: codeOf(badOutput) }
   );
 
-  await release(await buildVariant('big_output', '9.0.0-big'));
-  const bigOutput = await summary(reader);
-  assert(
-    'oversizedAppOutputRejected',
-    bigOutput.status === 502 && codeOf(bigOutput) === 'invalid_app_result',
-    {
-      status: bigOutput.status,
-      code: codeOf(bigOutput),
-    }
-  );
-
-  // 5. Deadline (5s) then recovery.
-  await release(await buildVariant('slow', '9.0.0-slow8000', { __DELAY_MS__: '8000' }));
-  const deadlineStart = performance.now();
-  const deadline = await summary(reader);
-  const deadlineMs = Math.round(performance.now() - deadlineStart);
-  assert('deadline504', deadline.status === 504 && deadlineMs < 6500, {
-    status: deadline.status,
-    ms: deadlineMs,
-  });
-  await release(await buildApp('1.0.0', 'Digest v1'));
-  const afterDeadline = await summary(reader);
-  assert('recoveryAfterDeadline', afterDeadline.status === 200);
-
-  // 6. Concurrency: at most four in flight per Kibana process; excess gets 429.
-  await release(await buildVariant('slow', '9.0.0-slow1500', { __DELAY_MS__: '1500' }));
-  const burst = await Promise.all(Array.from({ length: 6 }, () => summary(reader)));
-  const statuses = burst.map(({ status }) => status);
-  assert(
-    'concurrencyLimit429',
-    statuses.filter((s) => s === 200).length === 4 &&
-      statuses.filter((s) => s === 429).length === 2,
-    statuses
-  );
-
-  // 7. Client abort releases the slot and revokes; later invocations proceed.
+  // 5. Client abort revokes and closes the invocation; later invocations proceed.
   await release(await buildVariant('slow', '9.0.0-slow3000', { __DELAY_MS__: '3000' }));
   const aborts = Array.from({ length: 4 }, () => new AbortController());
   const aborted = aborts.map((controller) =>
@@ -406,7 +334,7 @@ const run = async (): Promise<string | undefined> => {
   await release(await buildApp('1.0.0', 'Digest v1'));
   const afterAbort = await Promise.all(Array.from({ length: 4 }, () => summary(reader)));
   assert(
-    'abortReleasesSlots',
+    'abortThenProceeds',
     afterAbort.every(({ status }) => status === 200),
     afterAbort.map(({ status }) => status)
   );

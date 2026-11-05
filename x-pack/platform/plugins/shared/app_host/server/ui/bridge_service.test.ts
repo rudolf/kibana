@@ -708,34 +708,6 @@ describe('BridgeService execute as the key (K1/K2/T8/T11/T13)', () => {
     expect(code(await service.execute(caller(), handle, SUMMARY))).toBe('app_stale');
     expect(asKey).toHaveBeenCalledTimes(2);
   });
-
-  describe('operation deadline (fake clock)', () => {
-    beforeEach(() => jest.useFakeTimers({ now: 1_000_000 }));
-    afterEach(() => jest.useRealTimers());
-
-    it('aborts the handler at exactly 5 s and returns app_timeout; not before', async () => {
-      let seen: AbortSignal | undefined;
-      const { service, caller, mint, runner } = setup({ now: () => Date.now() });
-      (runner.runSummary as jest.Mock).mockImplementation(
-        (_a: string, _e: unknown, signal: AbortSignal) => {
-          seen = signal;
-          return new Promise(() => undefined);
-        }
-      );
-      const handle = await mint();
-      let settled: unknown;
-      const pending = service
-        .execute(caller(), handle, SUMMARY)
-        .then((result) => (settled = result));
-      await jest.advanceTimersByTimeAsync(4999);
-      expect(settled).toBeUndefined();
-      expect(seen?.aborted).toBe(false);
-      await jest.advanceTimersByTimeAsync(1);
-      await pending;
-      expect(seen?.aborted).toBe(true);
-      expect((settled as { body: unknown }).body).toEqual({ ok: false, code: 'app_timeout' });
-    });
-  });
 });
 
 describe('BridgeService audit (T10/S9)', () => {
@@ -888,7 +860,6 @@ describe('BridgeService handlers reach only their own services (T11, behavioural
       method: 'GET',
       access: 'public',
       version: '2023-10-31',
-      timeout: 5000,
       asResponse: true,
       rawResponse: true,
     });
@@ -947,7 +918,8 @@ describe('BridgeService Mini Discover: data views and ES|QL as the key (D1–D3)
       [unknown, Record<string, unknown>]
     >;
     expect(params).toStrictEqual({ query: 'FROM kbn-apps-demo-logs-* | LIMIT 2' });
-    expect(options).toMatchObject({ maxRetries: 0, requestTimeout: 5000 });
+    expect(options).toMatchObject({ maxRetries: 0 });
+    expect(options).not.toHaveProperty('requestTimeout');
     expect(options.signal).toBeInstanceOf(AbortSignal);
   });
 
@@ -1050,7 +1022,6 @@ describe('BridgeService Mini Discover: data views and ES|QL as the key (D1–D3)
       method: 'GET',
       access: 'public',
       version: '2023-10-31',
-      timeout: 5000,
       asResponse: true,
       rawResponse: true,
     };

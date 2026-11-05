@@ -12,7 +12,7 @@
 
 import { RpcSession } from 'capnweb';
 import { BoundedWebSocketTransport } from '../../shared/bounded_transport';
-import { RPC_LIMITS, UNAUTHENTICATED_IDLE_MS } from '../../shared/protocol';
+import { UNAUTHENTICATED_IDLE_MS } from '../../shared/protocol';
 import { MIN_TOKEN_LENGTH, type Env } from './env';
 import { sanitize } from './errors';
 import { PublicRoot } from './public_root';
@@ -41,7 +41,6 @@ const acceptRpc = (env: Env): Response => {
   idleTimer = setTimeout(() => close(1008, 'authentication timeout'), UNAUTHENTICATED_IDLE_MS);
   // The session lives exactly as long as the socket; nothing is kept in globals.
   new RpcSession(new BoundedWebSocketTransport(server, clearIdle), root, {
-    limits: RPC_LIMITS,
     onSendError: (error) => sanitize(error),
   });
   return new Response(null, { status: 101, webSocket: client });

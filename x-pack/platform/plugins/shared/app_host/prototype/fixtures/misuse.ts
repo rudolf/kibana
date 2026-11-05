@@ -6,8 +6,8 @@
  */
 
 // One host-contract misuse attempt per invocation, selected at build time with __MISUSE_CASE__.
-// Each case runs in a fresh invocation so the one-callback budget never masks a validator; the app
-// reports the exact rejection message so the seam can check the specific contract error.
+// Each case runs in a fresh invocation; the app reports the exact rejection message so the seam can
+// check the specific contract error.
 
 import { WorkerEntrypoint } from 'cloudflare:workers';
 import { INDEX, rejection, type FixtureHost } from './host';
@@ -23,7 +23,6 @@ const MISUSE_CASES: Record<string, (host: FixtureHost) => Promise<unknown>> = {
   arrayIndex: (host) => host.search({ index: [INDEX], size: 1 }),
   extraField: (host) => host.search({ index: INDEX, size: 1, query: { match_all: {} } }),
   badSize: (host) => host.search({ index: INDEX, size: 'x' }),
-  oversize: (host) => host.search({ index: INDEX, size: 101 }),
 };
 
 export class App extends WorkerEntrypoint {

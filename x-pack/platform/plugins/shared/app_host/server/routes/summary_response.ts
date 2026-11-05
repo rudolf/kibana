@@ -52,12 +52,6 @@ export const toSummaryResponse = (
       });
     case 'not_found':
       return response.notFound({ body: { message: 'App not found' } });
-    case 'busy':
-      return response.customError({
-        statusCode: 429,
-        body: { message: 'Too many concurrent app invocations' },
-        headers: { 'retry-after': '1' },
-      });
     case 'invalid_package':
       return response.customError({
         statusCode: 500,
@@ -66,12 +60,6 @@ export const toSummaryResponse = (
     case 'es_forbidden':
       return response.forbidden({
         body: { message: 'Current user is not authorized to read the app data' },
-        headers: reached,
-      });
-    case 'deadline':
-      return response.customError({
-        statusCode: 504,
-        body: { message: 'App invocation exceeded its deadline' },
         headers: reached,
       });
     case 'aborted':

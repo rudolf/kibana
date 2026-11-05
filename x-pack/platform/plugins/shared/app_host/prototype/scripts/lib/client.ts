@@ -10,12 +10,7 @@
 import { randomUUID } from 'node:crypto';
 import { RpcSession, RpcTarget } from 'capnweb';
 import { BoundedWebSocketTransport } from '../../shared/bounded_transport';
-import {
-  RPC_LIMITS,
-  parseSearchParams,
-  stacklessError,
-  type SearchResult,
-} from '../../shared/protocol';
+import { parseSearchParams, stacklessError, type SearchResult } from '../../shared/protocol';
 import type { BuiltPackage } from './build';
 
 /** Structural view of the dispatcher's authenticated capability as seen through a capnweb stub. */
@@ -52,7 +47,6 @@ export const openSession = (url: string): Session => {
     );
   });
   const session = new RpcSession(new BoundedWebSocketTransport(socket), undefined, {
-    limits: RPC_LIMITS,
     // Never send stacks or host-internal messages to the remote peer.
     onSendError: sanitizeClientError,
   });
@@ -73,16 +67,14 @@ export const openSession = (url: string): Session => {
 
 export type SearchHandler = (params: { index: string; size: number }) => Promise<SearchResult>;
 
-/** Synthetic Node host capability with only `search`; revocable and budgeted. */
+/** Synthetic Node host capability with only `search`; revocable. */
 export class SyntheticHost extends RpcTarget {
   #handler: SearchHandler | undefined;
   #calls = 0;
-  #maxCalls: number;
 
-  constructor(handler: SearchHandler, maxCalls = 1) {
+  constructor(handler: SearchHandler) {
     super();
     this.#handler = handler;
-    this.#maxCalls = maxCalls;
   }
 
   static revoke(host: SyntheticHost): void {
@@ -101,7 +93,6 @@ export class SyntheticHost extends RpcTarget {
     const handler = this.#handler;
     if (!handler) throw new Error('revoked');
     this.#calls += 1;
-    if (this.#calls > this.#maxCalls) throw new Error('budget');
     return handler(parseSearchParams(params));
   }
 }
@@ -131,13 +122,13 @@ export const invokeOnce = async (options: {
   token: string;
   pkg: BuiltPackage;
   handler: SearchHandler;
+  /** Harness timeout only (so a hung run reports instead of hanging); not a host limit. */
   deadlineMs?: number;
-  maxCalls?: number;
   onSession?: (session: Session, host: SyntheticHost) => void;
 }): Promise<InvokeOutcome> => {
-  const { url, token, pkg, handler, deadlineMs = 5000, maxCalls = 1, onSession } = options;
+  const { url, token, pkg, handler, deadlineMs = 5000, onSession } = options;
   const start = performance.now();
-  const host = new SyntheticHost(handler, maxCalls);
+  const host = new SyntheticHost(handler);
   const session = openSession(url);
   onSession?.(session, host);
   const request = { manifest: pkg.manifest, bundle: pkg.bundle, invocationId: randomUUID() };

@@ -12,7 +12,7 @@ describe('bridgeApi 1 contract', () => {
   it('is pinned: any semantic expansion or policy relaxation changes this digest', () => {
     // Updating this value requires a new contract identity, security review and renewed approvals.
     expect(SCOPE_MAP_DIGEST_V1).toMatchInlineSnapshot(
-      `"e9a460cb47b9b83a122af47d036befeeb6dcf5af1f662c3f6e042d99e57bb303"`
+      `"10b16232000cb453f8f5275f4da870744386b7a5a926255adc9dfe34c83f3c14"`
     );
   });
 

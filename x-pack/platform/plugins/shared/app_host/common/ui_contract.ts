@@ -45,8 +45,8 @@ export const BRIDGE_V1_CAPABILITIES: readonly CapabilityDescriptor[] = [
     bridgeMethod: 'search',
     kind: 'server',
     description: 'Host-built match_all over the synthetic index, as the app session key',
-    input: '{index:<granted literal>,size:1..100}',
-    output: '{total,records:[{severity,rule}]}<=100,<=16KiB',
+    input: '{index:<granted literal>,size:<integer>}',
+    output: '{total,records:[{severity,rule}]}',
     mintsCredential: false,
     executesLater: false,
     egressSideEffect: false,
@@ -134,7 +134,6 @@ export const UI_SECURITY_PROFILE = {
   protocol: {
     transport: 'string-only MessagePort to a dedicated host Worker',
     receiveQueueBytes: UI_LIMITS.receiveQueueBytes,
-    deadlineMs: UI_LIMITS.operationDeadlineMs,
     guestCallbacks: false,
   },
 } as const;

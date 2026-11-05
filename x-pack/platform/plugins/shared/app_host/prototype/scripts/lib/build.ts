@@ -9,14 +9,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
-import {
-  HOST_API_VERSION,
-  MAX_BUNDLE_BYTES,
-  SYNTHETIC_INDEX,
-  byteLength,
-  sha256Hex,
-  type Manifest,
-} from '../../shared/protocol';
+import { HOST_API_VERSION, SYNTHETIC_INDEX, sha256Hex, type Manifest } from '../../shared/protocol';
 
 export const PROTOTYPE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
@@ -58,7 +51,6 @@ export const packageBundle = async (
   title: string = APP_TITLE,
   id: string = APP_ID
 ): Promise<BuiltPackage> => {
-  if (byteLength(bundle) > MAX_BUNDLE_BYTES) throw new Error('bundle exceeds 64 KiB');
   const manifest: Manifest = {
     id,
     title,

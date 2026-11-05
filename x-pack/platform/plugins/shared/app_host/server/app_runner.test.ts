@@ -45,7 +45,7 @@ describe('AppRunner', () => {
     );
   };
 
-  const setup = (behaviour: InvokeBehaviour, overrides: { deadlineMs?: number } = {}) => {
+  const setup = (behaviour: InvokeBehaviour) => {
     const dispatcher = createFakeDispatcher({ token: TOKEN, behaviour });
     const createSocket = jest.fn(dispatcher.createSocket);
     const runner = new AppRunner(
@@ -54,7 +54,6 @@ describe('AppRunner', () => {
         dispatcherUrl: 'ws://127.0.0.1:8787/rpc',
         callerToken: TOKEN,
         createSocket,
-        ...overrides,
       },
       loggingSystemMock.createLogger()
     );
@@ -106,7 +105,6 @@ describe('AppRunner', () => {
   it.each([
     ['digest mismatch', async () => writeFile(join(dir, `${digest}.js`), `${bundle}//x`)],
     ['unsupported host API', async () => writePackage({ hostApi: 2 })],
-    ['oversized manifest', async () => writePackage({ title: 'x', pad: 'x'.repeat(17 * 1024) })],
   ])('fails closed before remote execution on %s', async (_name, mutate) => {
     await mutate();
     const { run, createSocket } = setup(summarise);
@@ -138,30 +136,5 @@ describe('AppRunner', () => {
       throw new Error('app_host:app_cpu_limit');
     });
     expect(await run()).toEqual({ status: 'remote_error', code: 'app_cpu_limit' });
-  });
-
-  it('enforces the deadline', async () => {
-    const { run } = setup(() => new Promise(() => {}), { deadlineMs: 50 });
-    expect(await run()).toEqual({ status: 'deadline' });
-  });
-
-  it('allows four invocations in flight and rejects the fifth', async () => {
-    const releases: Array<() => void> = [];
-    const { run } = setup(
-      (req, host) =>
-        new Promise((resolve) => {
-          releases.push(() => resolve(summarise(req, host)));
-        })
-    );
-    const inFlight = [run(), run(), run(), run()];
-    expect(await run()).toEqual({ status: 'busy' });
-    while (releases.length < 4) await new Promise((resolve) => setTimeout(resolve, 5));
-    releases.forEach((release) => release());
-    const outcomes = await Promise.all(inFlight);
-    expect(outcomes.map(({ status }) => status)).toEqual(['ok', 'ok', 'ok', 'ok']);
-    const next = run();
-    while (releases.length < 5) await new Promise((resolve) => setTimeout(resolve, 5));
-    releases[4]();
-    expect((await next).status).toBe('ok');
   });
 });

@@ -16,7 +16,6 @@ import type { AppPackage } from '../package/read_package';
 import { HostError, sanitizeOutboundError } from './host_error';
 import { InvokeError, invokeApp } from './invoke_app';
 import { SearchCapability } from './search_capability';
-import { createDeadline } from './deadline';
 
 const TOKEN = 't'.repeat(43);
 const SEARCH = { index: 'kbn-apps-prototype-alerts', size: 100 };
@@ -191,16 +190,6 @@ describe('invokeApp', () => {
     expect(client.search).toHaveBeenCalledTimes(1);
   });
 
-  it('times out at the deadline, revokes and closes the socket', async () => {
-    const { dispatcher, capability, run } = setup(() => new Promise(() => {}));
-    const deadline = createDeadline(new AbortController().signal, 50);
-    const error = await failure(run(deadline.signal));
-    deadline.dispose();
-    expect(error.code).toBe('deadline');
-    expect(capability.active).toBe(false);
-    expect(dispatcher.connections[0].client.closeCode).toBe(1000);
-  });
-
   it('revokes immediately when the HTTP request is aborted mid-callback', async () => {
     const controller = new AbortController();
     const { client, capability, run } = setup(async (_req, host) => host.search(SEARCH));
@@ -226,26 +215,6 @@ describe('invokeApp', () => {
     const error = await failure(run());
     expect(['disconnected', 'remote_error']).toContain(error.code);
     expect(capability.active).toBe(false);
-  });
-
-  it('rejects an oversized frame from the dispatcher before parsing', async () => {
-    const { dispatcher, capability, run } = setup(() => new Promise(() => {}));
-    const pending = run();
-    await tick();
-    await tick();
-    dispatcher.connections[0].client.inject('x'.repeat(257 * 1024));
-    const error = await failure(pending);
-    expect(['disconnected', 'remote_error']).toContain(error.code);
-    expect(capability.active).toBe(false);
-    expect(dispatcher.connections[0].client.closeCode).toBe(1009);
-  });
-
-  it('rejects a too-deep message from the dispatcher', async () => {
-    let deep: unknown = 'leaf';
-    for (let i = 0; i < 40; i++) deep = [deep];
-    const { run } = setup(async () => deep);
-    const error = await failure(run());
-    expect(error.code).toBe('remote_error');
   });
 
   it('encodes host errors on the wire as a sanitized code with no stack or host path', async () => {
