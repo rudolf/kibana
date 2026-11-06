@@ -112,6 +112,9 @@ export interface BuildUiReleaseOptions {
   readonly extraDefine?: Record<string, string>;
   /** Server label override (defaults to `label`). */
   readonly serverLabel?: string;
+  /** Server app entry (default `app/src/entry.ts`; a variant under `fixtures/kibana/`) and its constants. */
+  readonly serverEntry?: string;
+  readonly serverDefine?: Record<string, string>;
 }
 
 export const buildUiRelease = async ({
@@ -123,9 +126,12 @@ export const buildUiRelease = async ({
   mutate,
   extraDefine = {},
   serverLabel,
+  serverEntry = 'app/src/entry.ts',
+  serverDefine = {},
 }: BuildUiReleaseOptions): Promise<UiRelease> => {
-  const serverBundle = await bundleModule('app/src/entry.ts', {
+  const serverBundle = await bundleModule(serverEntry, {
     __APP_LABEL__: JSON.stringify(serverLabel ?? label),
+    ...serverDefine,
   });
   const uiBundle = await bundleUi(
     uiEntry,

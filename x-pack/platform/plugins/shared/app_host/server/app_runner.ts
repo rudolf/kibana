@@ -14,7 +14,11 @@ import { readPackage } from './package/read_package';
 import type { MinimalWebSocket } from './remote/bounded_transport';
 import { describeDispatcher } from './remote/dispatcher_endpoint';
 import { InvokeError, invokeApp, type InvokeErrorCode } from './remote/invoke_app';
-import { SearchCapability, type SearchObserver } from './remote/search_capability';
+import {
+  SearchCapability,
+  type CallbackAuthorizer,
+  type SearchObserver,
+} from './remote/search_capability';
 
 export interface AppRunnerConfig {
   readonly packagePath: string;
@@ -54,6 +58,8 @@ export interface RunSummaryOptions {
   readonly legacyOnly?: boolean;
   /** Observes each Worker-path HostEs search (audit attribution, S9). */
   readonly searchObserver?: SearchObserver;
+  /** Lifecycle authorization run before each HostEs search (the UI app session). */
+  readonly authorizeCallback?: CallbackAuthorizer;
 }
 
 /** Orchestrates one summary invocation: verify package, invoke remotely, validate output. */
@@ -81,7 +87,7 @@ export class AppRunner {
     try {
       const pkg = await readPackage(this.#config.packagePath);
       if (pkg.manifest.id !== appId) return { status: 'not_found' };
-      const { expectedReleaseDigest, legacyOnly, searchObserver } = options;
+      const { expectedReleaseDigest, legacyOnly, searchObserver, authorizeCallback } = options;
       if (
         expectedReleaseDigest !== undefined &&
         pkg.manifest.releaseDigest !== expectedReleaseDigest
@@ -89,7 +95,10 @@ export class AppRunner {
         return { status: 'release_mismatch' };
       }
       if (legacyOnly && pkg.manifest.ui !== undefined) return { status: 'release_mismatch' };
-      capability = new SearchCapability(esClient, { observer: searchObserver });
+      capability = new SearchCapability(esClient, {
+        observer: searchObserver,
+        authorize: authorizeCallback,
+      });
       const packageMs = performance.now() - started;
       const { value, timings } = await invokeApp({
         dispatcherUrl: this.#config.dispatcherUrl,

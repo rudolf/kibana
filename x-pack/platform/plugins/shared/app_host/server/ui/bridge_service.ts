@@ -118,6 +118,47 @@ const summaryOutcome = (outcome: SummaryOutcome): OperationOutcome => {
   }
 };
 
+/** A session's lifecycle refusal: the public code and its audit reason. */
+interface LifecycleRefusal {
+  readonly code: 'app_disabled' | 'app_stale';
+  readonly reason: AuditReason;
+}
+
+/**
+ * Lifecycle authorization of a session against one state read: enabled, the approved release it
+ * was minted for, and the approval generation it carries. Undefined when the session is current.
+ */
+const lifecycleRefusal = (
+  state: UiReleaseState,
+  session: SessionPayload
+): LifecycleRefusal | undefined => {
+  if (state.status === 'disabled') return { code: 'app_disabled', reason: 'disabled' };
+  if (state.status !== 'approved') return { code: 'app_stale', reason: 'not_approved' };
+  const { manifest, consent } = state;
+  if (manifest.releaseDigest !== session.release || manifest.id !== session.app) {
+    return { code: 'app_stale', reason: 'stale_release' };
+  }
+  // Disabled, uninstalled or re-approved since mint: refused forever, whether or not the key's
+  // invalidation in Elasticsearch succeeded (that is cleanup).
+  if (consent.generation !== session.generation) {
+    return { code: 'app_stale', reason: 'stale_generation' };
+  }
+  return undefined;
+};
+
+/** Audit reason of one backend HostEs callback, from the capability's outcome reason. */
+const callbackAuditReason = (reason: string): AuditReason => {
+  if (reason === 'ok') return 'ok';
+  if (reason === 'es_forbidden' || reason === 'index_not_granted') return 'native_denied';
+  const lifecycle: readonly string[] = [
+    'disabled',
+    'not_approved',
+    'stale_release',
+    'stale_generation',
+  ];
+  return lifecycle.includes(reason) ? (reason as AuditReason) : 'native_failed';
+};
+
 /** Reuses one state read for at most `maxAgeMs`; a failed read is never cached. */
 const cachedState = (
   read: () => Promise<UiReleaseState>,
@@ -194,6 +235,9 @@ export class BridgeService {
         summaryOutcome(
           await runner.runSummary(session.app, clients.esClient, signal, {
             expectedReleaseDigest: session.release,
+            // Each HostEs callback rechecks the session's lifecycle, as execute does: an invocation
+            // held open across a disable or a generation change cannot start new searches.
+            authorizeCallback: async () => (await this.#lifecycle(session)).refusal,
             // S9: Worker-path HostEs reads inside app.summary are attributed with this correlation id.
             searchObserver: (outcome, reason) =>
               this.#record(
@@ -201,11 +245,7 @@ export class BridgeService {
                 caller,
                 'es.search',
                 outcome,
-                reason === 'ok'
-                  ? 'ok'
-                  : reason === 'es_forbidden' || reason === 'index_not_granted'
-                  ? 'native_denied'
-                  : 'native_failed',
+                callbackAuditReason(reason),
                 correlationId,
                 'app.summary'
               ),
@@ -306,6 +346,19 @@ export class BridgeService {
       correlationId,
       via,
     });
+  }
+
+  /**
+   * The session's current lifecycle state. A cached read (≤ 2 s) may only accept; any refusal is
+   * decided on a fresh read, so a handle minted right after a state change is not refused as stale.
+   */
+  async #lifecycle(
+    session: SessionPayload
+  ): Promise<{ state: UiReleaseState; refusal: LifecycleRefusal | undefined }> {
+    const cached = await this.#cachedState();
+    if (!lifecycleRefusal(cached, session)) return { state: cached, refusal: undefined };
+    const state = await this.#readState();
+    return { state, refusal: lifecycleRefusal(state, session) };
   }
 
   /** Common pre-checks for session creation and execution; fail closed before any I/O. */
@@ -421,15 +474,8 @@ export class BridgeService {
       return failure(expired ? 'app_expired' : 'app_denied');
     }
     const { payload: session } = opened;
-    // 2. Enablement, approval and generation. A cached read (≤ 2 s) may only accept; any refusal is
-    // decided on a fresh read, so a handle minted right after a state change is not refused as stale.
-    const accepts = (current: UiReleaseState) =>
-      current.status === 'approved' &&
-      current.manifest.id === session.app &&
-      current.manifest.releaseDigest === session.release &&
-      current.consent.generation === session.generation;
-    const cached = await this.#cachedState();
-    const state = accepts(cached) ? cached : await this.#readState();
+    // 2. Enablement, approval and generation (cache may accept; refusals use a fresh read).
+    const { state, refusal } = await this.#lifecycle(session);
     const sessionApp: BridgeAuditEvent['app'] =
       state.status === 'approved' || state.status === 'disabled'
         ? appOf(state.manifest, session.id)
@@ -438,17 +484,9 @@ export class BridgeService {
       this.#record(sessionApp, caller, capabilityName, 'failure', reason, correlationId);
       return failure(code);
     };
-    if (state.status === 'disabled') return deny('app_disabled', 'disabled');
+    if (refusal) return deny(refusal.code, refusal.reason);
     if (state.status !== 'approved') return deny('app_stale', 'not_approved');
     const { manifest } = state;
-    if (manifest.releaseDigest !== session.release || manifest.id !== session.app) {
-      return deny('app_stale', 'stale_release');
-    }
-    // Disabled, uninstalled or re-approved since mint: refused forever, whether or not the key's
-    // invalidation in Elasticsearch succeeded (that is cleanup).
-    if (state.consent.generation !== session.generation) {
-      return deny('app_stale', 'stale_generation');
-    }
     // 3. Input schema only (closed union, scope, exact index and dashboard id; data view id syntax,
     // non-empty ES|QL query). Not authorization: the key's role descriptor and the
     // viewer's own privileges are enforced natively.

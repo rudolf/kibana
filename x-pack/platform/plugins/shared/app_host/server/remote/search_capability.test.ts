@@ -66,6 +66,22 @@ describe('SearchCapability', () => {
     expect(client.search).not.toHaveBeenCalled();
   });
 
+  it('runs the lifecycle authorizer before every search; a refusal never reaches Elasticsearch', async () => {
+    const client = createScopedClient();
+    client.search.mockResponse(searchResponse());
+    const observed: string[] = [];
+    const lifecycle: { refusal?: { code: 'app_disabled'; reason: string } } = {};
+    const capability = new SearchCapability(client, {
+      authorize: async () => lifecycle.refusal,
+      observer: (outcome, reason) => observed.push(`${outcome}:${reason}`),
+    });
+    await capability.search(params);
+    lifecycle.refusal = { code: 'app_disabled', reason: 'disabled' };
+    expect(await codeOf(capability.search(params))).toBe('app_disabled');
+    expect(client.search).toHaveBeenCalledTimes(1);
+    expect(observed).toEqual(['success:ok', 'failure:disabled']);
+  });
+
   it('rejects calls after revocation and aborts in-flight requests', async () => {
     const client = createScopedClient();
     let signal: AbortSignal | undefined;

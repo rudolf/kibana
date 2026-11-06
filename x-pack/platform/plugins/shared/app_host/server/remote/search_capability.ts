@@ -14,6 +14,14 @@ import { HostError } from './host_error';
 /** Observes every search attempt (audit attribution); never receives payloads. */
 export type SearchObserver = (outcome: 'success' | 'failure', reason: string) => void;
 
+/**
+ * Authorizes one callback before any Elasticsearch I/O. Resolves to undefined to allow, or to the
+ * refusal's public code and audit reason.
+ */
+export type CallbackAuthorizer = () => Promise<
+  { readonly code: 'app_disabled' | 'app_stale'; readonly reason: string } | undefined
+>;
+
 export interface HostEsRecord {
   readonly severity: string;
   readonly rule: string;
@@ -41,18 +49,21 @@ const SEVERITY_PATTERN = /^[a-z]{1,16}$/;
 
 export interface SearchCapabilityOptions {
   readonly observer?: SearchObserver;
+  readonly authorize?: CallbackAuthorizer;
   /** K1 fault injection only (dev-only config): skip the index literal of the input schema. */
   readonly anyIndex?: boolean;
 }
 
 /**
  * Request-scoped Elasticsearch capability behind the exposed `HostEs` facade. Holds a scoped
- * client (the app session key on the bridge path, `asCurrentUser` on the native route) and an abort
- * signal; never exposed. Elasticsearch decides what the client may read.
+ * client (the app session key on the bridge path, `asCurrentUser` on the native route), an abort
+ * signal and, on the bridge path, a lifecycle authorizer run before every search; never exposed.
+ * Elasticsearch decides what the client may read.
  */
 export class SearchCapability {
   readonly #client: ElasticsearchClient;
   readonly #observer: SearchObserver | undefined;
+  readonly #authorize: CallbackAuthorizer | undefined;
   readonly #anyIndex: boolean;
   readonly #abort = new AbortController();
   #active = true;
@@ -64,10 +75,11 @@ export class SearchCapability {
 
   constructor(
     client: ElasticsearchClient,
-    { observer, anyIndex = false }: SearchCapabilityOptions = {}
+    { observer, authorize, anyIndex = false }: SearchCapabilityOptions = {}
   ) {
     this.#client = client;
     this.#observer = observer;
+    this.#authorize = authorize;
     this.#anyIndex = anyIndex;
   }
 
@@ -97,7 +109,7 @@ export class SearchCapability {
       this.#observer?.('success', 'ok');
       return result;
     } catch (error) {
-      this.#observer?.('failure', error instanceof HostError ? error.code : 'host_error');
+      this.#observer?.('failure', error instanceof HostError ? error.reason : 'host_error');
       throw error;
     }
   }
@@ -109,6 +121,11 @@ export class SearchCapability {
     const input = parseSearchInput(params, { anyIndex: this.#anyIndex });
     if (!input.ok) throw new HostError(input.reason);
     const { index, size } = input;
+    if (this.#authorize) {
+      const refusal = await this.#authorize();
+      if (refusal) throw new HostError(refusal.code, refusal.reason);
+      if (!this.#active) throw new HostError('host_revoked');
+    }
     const started = performance.now();
     try {
       const response = await this.#client.search<AlertSource>(

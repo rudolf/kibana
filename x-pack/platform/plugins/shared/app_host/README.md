@@ -173,7 +173,13 @@ U2 — delegation and consent:
     no command allowlist, `maxRetries: 0`, the ES client's own request timeout; the response's `columns` and `values`
     as Elasticsearch sent them. Row limits are Elasticsearch's (the query's `LIMIT` and the cluster's
     ES|QL limits);
-  - `app.summary` → backend Worker → `HostEs` callbacks with the same key-scoped client.
+  - `app.summary` → backend Worker → `HostEs` callbacks with the same key-scoped client. Before
+    **each** callback the host rechecks the session's lifecycle exactly as execute does (enabled,
+    approved release, generation; the 2 s cache may accept, refusals use a fresh read). A held
+    invocation therefore cannot start new searches after a disable or a generation change, even if
+    the key's cleanup in Elasticsearch missed: the callback fails with `app_host:app_disabled` or
+    `app_host:app_stale` before any Elasticsearch I/O and is audited (`via: app.summary`, reason
+    `disabled` / `stale_generation` / …). A search already admitted runs to completion.
 
   No result size caps and no host deadline; a request abort aborts the operation. Native refusals map
   to `app_denied`, with the audit reason `native_denied` for a 401/403/404 and `native_rejected` for a

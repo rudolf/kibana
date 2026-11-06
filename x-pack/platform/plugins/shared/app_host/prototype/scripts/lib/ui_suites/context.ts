@@ -89,6 +89,8 @@ export interface ReleaseOptions {
   readonly approve?: boolean;
   readonly mutate?: (manifest: Record<string, unknown>) => void;
   readonly version?: string;
+  readonly serverEntry?: string;
+  readonly serverDefine?: Record<string, string>;
 }
 
 /** Builds, releases and (optionally) approves a UI release as the local superuser installer. */
@@ -101,6 +103,8 @@ export const release = async (ctx: SuiteContext, options: ReleaseOptions = {}) =
     dashboardId: ctx.seed.dashboardId,
     uiEntry: options.entry,
     mutate: options.mutate,
+    serverEntry: options.serverEntry,
+    serverDefine: options.serverDefine,
     extraDefine: {
       __RECEIVER__: JSON.stringify(ctx.receiver.origin),
       __KIBANA__: JSON.stringify(ctx.kibana),
@@ -118,7 +122,8 @@ export const release = async (ctx: SuiteContext, options: ReleaseOptions = {}) =
     });
   }
   ctx.current = built.manifest;
-  ctx.currentEntry = options.entry ?? 'ui/src/main.ts';
+  const uiEntry = options.entry ?? 'ui/src/main.ts';
+  ctx.currentEntry = options.serverEntry ? `${uiEntry}+${options.serverEntry}` : uiEntry;
   return built;
 };
 

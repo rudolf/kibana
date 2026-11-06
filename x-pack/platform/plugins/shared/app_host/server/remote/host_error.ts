@@ -8,6 +8,8 @@
 /** Fixed error codes that may cross the RPC boundary. Nothing else is sent to the dispatcher. */
 export type HostErrorCode =
   | 'host_revoked'
+  | 'app_disabled'
+  | 'app_stale'
   | 'invalid_search'
   | 'index_not_granted'
   | 'es_forbidden'
@@ -16,11 +18,14 @@ export type HostErrorCode =
 
 export class HostError extends Error {
   readonly code: HostErrorCode;
+  /** Audit reason (defaults to the code); never sent to the dispatcher. */
+  readonly reason: string;
 
-  constructor(code: HostErrorCode) {
+  constructor(code: HostErrorCode, reason: string = code) {
     super(`app_host:${code}`);
     this.name = 'HostError';
     this.code = code;
+    this.reason = reason;
   }
 }
 

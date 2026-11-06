@@ -1072,6 +1072,69 @@ export const runK5 = async (ctx: SuiteContext) => {
     HTTP,
     codeOf(await execute(ctx, fresh, SUMMARY)) === 'ok'
   );
+  await runHeldInvocation(ctx);
+};
+
+/**
+ * A backend invocation held open across a disable whose key cleanup misses: the app's later HostEs
+ * searches must be refused by the host's per-callback lifecycle check, not by Elasticsearch.
+ */
+const runHeldInvocation = async (ctx: SuiteContext) => {
+  const { report, users } = ctx;
+  const T = 'K5';
+  await release(ctx, {
+    label: 'Digest K5 held',
+    serverEntry: 'fixtures/kibana/held_search.ts',
+    serverDefine: { __WAITS_MS__: JSON.stringify([4_000, 3_000]) },
+  });
+  const from = readLines(AUDIT_LOG).length;
+  const held = await mint(ctx, users.viewer);
+  const started = Date.now();
+  const pending = execute(ctx, held, SUMMARY);
+  await sleep(SETTLE_MS); // the first search has run; the key is visible to name invalidation
+  // Disable: the generation is replaced, but key cleanup is made to miss (its request fails).
+  const failingHttp: typeof http = async () => {
+    throw new Error('cleanup made to miss');
+  };
+  const cleanup = await setAppEnabled(false, { esUrl: ctx.es, http: failingHttp }).then(
+    () => 'ran',
+    (error: Error) => error.message
+  );
+  // The second search runs ~4 s in (past the state cache); re-enable before the third (~7 s in).
+  await sleep(Math.max(0, started + 5_000 - Date.now()));
+  await setAppEnabled(true, { esUrl: ctx.es });
+  const response = await pending;
+  await sleep(500);
+  const records = auditSince(from).filter((r) => r.user?.name === users.viewer.username);
+  const keyId = records.find((r) => r.app?.capability === 'session.create')?.api_key?.id as
+    | string
+    | undefined;
+  const key = keyId ? await keyById(ctx, keyId) : undefined;
+  const callbacks = records
+    .filter((r) => r.app?.via === 'app.summary')
+    .map((r) => `${r.event?.outcome}:${r.event?.reason}`);
+  const label = (response.json as { result?: { label?: string } } | undefined)?.result?.label;
+  report.expect(
+    T,
+    'held invocation, disable with key cleanup missed: later HostEs searches refused by the host (app_disabled, then app_stale after re-enable); the key is still valid in ES',
+    HTTP,
+    cleanup.startsWith('App key invalidation failed') &&
+      key?.invalidated === false &&
+      label === 's:app_host:app_disabled|s:app_host:app_stale' &&
+      callbacks.join() === 'success:ok,failure:disabled,failure:stale_generation',
+    { cleanup, keyInvalidated: key?.invalidated, label, callbacks }
+  );
+  const after = await execute(ctx, held, SUMMARY);
+  report.expect(
+    T,
+    'the held session is stale for new calls too',
+    HTTP,
+    codeOf(after) === 'app_stale',
+    {
+      code: codeOf(after),
+    }
+  );
+  await invalidateAppKeys({ esUrl: ctx.es, appId: 'alert-digest' }).catch(() => undefined);
 };
 
 // ---------------------------------------------------------------- K5 reset / re-approval
