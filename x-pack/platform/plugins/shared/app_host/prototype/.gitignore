@@ -1,0 +1,7 @@
+node_modules/
+.local/
+dist/
+.wrangler/
+.dev.vars
+*.secret
+!package-lock.json

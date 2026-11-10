@@ -347,6 +347,17 @@ export const importPluginOverrides: OxlintOverride[] = [
     },
   },
   {
+    // App Host prototype: the Workers runtime requires each Worker main module to default-export its
+    // fetch handler. Scoped to exactly those two files; the rest of the prototype keeps the rule.
+    files: [
+      'x-pack/platform/plugins/shared/app_host/prototype/cloudflare/src/dispatcher.ts',
+      'x-pack/platform/plugins/shared/app_host/prototype/cloudflare/src/probe.ts',
+    ],
+    rules: {
+      'import/no-default-export': 'off',
+    },
+  },
+  {
     // CodeQL query fixtures call APIs that do not exist so the queries have something to flag.
     files: ['.github/codeql/**'],
     rules: {

@@ -1,0 +1,39 @@
+{
+  "name": "app-host-prototype-tools",
+  "private": true,
+  "version": "0.0.0",
+  "license": "Elastic License 2.0",
+  "type": "module",
+  "engines": {
+    "node": "24.22.1"
+  },
+  "scripts": {
+    "dev": "wrangler dev --config cloudflare/wrangler.jsonc --ip 127.0.0.1",
+    "secret:local": "tsx scripts/secret_local.ts",
+    "dev:probe": "wrangler dev --config cloudflare/wrangler.probe.jsonc --ip 127.0.0.1 --port 8788 --inspector-port 9230 --persist-to .local/probe-state",
+    "seam": "tsx scripts/seam.ts",
+    "seed": "tsx scripts/seed.ts",
+    "release": "tsx scripts/release.ts",
+    "acceptance": "tsx scripts/acceptance.ts",
+    "benchmark": "tsx scripts/benchmark.ts",
+    "typecheck": "tsc -p tsconfig.json && tsc -p cloudflare/tsconfig.json && tsc -p ui/tsconfig.json",
+    "test": "npm run -s typecheck && tsx --test 'test/*_test.ts'",
+    "lint": "npm run -s typecheck && cd ../../../../../.. && node scripts/eslint x-pack/platform/plugins/shared/app_host/prototype",
+    "kibana:config": "tsx scripts/local_kibana_config.ts",
+    "ui-check": "tsx scripts/ui_check.ts",
+    "ui:seed": "tsx scripts/ui_seed.ts",
+    "ui:operator": "tsx scripts/ui_operator.ts",
+    "ui:security": "tsx scripts/ui_security.ts"
+  },
+  "dependencies": {
+    "capnweb": "0.12.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20261104.1",
+    "@types/node": "24.19.2",
+    "esbuild": "0.28.2",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3",
+    "wrangler": "4.157.0"
+  }
+}

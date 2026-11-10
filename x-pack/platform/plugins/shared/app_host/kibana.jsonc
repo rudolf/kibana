@@ -1,0 +1,15 @@
+{
+  "type": "plugin",
+  "id": "@kbn/app-host-plugin",
+  "owner": ["@elastic/kibana-core"],
+  "group": "platform",
+  "visibility": "shared",
+  "description": "Prototype: runs one operator-installed backend app bundle in a fresh Cloudflare Dynamic Worker with a request-scoped Elasticsearch capability. Disabled by default.",
+  "plugin": {
+    "id": "appHost",
+    "server": true,
+    "browser": true,
+    "configPath": ["xpack", "app_host"],
+    "requiredPlugins": ["features"]
+  }
+}

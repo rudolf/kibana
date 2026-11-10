@@ -28,6 +28,7 @@
     "xpack.stackAlerts": "platform/plugins/shared/stack_alerts",
     "xpack.stackConnectors": "platform/plugins/shared/stack_connectors",
     "xpack.apm": "solutions/observability/plugins/apm",
+    "xpack.appHost": "platform/plugins/shared/app_host",
     "xpack.apmSourcesAccess": "platform/plugins/shared/apm_sources_access",
     "xpack.automaticImport": "platform/plugins/shared/automatic_import",
     "xpack.banners": "platform/plugins/private/banners",

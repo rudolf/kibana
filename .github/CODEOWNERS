@@ -300,6 +300,9 @@ src/core/packages/pricing/server-mocks @elastic/kibana-core
 src/core/packages/pubsub/server @elastic/kibana-core
 src/core/packages/pubsub/server-internal @elastic/kibana-core
 src/core/packages/pubsub/server-mocks @elastic/kibana-core
+src/core/packages/remote/common @elastic/kibana-core
+src/core/packages/remote/server @elastic/kibana-core
+src/core/packages/remote/server-internal @elastic/kibana-core
 src/core/packages/rendering/browser @elastic/kibana-core
 src/core/packages/rendering/browser-internal @elastic/kibana-core
 src/core/packages/rendering/browser-mocks @elastic/kibana-core
@@ -1270,6 +1273,7 @@ x-pack/platform/plugins/shared/alerting @elastic/response-ops
 x-pack/platform/plugins/shared/alerting_v2 @elastic/rna-project-team
 x-pack/platform/plugins/shared/anonymization @elastic/workchat-eng @elastic/security-threat-hunting
 x-pack/platform/plugins/shared/apm_sources_access @elastic/obs-signals-traces-team
+x-pack/platform/plugins/shared/app_host @elastic/kibana-core
 x-pack/platform/plugins/shared/automatic_import @elastic/siem-conduit
 x-pack/platform/plugins/shared/cases @elastic/security-investigations
 x-pack/platform/plugins/shared/cloud @elastic/kibana-core
