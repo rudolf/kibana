@@ -50,19 +50,22 @@ const ATTEMPT_TIMEOUT_MS = 2500;
 
 /** Runs one probe; a probe that never settles (some engines leave storage opens pending) times out. */
 const attempt = async (name: string, action: () => unknown): Promise<void> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     const value = await Promise.race([
       Promise.resolve().then(action),
-      new Promise((_, reject) =>
-        setTimeout(
+      new Promise((_, reject) => {
+        timer = setTimeout(
           () => reject(Object.assign(new Error('timeout'), { name: 'Timeout' })),
           ATTEMPT_TIMEOUT_MS
-        )
-      ),
+        );
+      }),
     ]);
     results[name] = `executed:${String(value).slice(0, 80)}`;
   } catch (error) {
     results[name] = `blocked:${(error as Error)?.name ?? 'Error'}`;
+  } finally {
+    clearTimeout(timer);
   }
 };
 

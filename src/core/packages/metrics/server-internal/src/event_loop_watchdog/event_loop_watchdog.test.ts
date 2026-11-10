@@ -62,6 +62,7 @@ describe('EventLoopWatchdog', () => {
       start: jest.fn(),
       stop: jest.fn(() => new Promise<void>((resolve) => (resolveStop = resolve))),
       status: jest.fn(),
+      ready: jest.fn(() => Promise.resolve()),
     };
     createWorker.mockReset();
     createWorker.mockReturnValue(worker);
