@@ -118,15 +118,20 @@ export const buildRemoteBundle = async ({
     ].map(({ modulePath }) => modulePath)
   );
   const host = resolve('src/core/packages/remote/server-internal/src/remote_process_entry.ts');
-  const entry = `import { serveProcess } from ${JSON.stringify(host)};
+  const entry = `import { isMainThread, workerData } from 'node:worker_threads';
+    import { serveProcess, serveWorker } from ${JSON.stringify(host)};
     export const spec = ${JSON.stringify(spec)};
     export const implementations = {
       ${[...implementations]
         .map((path) => `${JSON.stringify(path)}: () => import(${JSON.stringify(path)})`)
         .join(',\n')}
     };
-    if (process.send) serveProcess(spec, implementations);`;
+    if (process.send) serveProcess(spec, implementations);
+    else if (!isMainThread && workerData?.__kbnRemoteBundlePort) serveWorker(spec, implementations);`;
   mkdirSync(outdir, { recursive: true });
+  const lodashEsDir = resolve('node_modules/lodash-es');
+  const pureWorkspacePackagePattern =
+    /[\\/](?:kbn-workflows(?:-[a-z-]+)?|kbn-connector-specs(?:-runtime)?|kbn-config-schema|kbn-significant-events-runtime|kbn-securitysolution-esql-runtime|core[\\/]packages[\\/](?:di|remote))[\\/]/;
   const result = await build({
     stdin: { contents: entry, resolveDir: process.cwd(), sourcefile: `${graph.id}.ts` },
     outdir,
@@ -135,6 +140,8 @@ export const buildRemoteBundle = async ({
     outExtension: { '.js': '.mjs' },
     bundle: true,
     splitting: true,
+    minify: true,
+    legalComments: 'none',
     platform: 'node',
     format: 'esm',
     target: 'node24',
@@ -155,6 +162,37 @@ export const buildRemoteBundle = async ({
             }).source,
             loader: 'js',
           }));
+        },
+      },
+      {
+        name: 'lodash-es-and-pure-workspace-side-effects',
+        setup(bundler) {
+          if (existsSync(lodashEsDir)) {
+            bundler.onResolve({ filter: /^lodash(?:\/([a-zA-Z0-9_]+))?$/ }, (args) => {
+              const fn = args.path === 'lodash' ? undefined : args.path.slice('lodash/'.length);
+              if (!fn) {
+                const indexFile = join(lodashEsDir, 'lodash.js');
+                return existsSync(indexFile) ? { path: indexFile, sideEffects: false } : null;
+              }
+              const esFile = join(lodashEsDir, `${fn}.js`);
+              return existsSync(esFile) ? { path: esFile, sideEffects: false } : null;
+            });
+          }
+          bundler.onResolve({ filter: /^(?:@kbn\/|\.\.?\/)/ }, async (args) => {
+            if (args.pluginData?.__pureSideEffectsChecked) return null;
+            if (!args.resolveDir) return null;
+            const resolved = await bundler.resolve(args.path, {
+              kind: args.kind,
+              resolveDir: args.resolveDir,
+              importer: args.importer,
+              pluginData: { ...args.pluginData, __pureSideEffectsChecked: true },
+            });
+            if (resolved.errors.length || !resolved.path) return null;
+            if (pureWorkspacePackagePattern.test(resolved.path)) {
+              return { ...resolved, sideEffects: false };
+            }
+            return null;
+          });
         },
       },
     ],
@@ -197,7 +235,17 @@ export const buildRemoteBundle = async ({
     contributions.filter(({ kind }) => sourceDigestKinds.includes(kind))
   );
   writeFileSync(join(outdir, 'source_digests.json'), JSON.stringify(sourceDigests, null, 2));
-  const bytes = result.outputFiles.reduce((sum, output) => sum + output.contents.length, 0);
+  const escapeNonAscii = (text: string): string =>
+    text.replace(/[^\x00-\x7f]/g, (ch) => {
+      const code = ch.charCodeAt(0);
+      return `\\u${code.toString(16).padStart(4, '0')}`;
+    });
+  const encodedOutputs = result.outputFiles.map((output) => {
+    const raw = Buffer.from(output.contents).toString('utf8');
+    const ascii = escapeNonAscii(raw);
+    return { path: output.path, contents: Buffer.from(ascii, 'utf8') };
+  });
+  const bytes = encodedOutputs.reduce((sum, output) => sum + output.contents.length, 0);
   const sizeReport = {
     bytes,
     reportingCeilingBytes,
@@ -205,7 +253,7 @@ export const buildRemoteBundle = async ({
       reportingCeilingBytes === undefined ? undefined : bytes > reportingCeilingBytes,
   };
   writeFileSync(join(outdir, 'bundle_size.json'), JSON.stringify(sizeReport, null, 2));
-  for (const output of result.outputFiles) writeFileSync(output.path, output.contents);
+  for (const output of encodedOutputs) writeFileSync(output.path, output.contents);
   writeFileSync(join(outdir, 'spec.json'), JSON.stringify(spec, null, 2));
   writeFileSync(join(outdir, 'selection_report.json'), JSON.stringify(selectionReport, null, 2));
   return {

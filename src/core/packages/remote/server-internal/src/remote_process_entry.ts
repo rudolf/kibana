@@ -7,7 +7,8 @@
  * License v3.0 only", or the "Server Side Public License, v 1".
  */
 
-import type { RemoteWorkerSpec } from '@kbn/core-remote-common';
+import { parentPort, workerData, type MessagePort } from 'node:worker_threads';
+import { openPortSession, type RemoteWorkerSpec } from '@kbn/core-remote-common';
 import { buildExecutor } from './build_executor';
 import { createBridge } from './executor_bridge';
 import { openIpcSession } from './ipc_session';
@@ -78,4 +79,46 @@ export const serveProcess = (
     }
   };
   process.on('message', onInit);
+};
+
+/** Hosts a statically bundled graph inside a `worker_threads` Worker (same bundle as `serveProcess`). */
+export const serveWorker = (
+  spec: RemoteWorkerSpec,
+  implementations: ImplementationImports
+): void => {
+  const data = workerData as { __kbnRemoteBundlePort?: MessagePort; signature?: string } | null;
+  const port = data?.__kbnRemoteBundlePort;
+  if (!parentPort || !port) {
+    throw new Error('Remote worker bundle host requires parentPort and __kbnRemoteBundlePort');
+  }
+  const bridge = createBridge();
+  const gateway = openPortSession<CoordinatorApi>(port, bridge.rpc);
+  void (async () => {
+    try {
+      if (data.signature && data.signature !== graphSignature(spec)) {
+        throw new Error('Remote bundle registration mismatch');
+      }
+      const coordinator = new Map(
+        spec.coordinatorTokenIds.map((tokenId) => [tokenId, gateway.getCapability(tokenId)])
+      );
+      const loaded: string[] = [];
+      const executor = await buildExecutor(spec, coordinator, loaded, async (path, exportName) => {
+        const load = implementations[path];
+        if (!load) throw new Error(`Implementation absent from worker bundle: ${path}`);
+        const implementation = (await load())[exportName];
+        if (!implementation) throw new Error(`Missing bundled export: ${exportName}`);
+        loaded.push(path);
+        return implementation;
+      });
+      bridge.attach(executor, loaded);
+      parentPort.postMessage({ kind: 'ready' });
+    } catch (error) {
+      parentPort.postMessage({
+        kind: 'boot-error',
+        message: error instanceof Error ? error.message : String(error),
+      });
+      port.close();
+      process.exitCode = 1;
+    }
+  })();
 };

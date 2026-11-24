@@ -14,7 +14,7 @@ import { once } from 'node:events';
 import { existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
-import { MessageChannel, type MessagePort } from 'node:worker_threads';
+import { MessageChannel, Worker, type MessagePort } from 'node:worker_threads';
 import {
   openPortSession,
   remoteTokenId,
@@ -569,6 +569,15 @@ export class RemoteService implements RemoteSetup {
     );
   }
 
+  private getMaxOldGenerationSizeMb(): number {
+    const envVal = process.env.KBN_REMOTE_MAX_OLD_SPACE_MB;
+    if (envVal) {
+      const parsed = Number.parseInt(envVal, 10);
+      if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    }
+    return this.limits.maxOldGenerationSizeMb;
+  }
+
   private async startProcess(
     id: string,
     spec: RemoteWorkerSpec,
@@ -582,7 +591,7 @@ export class RemoteService implements RemoteSetup {
     getIpcMessageDelayMs();
     const child = fork(entry, [], {
       execArgv: [
-        `--max-old-space-size=${this.limits.maxOldGenerationSizeMb}`,
+        `--max-old-space-size=${this.getMaxOldGenerationSizeMb()}`,
         ...(process.env.KBN_REMOTE_LOAD_HOOK ? ['--import', process.env.KBN_REMOTE_LOAD_HOOK] : []),
         ...(process.env.KBN_REMOTE_EXPOSE_GC === 'true' ? ['--expose-gc'] : []),
       ],
@@ -656,6 +665,12 @@ export class RemoteService implements RemoteSetup {
     spec: RemoteWorkerSpec,
     coordinator: Map<string, object>
   ): Promise<LeaseHost<RemoteSession<unknown>>> {
+    const directory =
+      this.limits.bundleDirectory ?? process.env.KBN_REMOTE_BUNDLE_DIR ?? 'target/remote_bundles';
+    const bundledEntry = join(directory, id, 'graph.mjs');
+    if (existsSync(bundledEntry)) {
+      return this.startBundledWorker(id, spec, coordinator, bundledEntry);
+    }
     const { port1, port2 } = new MessageChannel();
     const gateway = new CoordinatorGateway(coordinator);
     // Session is established before the worker runs so capability lookups during ready can land.
@@ -700,6 +715,101 @@ export class RemoteService implements RemoteSetup {
       () => alive,
       port1
     );
+  }
+
+  private async startBundledWorker(
+    id: string,
+    spec: RemoteWorkerSpec,
+    coordinator: Map<string, object>,
+    entry: string
+  ): Promise<LeaseHost<RemoteSession<unknown>>> {
+    const { port1, port2 } = new MessageChannel();
+    const gateway = new CoordinatorGateway(coordinator);
+    const stub = openPortSession(port1, gateway);
+    let alive = true;
+    const terminated = new AbortController();
+    const worker = new Worker(entry, {
+      workerData: {
+        __kbnRemoteBundlePort: port2,
+        signature: graphSignature(spec),
+      },
+      transferList: [port2],
+      resourceLimits: { maxOldGenerationSizeMb: this.getMaxOldGenerationSizeMb() },
+    });
+    const markDead = (reason: string) => {
+      if (!alive) return;
+      alive = false;
+      this.logger.warn(
+        `Remote graph "${id}" worker thread exited (${reason}); outstanding calls fail and are not replayed`
+      );
+      try {
+        (stub as unknown as { [Symbol.dispose]?: () => void })[Symbol.dispose]?.();
+      } catch {
+        // ignore dispose errors during crash teardown
+      }
+      port1.close();
+      terminated.abort();
+    };
+    worker.once('exit', (code: number) => markDead(`code ${code}`));
+    worker.on('error', (error: Error) => markDead(error.message));
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(
+          () => finish(new Error(`Remote graph "${id}" worker boot timed out`)),
+          120_000
+        );
+        const onBootExit = (code: number) =>
+          finish(new Error(`Remote graph "${id}" worker exited before ready: ${code}`));
+        const onError = (error: Error) => finish(error);
+        const onMessage = (message: { kind?: string; message?: string }) => {
+          if (message?.kind === 'ready') finish();
+          if (message?.kind === 'boot-error') finish(new Error(message.message));
+        };
+        const finish = (error?: Error) => {
+          clearTimeout(timeout);
+          worker.off('message', onMessage);
+          worker.off('exit', onBootExit);
+          worker.off('error', onError);
+          if (error) reject(error);
+          else resolve();
+        };
+        worker.on('message', onMessage);
+        worker.once('exit', onBootExit);
+        worker.once('error', onError);
+      });
+      worker.unref();
+      const onTestKill = () => {
+        this.logger.warn(
+          `Remote graph "${id}" received SIGUSR2; terminating worker thread ${worker.threadId}`
+        );
+        markDead('terminated via SIGUSR2');
+        void worker.terminate();
+      };
+      if (process.env.KBN_REMOTE_TEST_KILL_SIGNAL === 'SIGUSR2') {
+        process.once('SIGUSR2', onTestKill);
+      }
+      this.logger.info(`Remote graph "${id}" ready on bundled worker thread ${worker.threadId}`);
+      return this.openSession(
+        id,
+        stub,
+        async () => {
+          process.off('SIGUSR2', onTestKill);
+          alive = false;
+          port1.close();
+          terminated.abort();
+          await worker.terminate();
+        },
+        () => alive,
+        port1,
+        terminated.signal
+      );
+    } catch (error) {
+      alive = false;
+      port1.close();
+      terminated.abort();
+      await worker.terminate();
+      throw error;
+    }
   }
 }
 
