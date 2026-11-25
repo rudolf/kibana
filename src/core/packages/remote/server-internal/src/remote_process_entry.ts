@@ -20,6 +20,27 @@ interface CoordinatorApi {
 
 export type ImplementationImports = Readonly<Record<string, () => Promise<Record<string, object>>>>;
 
+/** Instantiates a statically bundled graph directly in the current thread (no IPC/RPC). */
+export const createInProcessExecutor = async (
+  spec: RemoteWorkerSpec,
+  implementations: ImplementationImports,
+  getCapability: (tokenId: string) => object
+): Promise<{ executor: object; loaded: string[] }> => {
+  const coordinator = new Map(
+    spec.coordinatorTokenIds.map((tokenId) => [tokenId, getCapability(tokenId)])
+  );
+  const loaded: string[] = [];
+  const executor = await buildExecutor(spec, coordinator, loaded, async (path, exportName) => {
+    const load = implementations[path];
+    if (!load) throw new Error(`Implementation absent from worker bundle: ${path}`);
+    const implementation = (await load())[exportName];
+    if (!implementation) throw new Error(`Missing bundled export: ${exportName}`);
+    loaded.push(path);
+    return implementation;
+  });
+  return { executor, loaded };
+};
+
 /** Hosts a statically bundled graph; no source transpiler or plugin discovery runs in the child. */
 export const serveProcess = (
   spec: RemoteWorkerSpec,

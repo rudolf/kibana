@@ -119,13 +119,14 @@ export const buildRemoteBundle = async ({
   );
   const host = resolve('src/core/packages/remote/server-internal/src/remote_process_entry.ts');
   const entry = `import { isMainThread, workerData } from 'node:worker_threads';
-    import { serveProcess, serveWorker } from ${JSON.stringify(host)};
+    import { createInProcessExecutor, serveProcess, serveWorker } from ${JSON.stringify(host)};
     export const spec = ${JSON.stringify(spec)};
     export const implementations = {
       ${[...implementations]
         .map((path) => `${JSON.stringify(path)}: () => import(${JSON.stringify(path)})`)
         .join(',\n')}
     };
+    export const createInProcess = (getCapability) => createInProcessExecutor(spec, implementations, getCapability);
     if (process.send) serveProcess(spec, implementations);
     else if (!isMainThread && workerData?.__kbnRemoteBundlePort) serveWorker(spec, implementations);`;
   mkdirSync(outdir, { recursive: true });
