@@ -336,7 +336,7 @@ export function makeGraph1520Def(blocks = 190) {
   };
 }
 
-export function startMockEs({ alertCount = 50, esqlRows = 1, latencyMs = 0 } = {}) {
+export function startMockEs({ alertCount = 50, esqlRows = 1, latencyMs = Number(process.env.MOCK_IO_LATENCY_MS || 0) } = {}) {
   const alerts = Array.from({ length: alertCount }, (_, index) => {
     const host = `host-${String(index).padStart(5, '0')}`;
     const severity = index % 2 === 0 ? 'high' : 'low';
@@ -428,7 +428,12 @@ export function startMockEs({ alertCount = 50, esqlRows = 1, latencyMs = 0 } = {
   });
 }
 
-export function makeCoordinator(executions, stepsMap, { trackTimings = false } = {}) {
+export function makeCoordinator(
+  executions,
+  stepsMap,
+  { trackTimings = false, ioLatencyMs = Number(process.env.MOCK_IO_LATENCY_MS || 0) } = {}
+) {
+  const waitIo = () => (ioLatencyMs > 0 ? delay(ioLatencyMs) : Promise.resolve());
   const timing = { rpcCalls: 0, rpcMs: 0 };
   const timed = async (fn) => {
     if (!trackTimings) return fn();
@@ -493,6 +498,7 @@ export function makeCoordinator(executions, stepsMap, { trackTimings = false } =
     }
     async executeConnector(_scopeId, params) {
       return timed(async () => {
+        await waitIo();
         if (params.connectorType === '.slack_api' || params.connectorNameOrId === 'slack-conn-1') {
           return { ok: true, message: { text: params.input?.text ?? 'ok' } };
         }
@@ -555,6 +561,7 @@ export function makeCoordinator(executions, stepsMap, { trackTimings = false } =
       };
     }
     async start() {
+      await waitIo();
       return { workflowExecutionId: 'child-exec-1' };
     }
     async getExecution() {
@@ -586,6 +593,7 @@ export function makeCoordinator(executions, stepsMap, { trackTimings = false } =
       };
     }
     async relay() {
+      await waitIo();
       return { status: 200, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ok: true, message: { text: 'confirm-delivery ok' } }) };
     }
     async finalize() {}
@@ -634,6 +642,7 @@ export function makeCoordinator(executions, stepsMap, { trackTimings = false } =
       return out;
     }
     async invoke(req) {
+      await waitIo();
       const type = req.description?.type || req.connectorType;
       if (type === 'slack2.sendMessage') return { output: { ok: true, message: { text: 'confirm-delivery ok' } } };
       if (type === 'ai.prompt') return { output: { content: '25 high alerts triaged.' } };
@@ -646,9 +655,11 @@ export function makeCoordinator(executions, stepsMap, { trackTimings = false } =
 
   class CasesStub extends RpcTarget {
     async createCase(_scopeId, input) {
+      await waitIo();
       return { id: 'case-1', title: input?.title ?? 'Big workflow authentication triage' };
     }
     async caseCreate(_scopeId, input) {
+      await waitIo();
       return { id: 'case-1', title: input?.title ?? 'Big workflow authentication triage', owner: 'cases' };
     }
   }

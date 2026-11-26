@@ -498,32 +498,48 @@ docker run --rm [--cpus=1] -v "$WORK:/work:ro" \
 
 *(0 HTTP errors across all 15 runs.)*
 
-### Results — Table H3: Serverless Pod Envelope (`--cpus=0.125` request vs. `--cpus=2` burst limit, `100 ms` ES latency, Sweet Spot, `[ENV-LIN-PC1-JE]`)
+### Results — Table H3: Serverless Pod Envelope (`--cpus=0.125` request vs. `--cpus=2` burst limit, `100 ms` all-mocks I/O, Sweet Spot, `[ENV-LIN-PC1-JE]`)
 
 | Topology | Peak Anonymous memory | Batch wall time (`0.125 vCPU`) | Batch wall time (`2 vCPU`) | Main responsiveness (`/login` p99: `0.125` / `2 vCPU`) |
 | --- | ---: | ---: | ---: | ---: |
-| **In process (today, 10 parallel)** | **53–63 MiB** *(host Δ)* | **29.0 s** | **2.2 s** | **20,675 ms / 1,367 ms** |
-| **1 worker thread (10 parallel)** | **73–100 MiB** *(combined Δ)* | **34.7 s** | **1.9 s** | **499 ms / 27.6 ms** |
-| **1 child process (10 parallel)** | **75–110 MiB** *(worker-only)* | **36.0 s** | **2.0 s** | **199 ms / 4.9 ms** |
-| **10 worker threads (1 each)** | **364–396 MiB** *(combined Δ)* | **328.1 s** *(~5.5 min)* | **4.2 s** | **7,957 ms / 102.4 ms** |
-| **10 child processes (1 each)** | **584–612 MiB** *(sum of 10 PIDs)* | **266.7 s** *(~4.4 min)* | **4.8 s** | **20,277 ms / 136.2 ms** |
+| **In process (today, 10 parallel)** | **54–64 MiB** *(host Δ)* | **26.9 s** | **2.6 s** | **38,703 ms / 1,303 ms** |
+| **1 worker thread (10 parallel)** | **72–100 MiB** *(combined Δ)* | **32.8 s** | **2.6 s** | **752 ms / 29.2 ms** |
+| **1 child process (10 parallel)** | **75–100 MiB** *(worker-only)* | **33.3 s** | **2.6 s** | **322 ms / 6.4 ms** |
+| **10 worker threads (1 each)** | **348–375 MiB** *(combined Δ)* | **243.5 s** *(~4.1 min)* | **4.1 s** | **1,802 ms / 70.1 ms** |
+| **10 child processes (1 each)** | **580–589 MiB** *(sum of 10 PIDs)* | **232.9 s** *(~3.9 min)* | **5.0 s** | **17,598 ms / 180.3 ms** |
 
-> **Workload & environment footnote:** Each batch executes **10 concurrent Scenario A workflows** (262 steps/workflow = 2,620 total steps per batch: ES search of 50 alerts, ES|QL query, `data.map`/`data.filter`, 50-item `foreach` with `if`/`data.set`/`data.map`, ES bulk/index, and mocked Slack/AI/Cases/child-workflow steps) against the pre-built 889-step lazy ESM bundle (`17.52 MiB`, 572 chunks, minified, ASCII-escaped, `lodash-es`, `sideEffects: false`). The worker runs the real `@elastic/elasticsearch` client against an in-container mock ES server with a fixed **100 ms** response latency (no jitter) to simulate realistic I/O wait reproducibly; an independent HTTP load-generator Worker polls `/login` on main every 15 ms. Measured in Linux `aarch64` Docker (`ubuntu:24.04`) with `--cpus=0.125` (K8s request floor) and `--cpus=2` (burst limit) on **Elastic production serverless Node `v24.22.1` with V8 pointer compression enabled (`v8_enable_pointer_compression=1`)**, `LD_PRELOAD=libjemalloc.so.2`, and sweet-spot memory tuning (`MALLOC_CONF="narenas:2,dirty_decay_ms:0,muzzy_decay_ms:0"`, V8 `--optimize-for-size`, and a `4 MiB` young-generation cap via `--max-semi-space-size=4` for `child_process` or `resourceLimits.maxYoungGenerationSizeMb: 4` for `worker_thread`). Values are warm-batch medians (`n = 3`, except `n = 1` for 10-worker topologies at `0.125 vCPU` after 1 cold warmup batch); Peak Anonymous memory is total pod `Anon` (`/proc/<pid>/smaps_rollup` `Anonymous`, reported as the `0.125`–`2 vCPU` range).
+*(At `--cpus=1`, sweet spot, `100 ms` all-mocks I/O: `in_process` `3.14 s` / `1,878 ms` p99; `1 worker_thread` `3.14 s` / `68.9 ms` p99; `1 child_process` `2.96 s` / `31.9 ms` p99; `10 worker_threads` `11.04 s` / `189.5 ms` p99; `10 child_processes` `13.47 s` / `269.3 ms` p99.)*
 
-### Results — Table H4: CPU Cost of Memory Tuning (`default` vs. `sweet`, `--cpus=2`, `100 ms` ES latency, `[ENV-LIN-PC1-JE]`)
+> **Workload & environment footnote:** Each batch executes **10 concurrent Scenario A workflows** (262 steps/workflow = 2,620 total steps per batch: ES search of 50 alerts, ES|QL query, `data.map`/`data.filter`, 50-item `foreach` with `if`/`data.set`/`data.map`, ES bulk/index, and mocked Slack/AI/Cases/child-workflow steps) against the pre-built 889-step lazy ESM bundle (`17.52 MiB`, 572 chunks, minified, ASCII-escaped, `lodash-es`, `sideEffects: false`). The worker runs the real `@elastic/elasticsearch` client against an in-container mock ES server, with a fixed **100 ms** response latency (`MOCK_IO_LATENCY_MS=100`, no jitter) applied to **both** ES HTTP responses and mocked external coordinator calls (Slack, AI prompt, Cases, child-workflow start) to simulate realistic I/O wait reproducibly; an independent HTTP load-generator Worker polls `/login` on main every 15 ms. Measured in Linux `aarch64` Docker (`ubuntu:24.04`) with `--cpus=0.125` (K8s request floor) and `--cpus=2` (burst limit) on **Elastic production serverless Node `v24.22.1` with V8 pointer compression enabled (`v8_enable_pointer_compression=1`)**, `LD_PRELOAD=libjemalloc.so.2`, and sweet-spot memory tuning (`MALLOC_CONF="narenas:2,dirty_decay_ms:0,muzzy_decay_ms:0"`, V8 `--optimize-for-size`, and a `4 MiB` young-generation cap via `--max-semi-space-size=4` for `child_process` or `resourceLimits.maxYoungGenerationSizeMb: 4` for `worker_thread`). Values are warm-batch medians (`n = 3`, except `n = 1` for 10-worker topologies at `0.125 vCPU` after 1 cold warmup batch); Peak Anonymous memory is total pod `Anon` (`/proc/<pid>/smaps_rollup` `Anonymous`, reported as the `0.125`–`2 vCPU` range).
 
-Total container CPU time (`user + sys` from `/sys/fs/cgroup/cpu.stat`) across all processes/threads for **40 Scenario A workflows** (1 cold + 3 warm batches of 10 parallel runs = 10,480 steps, idle host load `0.82`):
+### Results — Table H4: CPU Cost of Memory Tuning (`default` vs. `sweet`, `--cpus=2`, `100 ms` all-mocks I/O, `[ENV-LIN-PC1-JE]`)
+
+Total container CPU time (`user + sys` from `/sys/fs/cgroup/cpu.stat`) across all processes/threads for **40 Scenario A workflows** (1 cold + 3 warm batches of 10 parallel runs = 10,480 steps, `MOCK_IO_LATENCY_MS=100`):
 
 | Topology (10 parallel) | Untuned (`default`) CPU | Tuned (`sweet`) CPU | CPU saved without tuning | Peak `Anon` (Untuned → Tuned) | Warm Batch Wall (Untuned → Tuned) |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| **In process (10 parallel)** | **7.72 s** *(7.30u / 0.42s)* | **8.54 s** *(8.06u / 0.48s)* | **–9.6%** *(–0.82 s)* | 238 → **54 MiB** *(4.4×)* | 2.12 → 2.19 s |
-| **1 worker thread (10 parallel)** | **8.06 s** *(7.51u / 0.54s)* | **9.41 s** *(8.77u / 0.65s)* | **–14.3%** *(–1.35 s)* | 293 → **109 MiB** *(2.7×)* | 1.77 → 1.95 s |
-| **1 child process (10 parallel)** | **8.39 s** *(7.76u / 0.62s)* | **9.97 s** *(9.33u / 0.64s)* | **–15.8%** *(–1.58 s)* | 308 → **106 MiB** *(2.9×)* | 1.84 → 2.01 s |
-| **10 worker threads (1 each)** | **28.71 s** *(25.10u / 3.60s)* | **37.86 s** *(34.09u / 3.77s)* | **–24.2%** *(–9.15 s)* | 1,251 → **395 MiB** *(3.2×)* | 3.41 → 4.42 s |
-| **10 child processes (1 each)** | **36.60 s** *(32.31u / 4.29s)* | **43.19 s** *(38.83u / 4.37s)* | **–15.3%** *(–6.59 s)* | 1,651 → **625 MiB** *(2.6×)* | 3.78 → 4.63 s |
+| **In process (10 parallel)** | **7.95 s** *(7.40u / 0.55s)* | **9.04 s** *(8.53u / 0.51s)* | **–12.1%** *(–1.09 s)* | 226 → **54 MiB** *(4.2×)* | 2.43 → 2.59 s |
+| **1 worker thread (10 parallel)** | **8.64 s** *(7.93u / 0.71s)* | **9.79 s** *(9.04u / 0.76s)* | **–11.7%** *(–1.15 s)* | 293 → **100 MiB** *(2.9×)* | 2.51 → 2.59 s |
+| **1 child process (10 parallel)** | **8.71 s** *(8.03u / 0.68s)* | **10.16 s** *(9.42u / 0.75s)* | **–14.3%** *(–1.45 s)* | 304 → **100 MiB** *(3.0×)* | 2.41 → 2.56 s |
+| **10 worker threads (1 each)** | **26.07 s** *(22.82u / 3.25s)* | **33.38 s** *(30.24u / 3.14s)* | **–21.9%** *(–7.31 s)* | 1,227 → **375 MiB** *(3.3×)* | 3.44 → 4.10 s |
+| **10 child processes (1 each)** | **34.93 s** *(30.94u / 4.00s)* | **43.67 s** *(39.13u / 4.54s)* | **–20.0%** *(–8.74 s)* | 1,644 → **589 MiB** *(2.8×)* | 4.15 → 4.98 s |
 
-- **Where the CPU delta comes from:** Kernel `sys` CPU is nearly identical between untuned and tuned (`0.62 → 0.64 s` on `1 child_process`, `4.29 → 4.37 s` on `10 child_processes`), showing that `jemalloc`'s `narenas:2,dirty_decay_ms:0` `madvise()` purging has negligible CPU cost. Almost all of the ~10–16% (24% on `10 worker_threads`) extra CPU is user-space V8 GC from `--optimize-for-size` and the `4 MiB` young-gen cap, trading ~15% CPU for **2.6–4.4× less peak `Anon` RAM**.
-- **Topology dominates tuning:** 10 dedicated workers burn **3.5–4.5× more total CPU** than 1 packed worker (`28.7–43.2 s` vs. `8.1–10.0 s`) for the same 40 workflows (10× cold-load/JIT/GC across 10 isolates).
+- **Where the CPU delta comes from:** Kernel `sys` CPU is nearly identical between untuned and tuned (`0.68 → 0.75 s` on `1 child_process`, `3.25 → 3.14 s` on `10 worker_threads`), showing that `jemalloc`'s `narenas:2,dirty_decay_ms:0` `madvise()` purging has negligible CPU cost. Almost all of the ~12–14% (~20–22% on 10 workers) extra CPU is user-space V8 GC from `--optimize-for-size` and the `4 MiB` young-gen cap, trading ~12–14% CPU for **2.9–4.2× less peak `Anon` RAM**.
+- **Topology dominates tuning:** 10 dedicated workers burn **3.0–4.3× more total CPU** than 1 packed worker (`26.1–43.7 s` vs. `8.6–10.2 s`) for the same 40 workflows (10× cold-load/JIT/GC across 10 isolates).
+
+### Results — Table H5: Experiments A, C, and F Re-run with `100 ms` All-Mocks I/O (`--cpus=2`, `[ENV-LIN-PC1-JE]`)
+
+| Experiment & Config (`MOCK_IO_LATENCY_MS=100`, `--cpus=2`) | `worker_thread` | `child_process` | `in_process` / Notes |
+| --- | ---: | ---: | --- |
+| **Exp F — Warm 262-step wall (`n=5`, `default`)** | **1,475.7 ms** *(+2.3%)* | **1,492.1 ms** *(+3.4%)* | `in_process`: **1,443.1 ms** |
+| **Exp F — Warm 262-step wall (`n=5`, `sweet`)** | **1,509.4 ms** *(+1.6%)* | **1,540.0 ms** *(+3.7%)* | `in_process`: **1,485.0 ms** |
+| **Exp A — 10k ES + 10k ES\|QL (`sweet`, uncapped, `n=3`)** | Peak **75.9** / Settled **51.1 MiB** `Anon` | Peak **96.1** / Settled **64.0 MiB** `Anon` | 100% completed (`1.95–1.97 s` wall) |
+| **Exp A — 10k ES + 10k ES\|QL (`sweet`, 96 MiB cap, `n=3`)** | Peak **73.8** / Settled **49.9 MiB** `Anon` | Peak **84.7** / Settled **62.8 MiB** `Anon` | 100% contained (`1.90–1.92 s` wall) |
+| **Exp C — Pack 5 vs. 5 Separate (`sweet`, `n=3`)** | Pack: **2.21 s** / **36.8 MiB** vs. Sep: **3.19 s** / **155.1 MiB** | Pack: **2.42 s** / **64.9 MiB** vs. Sep: **3.49 s** / **284.1 MiB** | Packing is **1.4× faster** & **4.2–4.4× smaller** |
+| **Exp C — Pack 10 vs. 10 Separate (`sweet`, `n=3`)** | Pack: **3.16 s** / **41.1 MiB** vs. Sep: **5.44 s** / **296.7 MiB** | Pack: **3.19 s** / **67.1 MiB** vs. Sep: **7.97 s** / **572.8 MiB** | Packing is **1.7–2.5× faster** & **7.2–8.5× smaller** |
+| **Exp C — Noisy neighbour (5 normal + 1 × 5 s spin, `sweet`)** | Shared: **7.14 s** vs. Sep: **3.55 s** | Shared: **7.16 s** vs. Sep: **3.25 s** | Shared worker adds **+4.8 s** head-of-line stall |
+
+*(Experiments B, D, E, and G are pure CPU/memory/schema tests with zero ES/Slack/AI/Cases/child-workflow I/O calls, so their results are unaffected by `MOCK_IO_LATENCY_MS`.)*
 
 ### Interpretation & Caveats
 - **Even 10 *normal* workflows degrade `in_process` `/login` latency by ~20×:** On multi-core, `in_process` hits **`160.1 ms`** `/login` p99 (`206.0 ms` on 1 vCPU), whereas `1 child_process` keeps `/login` p99 at **`7.46 ms`** (`41.6 ms` on 1 vCPU) — **21× better** on multi-core and **5× better** on 1 vCPU.

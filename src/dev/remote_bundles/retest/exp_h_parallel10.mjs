@@ -91,7 +91,7 @@ function startExternalHttpClient(port, intervalMs = 15) {
 const TOPOLOGY = process.argv[2] || 'in_process_1';
 const PROFILE = process.argv[3] || 'sweet';
 const WARM_BATCHES = Number(process.argv[4] || 5);
-const ES_LATENCY_MS = Number(process.argv[5] || 0);
+const ES_LATENCY_MS = Number(process.argv[5] ?? process.env.MOCK_IO_LATENCY_MS ?? 0);
 const CONCURRENCY = 10;
 
 const TOPOLOGIES = {
@@ -139,7 +139,7 @@ async function main() {
   const httpClient = startExternalHttpClient(port, 15);
   const executions = new Map();
   const stepsMap = new Map();
-  const { coordinator } = makeCoordinator(executions, stepsMap);
+  const { coordinator } = makeCoordinator(executions, stepsMap, { ioLatencyMs: ES_LATENCY_MS });
 
   const hist = monitorEventLoopDelay({ resolution: 10 });
   hist.enable();
