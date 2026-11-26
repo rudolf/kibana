@@ -29,7 +29,7 @@ export class ExecutorDataPlane implements WorkflowDataPlaneApi {
         'Worker dispatch requires separate internal and run-user authorization headers'
       );
     }
-    if (this.activeScopeId !== undefined)
+    if (this.activeScopeId !== undefined && process.env.KBN_REMOTE_ALLOW_CONCURRENT_LEASES !== '1')
       throw new Error('Worker already has an active workflow lease');
     this.activeScopeId = scopeId;
     try {
@@ -57,7 +57,9 @@ export class ExecutorDataPlane implements WorkflowDataPlaneApi {
     try {
       await Promise.all([clients.internal.close(), clients.user.close()]);
     } finally {
-      this.activeScopeId = undefined;
+      if (this.clients.size === 0) {
+        this.activeScopeId = undefined;
+      }
     }
   }
 

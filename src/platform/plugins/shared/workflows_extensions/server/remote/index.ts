@@ -75,6 +75,12 @@ export const remoteModule: RemoteModule = {
       modulePath: require.resolve('../steps/data/data_stringify_json_runtime'),
       exportName: 'DataStringifyJsonStep',
     },
+    {
+      kind: WorkflowStep,
+      stepType: 'test.bench',
+      modulePath: require.resolve('../steps/data/test_bench_runtime'),
+      exportName: 'TestBenchStep',
+    },
   ],
   providers: [
     {

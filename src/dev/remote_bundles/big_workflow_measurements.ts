@@ -39,7 +39,7 @@ import { nearestRank } from './load_statistics';
 import { memorySnapshot } from './lane_b_measurements';
 import { createLaneBWorkflow } from './lane_b_workflows';
 
-type Backend = 'baseline' | 'in_process' | 'child_process';
+type Backend = 'baseline' | 'in_process' | 'worker_thread' | 'child_process';
 type Phase = 'green' | 'duration' | 'latency' | 'nightshift' | 'all';
 
 const es = 'http://127.0.0.1:9235';
@@ -49,7 +49,7 @@ const headers = {
   'kbn-xsrf': 'true',
   'content-type': 'application/json',
 };
-const backends: Backend[] = ['baseline', 'in_process', 'child_process'];
+const backends: Backend[] = ['baseline', 'in_process', 'worker_thread', 'child_process'];
 const backendSlug = (backend: Backend) => backend.replaceAll('_', '-');
 const callbackEvents = new Set([
   'connector_prepare',
@@ -637,6 +637,8 @@ const assertPid = (backend: Backend, coordinatorPid: number, pids: number[], ste
   if (backend === 'child_process') {
     assert(pids.length > 0, 'Worker process did not record a PID');
     assert(pids.every((pid) => pid !== coordinatorPid));
+  } else if (backend === 'worker_thread') {
+    assert(pids.every((pid) => pid === coordinatorPid));
   } else {
     assert.equal(pids.length, 0, `Unexpected worker PID in ${backend}: ${pids.join(',')}`);
   }
