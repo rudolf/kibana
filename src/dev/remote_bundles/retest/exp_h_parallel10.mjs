@@ -91,6 +91,7 @@ function startExternalHttpClient(port, intervalMs = 15) {
 const TOPOLOGY = process.argv[2] || 'in_process_1';
 const PROFILE = process.argv[3] || 'sweet';
 const WARM_BATCHES = Number(process.argv[4] || 5);
+const ES_LATENCY_MS = Number(process.argv[5] || 0);
 const CONCURRENCY = 10;
 
 const TOPOLOGIES = {
@@ -127,7 +128,7 @@ function profileCfg(mode, profile) {
 }
 
 async function main() {
-  const { server: esServer, url: esUrl } = await startMockEs({ alertCount: 50, esqlRows: 1 });
+  const { server: esServer, url: esUrl } = await startMockEs({ alertCount: 50, esqlRows: 1, latencyMs: ES_LATENCY_MS });
   const loginBody = JSON.stringify({ ok: true, route: '/login', providers: [{ type: 'basic', name: 'basic' }] });
   const loginServer = createServer((_req, res) => {
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
@@ -290,6 +291,7 @@ async function main() {
         workerCount: spec.workerCount,
         concurrency: CONCURRENCY,
         profile: PROFILE,
+        esLatencyMs: ES_LATENCY_MS,
         warmBatches: WARM_BATCHES,
         spawnMs,
         memScope: idleMem.scope,

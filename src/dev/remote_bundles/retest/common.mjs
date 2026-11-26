@@ -336,7 +336,7 @@ export function makeGraph1520Def(blocks = 190) {
   };
 }
 
-export function startMockEs({ alertCount = 50, esqlRows = 1 } = {}) {
+export function startMockEs({ alertCount = 50, esqlRows = 1, latencyMs = 0 } = {}) {
   const alerts = Array.from({ length: alertCount }, (_, index) => {
     const host = `host-${String(index).padStart(5, '0')}`;
     const severity = index % 2 === 0 ? 'high' : 'low';
@@ -380,11 +380,15 @@ export function startMockEs({ alertCount = 50, esqlRows = 1 } = {}) {
         const bodyStr = Buffer.concat(chunks).toString('utf8');
         const pathOnly = (req.url || '/').split('?')[0];
         const sendRaw = (status, jsonStr) => {
-          res.writeHead(status, {
-            'content-type': 'application/json',
-            'x-elastic-product': 'Elasticsearch',
-          });
-          res.end(jsonStr);
+          const finish = () => {
+            res.writeHead(status, {
+              'content-type': 'application/json',
+              'x-elastic-product': 'Elasticsearch',
+            });
+            res.end(jsonStr);
+          };
+          if (latencyMs > 0) setTimeout(finish, latencyMs);
+          else finish();
         };
         const send = (status, obj) => sendRaw(status, JSON.stringify(obj));
 
